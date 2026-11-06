@@ -179,6 +179,7 @@ end
 function M.Step(dt)
 	M.now = M.now + dt
 	if M.pendingShot then M.pendingShot = false; M.Fire("SCREENSHOT_SUCCEEDED") end
+	if M.ground then M.pz = M.ground(M.px, M.py) or M.pz end -- the player stands on the ground
 	M.UpdateNav()
 	for _, f in ipairs(M.frames) do
 		local fn = f.scripts.OnUpdate

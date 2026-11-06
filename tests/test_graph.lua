@@ -43,6 +43,8 @@ local CASES = {
 }
 
 local dump = os.getenv("PATH_DUMP") and io.open(os.getenv("PATH_DUMP"), "w")
+-- HEIGHT_DUMP=file: every 4 yards along each route, the ground height the dots use and the straight-line height
+local hdump = os.getenv("HEIGHT_DUMP") and io.open(os.getenv("HEIGHT_DUMP"), "w")
 collectgarbage("collect")
 for _, c in ipairs(CASES) do
 	local name, inst, sx, sy, tx, ty, maxRatio = unpack(c)
@@ -53,6 +55,14 @@ for _, c in ipairs(CASES) do
 		for i = 1, p.n do dump:write(string.format("\t%.1f,%.1f", p.x[i], p.y[i])) end
 		dump:write("\n")
 	end
+	if p and hdump then
+		p.seg, p.segT = 1, 0
+		ns.player.gx = nil
+		local z0 = ns.TrackGround(p.x[1], p.y[1], inst)
+		ns.SampleGround(p, inst, p.x[1], p.y[1], z0, 4, math.huge, function(x, y, z, along, lineZ)
+			hdump:write(string.format("%s\t%d\t%.2f\t%.2f\t%.2f\t%.2f\n", name, inst, x, y, lineZ, z))
+		end)
+	end
 	if p then
 		local ratio = len / direct
 		check(ratio <= maxRatio, string.format("%s: %d corners, %.0f yd walk vs %.0f direct (x%.2f), %.0f ms CPU over %d frames",
@@ -62,6 +72,7 @@ for _, c in ipairs(CASES) do
 	end
 end
 if dump then dump:close() end
+if hdump then hdump:close() end
 print(string.format("     Lua memory after searches %.0f MB", collectgarbage("count") / 1024))
 
 print(fails == 0 and "ALL PASSED" or (fails .. " FAILED"))

@@ -135,7 +135,7 @@ local function draw()
 	if not db.dots or not db.marker or not p or not p.seg or ns.Marker.probing or not ns.Marker.IsActive() then return 0 end
 	local nav = C_Navigation.GetFrame()
 	if not nav or not C_Navigation.HasValidScreenPosition() or C_Navigation.WasClampedToScreen() then return 0 end
-	local px, py = ns.HBD:GetPlayerWorldPosition()
+	local px, py, instance = ns.HBD:GetPlayerWorldPosition()
 	if not px then return 0 end
 
 	local ui = UIParent:GetEffectiveScale()
@@ -150,7 +150,15 @@ local function draw()
 	focal = focalFor(W)
 
 	local k = p.k
-	local _, _, pz = ns.PointOnSeg(p, p.seg, p.segT or 0)
+	-- Heights: the ground under the player and under each dot from the height map, else (no height data)
+	-- the path's own corner heights in a straight line between corners.
+	local ground = ns.Graph.HasGround(instance) and ns.player.z
+	local pz
+	if ground then
+		pz = ns.Graph.GroundZ(instance, px, py, ground, 1) or ground
+	else
+		pz = select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))
+	end
 	-- The game draws a user waypoint at the player's own height, whatever height it was given (measured
 	-- with /gpath probe), so the marker sits pz + 0 while the camera pivots at pz + focus height.
 	local m = { -p.x[k], p.y[k], pz }
@@ -186,13 +194,13 @@ local function draw()
 
 	local n = 0
 	local range, size = db.dotRange, db.dotSize
-	ns.SamplePath(p, db.dotSpacing, range, function(x, y, z, along)
+	ns.SampleGround(p, instance, px, py, ground and pz, db.dotSpacing, range, function(x, y, z, along, lineZ)
 		if n >= MAX_DOTS then return false end
 		if along < 2 then return end
 		local sx, sy, cf, dirz = project(-x, y, z + 0.05)
 		if not sx then return end
 		n = n + 1
-		if rec then rec[n] = { x, y, z + 0.05, sx, sy } end
+		if rec then rec[n] = { x, y, z + 0.05, sx, sy, lineZ } end
 		local t = dot(n)
 		local s = min(40, max(3, size * focal / cf))
 		t:SetSize(s, s * min(1, max(0.15, -dirz)))
@@ -313,7 +321,7 @@ function Dots.Probe()
 	if p and p.seg then _, _, pz = ns.PointOnSeg(p, p.seg, p.segT or 0) end
 	local u1, u2, u3, u4 = UnitPosition("player")
 	local gz = ns.Graph.NearestZ(instance, px, py, IsIndoors())
-	local z0 = pz or gz or u3 or 0
+	local z0 = ns.player.z or pz or gz or u3 or 0
 	local facing = GetPlayerFacing() or 0
 	local ui = UIParent:GetEffectiveScale()
 	local wcx, wcy = WorldFrame:GetCenter()
@@ -321,7 +329,7 @@ function Dots.Probe()
 	local rec = {
 		version = C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON, "Version"),
 		build = { GetBuildInfo() },
-		player = { x = px, y = py, instance = instance, pathZ = pz, graphZ = gz, unitPosition = { u1, u2, u3, u4 }, facing = facing,
+		player = { x = px, y = py, instance = instance, pathZ = pz, graphZ = gz, groundZ = ns.player.z, unitPosition = { u1, u2, u3, u4 }, facing = facing,
 			zoom = GetCameraZoom(), mounted = IsMounted(), indoors = IsIndoors(), race = select(2, UnitRace("player")),
 			sex = UnitSex("player"), map = C_Map.GetBestMapForUnit("player") },
 		screen = { ui = ui, uiW = UIParent:GetWidth(), uiH = UIParent:GetHeight(), worldW = WorldFrame:GetWidth(),

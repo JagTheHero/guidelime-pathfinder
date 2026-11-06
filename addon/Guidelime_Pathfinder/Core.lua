@@ -22,6 +22,7 @@ local DEFAULTS = {
 
 local OFF_PATH = 25   -- yards away from the path before replanning
 local ADVANCE = 7     -- yards from a corner before the marker moves to the next one
+local GROUND_LOST = 1 -- seconds without ground that continues the tracked height before it jumps (a fall)
 
 ns.player = {}
 ns.goal = {}
@@ -221,6 +222,33 @@ function ns.SamplePath(p, spacing, maxDist, fn)
 	end
 end
 
+local OFFSET_EASE = 0.7 -- where no ground fits, the offset from the route's line shrinks by this each point
+
+-- SamplePath with the ground height under each point from the height map, starting from height z0 at (x0, y0).
+-- On a walkable route each height is predicted as the route's straight line between corners plus the offset
+-- the ground had from that line at the point before. Following the offset rather than the height keeps the
+-- route's layer where layers part slowly (a ramp down into a tunnel under the hillside, a bridge ramp); where
+-- no ground fits (a narrow bridge between samples) it eases back to the line, which is on the route's layer
+-- at every corner. A straight-line path (no corner heights) just continues the last height.
+-- Without height data (or z0) the heights are the path's own. fn also gets the straight-line height.
+function ns.SampleGround(p, instance, x0, y0, z0, spacing, maxDist, fn)
+	if not z0 or not ns.Graph.HasGround(instance) then
+		return ns.SamplePath(p, spacing, maxDist, function(x, y, z, along) return fn(x, y, z, along, z) end)
+	end
+	local anchored = p.graph and p.z
+	local _, _, lineZ0 = ns.PointOnSeg(p, p.seg, p.segT or 0)
+	local offset, rx, ry = z0 - lineZ0, x0, y0
+	ns.SamplePath(p, spacing, maxDist, function(x, y, lineZ, along)
+		local z, guess = ns.Graph.GroundZ(instance, x, y, lineZ + offset, dist(rx, ry, x, y))
+		if not z then
+			if anchored then offset = offset * OFFSET_EASE end
+			z = not anchored and guess or lineZ + offset
+		end
+		offset, rx, ry = z - lineZ, x, y
+		return fn(x, y, z, along, lineZ)
+	end)
+end
+
 function ns.SetPath(p, fromGraph)
 	pathId = pathId + 1
 	p.id, p.k, p.graph = pathId, 2, fromGraph
@@ -267,10 +295,43 @@ function ns.Stop()
 	end
 end
 
+-- The game gives addons no player height, so follow the ground under the player on the height map from tick
+-- to tick: the layer that continues from the last height (a bridge, not the river below it), predicted along
+-- the route's straight line when on a walkable route (see SampleGround), jumping to the nearest layer only
+-- after a moment without one (a fall, a teleport).
+function ns.TrackGround(px, py, instance)
+	local pl = ns.player
+	local moved = pl.gx and pl.ginstance == instance and sqrt((px - pl.gx) ^ 2 + (py - pl.gy) ^ 2)
+	local ref = moved and moved < 40 and pl.z or nil
+	local p = ns.path
+	local onRoute = p and p.graph and p.seg and (p.off or huge) < 10
+	local lineZ = onRoute and select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))
+	local pred, reach = ref, moved
+	if not ref then
+		-- first height (login, teleport): the route's or the nearest route point's, which pick the floor of
+		-- a building or the layer of a bridge, then the ground under the player within a few yards of it
+		pred, reach = lineZ or ns.Graph.NearestZ(instance, px, py, IsIndoors()), 6
+	elseif lineZ and pl.linePath == p.id then
+		pred = lineZ + ref - pl.lineZ
+	end
+	local z, guess = ns.Graph.GroundZ(instance, px, py, pred, reach or 0)
+	if z then
+		pl.lost = nil
+	elseif guess then
+		pl.lost = pl.lost or GetTime()
+		if GetTime() - pl.lost > GROUND_LOST then z, pl.lost = guess, nil end
+	end
+	pl.z = z or ref or pred
+	pl.lineZ, pl.linePath = lineZ, lineZ and p.id
+	pl.gx, pl.gy, pl.ginstance = px, py, instance
+	return pl.z
+end
+
 local function tick()
 	local db = ns.db
 	if not db.enabled then return ns.Stop() end
 	local px, py, instance = HBD:GetPlayerWorldPosition()
+	if px then ns.TrackGround(px, py, instance) end
 	local tx, ty, tinstance = ns.GetTarget()
 	if not px or not tx or tinstance ~= instance then return ns.Stop() end
 	ns.player.x, ns.player.y, ns.player.instance = px, py, instance

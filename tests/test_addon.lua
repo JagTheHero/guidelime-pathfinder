@@ -14,6 +14,11 @@ GuidelimeArrow.element = { wx = -150, wy = 300, instance = 1 }
 GuidelimeData = {}
 
 local ns = M.LoadAddon(dir, "Guidelime_Pathfinder")
+-- the world's ground is the packed height map (tests/test_ground.lua checks it against the build's heights)
+M.ground = function(x, y)
+	local z, guess = ns.Graph.GroundZ(M.instance, x, y, M.pz, 1)
+	return z or guess
+end
 M.Fire("ADDON_LOADED", "Guidelime_Pathfinder")
 M.Fire("PLAYER_LOGIN")
 for _ = 1, 5 do M.Step(0.05) end
@@ -182,7 +187,7 @@ if ns.Graph.Has(0) then
 		-- dots on a slope: the corners ahead are higher or lower than the player, the marker is not
 		local q = ns.path
 		local j = math.max(2, q.k - 2)
-		M.px, M.py, M.pz = q.x[j], q.y[j], q.z[j]
+		M.px, M.py = q.x[j], q.y[j]
 		for _ = 1, 3 do M.Step(0.1) end
 		local yaw = math.atan2(q.x[q.k] - M.px, q.y[q.k] - M.py)
 		M.trueYaw, M.facing, M.truePitch = yaw, yaw, 0.4
@@ -190,8 +195,22 @@ if ns.Graph.Has(0) then
 		for _ = 1, 5 do worst, count = dotError() end
 		check(count > 3 and worst < 1.5, string.format("dots on a slope match (worst %.2f px, %d dots, next corner %.1f yd higher)", worst, count, q.z[q.k] - M.pz))
 
+		-- the dots sit on the ground under them, not on the straight line between corners
+		ns.Dots.record = {}
+		M.Step(1 / 60)
+		local onGround, offLine, nd = 0, 0, #ns.Dots.record
+		for _, r in ipairs(ns.Dots.record) do
+			local z = r[3] - 0.05
+			local fit, plain = ns.Graph.GroundZ(M.instance, r[1], r[2], z, 0)
+			plain = fit or plain
+			if plain and math.abs(plain - z) < 0.3 then onGround = onGround + 1 end
+			offLine = math.max(offLine, math.abs(z - r[6]))
+		end
+		ns.Dots.record = nil
+		check(nd > 3 and onGround == nd, string.format("dots are on the ground (%d of %d; up to %.1f yd off the straight line between corners)", onGround, nd, offLine))
+
 		-- camera probe: walk back a bit so a path is active, then measure
-		M.px, M.py, M.pz = p.x[p.n - 2], p.y[p.n - 2], p.z[p.n - 2]
+		M.px, M.py = p.x[p.n - 2], p.y[p.n - 2]
 		M.trueYaw, M.truePitch, M.facing = 2.4, 0.4, 2.4
 		for _ = 1, 3 do M.Step(0.1) end
 		local before = M.waypoint

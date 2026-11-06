@@ -303,6 +303,117 @@ function Graph.NearestZ(instance, x, y, indoors)
 	if found[1] and found[1][2] < 30 then return g.z[found[1][1]] end
 end
 
+-- Ground heights for the ground dots (tools/pack.py, pack_heights): a block per 64-yard cell with heights every
+-- g.hs yards, every walkable layer where several stack (bridges, caves, floors).
+--   hcells:  hc records of 8 chars: cellKey(4) offset(4) into heights, sorted by key
+--   heights: per cell base(3), then 64 codes in serpentine row order: c < 62 is the previous height
+--            + (c - 31) / 2 yards, 62 is no ground, 63 is followed by an absolute height(2); then the number
+--            of extra layers(2) and per extra layer sampleIndex(1) height(2). Absolute heights are
+--            quarter yards above the base, which is (lowest height + 4000) * 4.
+local HPER = 8
+local SCAN = {}
+for j = 0, HPER - 1 do
+	for i = 0, HPER - 1 do SCAN[#SCAN + 1] = j * HPER + (j % 2 == 0 and i or HPER - 1 - i) end
+end
+local CACHE_CELLS = 256
+-- a grid corner fits the reference height when within STEP_ALLOW + SLOPE_ALLOW x its distance + REACH_ALLOW x
+-- how far back the reference was measured (tuned on real routes against a 4-yard height map)
+local STEP_ALLOW, SLOPE_ALLOW, REACH_ALLOW = 1.5, 0.8, 0.4
+
+local function heightCell(g, key)
+	local cache = g.hcache
+	if not cache then cache = {}; g.hcache, g.hcached = cache, 0 end
+	local cell = cache[key]
+	if cell ~= nil then return cell end
+	local s, lo, hi, off = g.hcells, 1, g.hc, nil
+	while lo <= hi do
+		local mid = floor((lo + hi) / 2)
+		local k = v4(s, (mid - 1) * 8 + 1)
+		if k == key then off = v4(s, (mid - 1) * 8 + 5) break end
+		if k < key then lo = mid + 1 else hi = mid - 1 end
+	end
+	cell = false
+	if off then
+		s = g.heights
+		local p = off + 1
+		local base = v3(s, p)
+		p = p + 3
+		local first, extra = {}, {}
+		local last = base / Q - OFFSET_Z
+		for n = 1, HPER * HPER do
+			local c = DEC[byte(s, p)]
+			p = p + 1
+			if c == 63 then
+				last = (base + DEC[byte(s, p)] * 64 + DEC[byte(s, p + 1)]) / Q - OFFSET_Z
+				p = p + 2
+				first[SCAN[n]] = last
+			elseif c < 62 then
+				last = last + (c - 31) / 2
+				first[SCAN[n]] = last
+			end
+		end
+		for _ = 1, DEC[byte(s, p)] * 64 + DEC[byte(s, p + 1)] do
+			local idx = DEC[byte(s, p + 2)]
+			local list = extra[idx] or {}
+			extra[idx] = list
+			list[#list + 1] = (base + DEC[byte(s, p + 3)] * 64 + DEC[byte(s, p + 4)]) / Q - OFFSET_Z
+			p = p + 3
+		end
+		cell = { first = first, extra = extra }
+	end
+	if g.hcached >= CACHE_CELLS then wipe(cache); g.hcached = 0 end
+	cache[key], g.hcached = cell, g.hcached + 1
+	return cell
+end
+
+-- Height of grid point (sx, sy) on the layer nearest ref (any layer without ref).
+local function groundSample(g, sx, sy, ref)
+	local cell = heightCell(g, floor(sx / HPER) + floor(sy / HPER) * 1024)
+	if not cell then return end
+	local idx = (sy % HPER) * HPER + sx % HPER
+	local h = cell.first[idx]
+	local more = cell.extra[idx]
+	if more and ref then
+		for _, z in ipairs(more) do
+			if not h or abs(z - ref) < abs(h - ref) then h = z end
+		end
+	end
+	return h
+end
+
+function Graph.HasGround(instance)
+	local g = graphs[instance]
+	return g ~= nil and (g.hc or 0) > 0
+end
+
+-- Ground height at (x, y), on the layer that continues from height `ref` measured `reach` yards away.
+-- Grid corners that are on another layer (farther from ref than a walkable slope allows, like the water
+-- under a bridge) are left out. Returns nil, guess when no corner fits ref (guess: the plain nearest
+-- layers), and nil when there is no ground data here.
+function Graph.GroundZ(instance, x, y, ref, reach)
+	local g = graphs[instance]
+	if not g or not g.hc then return end
+	local hs = g.hs
+	local gx, gy = (x + OFFSET_XY) / hs, (y + OFFSET_XY) / hs
+	local ix, iy = floor(gx), floor(gy)
+	local fx, fy = gx - ix, gy - iy
+	local sum, wsum, any, anyW = 0, 0, 0, 0
+	for c = 0, 3 do
+		local dx, dy = c % 2, floor(c / 2)
+		local w = (dx == 1 and fx or 1 - fx) * (dy == 1 and fy or 1 - fy)
+		local h = w > 0 and groundSample(g, ix + dx, iy + dy, ref)
+		if h then
+			any, anyW = any + w * h, anyW + w
+			local d = hs * sqrt((dx - fx) ^ 2 + (dy - fy) ^ 2)
+			if not ref or abs(h - ref) <= STEP_ALLOW + SLOPE_ALLOW * d + REACH_ALLOW * (reach or 0) then
+				sum, wsum = sum + w * h, wsum + w
+			end
+		end
+	end
+	if wsum > 1e-3 then return sum / wsum end
+	if anyW > 1e-3 then return nil, any / anyW end
+end
+
 function Graph.Stats(instance)
 	local g = graphs[instance]
 	if not g then return end

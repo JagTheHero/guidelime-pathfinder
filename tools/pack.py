@@ -1,9 +1,10 @@
 """Pack a navbuild .graph into the addon's Lua data file (format documented in Graph.lua).
 
-usage: pack.py <graph> <instance id> <map name> <out.lua> [min component nodes]
+usage: pack.py <graph> <instance id> <map name> <out.lua> [min component nodes] [--heights <file.hgt>]
 
 Coordinates go to HereBeDragons world space (x = world Y, y = world X). Small disconnected pieces
-(mountain ledges, roofs) and swim nodes far out at sea are dropped.
+(mountain ledges, roofs) and swim nodes far out at sea are dropped. With --heights, the ground heights
+(navbuild heights) of the cells near the kept nodes are packed too, for the ground dots.
 """
 import datetime
 import sys
@@ -11,10 +12,12 @@ import sys
 import numpy as np
 
 from graphio import read_graph
+from hgtio import read_hgt, PER
 
 ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 OFFSET_XY, OFFSET_Z, Q = 17100, 4000, 4
 CS = 64  # lookup cell size, yards
+HEIGHT_REACH = 2  # height cells are kept within this many cells of a kept node (edges are up to 143 yd long)
 SEA_RANGE = 120  # swim nodes farther than this from any ground node are dropped
 NODE_INDOOR, NODE_SWIM = 1, 2
 AREA_SWIM, AREA_INDOOR = 2, 3
@@ -76,9 +79,73 @@ def keep_mask(hx, hy, area, a, b, min_comp):
     return keep
 
 
+def pack_heights(cells, node_keys):
+    """Per cell: base(3), 64 first-layer codes in serpentine order, extra-layer count(2), extras (index(1) height(2)).
+    A code c < 62 is the previous value + (c - 31) / 2 yards, 62 is no ground, 63 is followed by an absolute
+    height(2). Absolute heights are quarter yards above the base, which is (lowest height + 4000) * 4.
+    Returns the index string (key(4) offset(4), sorted by key) and the data string."""
+    near = set()
+    for k in node_keys:
+        cx, cy = k % 1024, k // 1024
+        for dx in range(-HEIGHT_REACH, HEIGHT_REACH + 1):
+            for dy in range(-HEIGHT_REACH, HEIGHT_REACH + 1):
+                near.add((cx + dx) + (cy + dy) * 1024)
+    blocks = []
+    for cx, cy, n, h in cells:
+        key = cx + cy * 1024
+        if key not in near:
+            continue
+        layers, k = [], 0
+        for idx in range(PER * PER):
+            layers.append([float(v) for v in h[k:k + int(n[idx])]])
+            k += int(n[idx])
+        base = int(np.floor((min(h) + OFFSET_Z) * Q))
+        def rel(z):
+            return int(min(4094, max(0, round((z + OFFSET_Z) * Q) - base)))
+        def absz(r):
+            return (base + r) / Q - OFFSET_Z
+        codes, extras = [], []
+        last = absz(0)
+        for j in range(PER):
+            for ii in range(PER):
+                idx = j * PER + (ii if j % 2 == 0 else PER - 1 - ii)
+                ls = layers[idx]
+                if not ls:
+                    codes.append(62)
+                    continue
+                first = min(ls, key=lambda z: abs(z - last))
+                c = int(round((first - last) * 2)) + 31
+                if 0 <= c <= 61:
+                    codes.append(c)
+                    last = last + (c - 31) / 2
+                else:
+                    r = rel(first)
+                    codes += [63, r >> 6, r & 63]
+                    last = absz(r)
+                for z in ls:
+                    if z is not first:
+                        r = rel(z)
+                        extras += [idx, r >> 6, r & 63]
+        block = b64([base], 3) + b64(codes, 1) + b64([len(extras) // 3], 2) + b64(extras, 1)
+        blocks.append((key, block))
+    blocks.sort()
+    index, data, offset = [], [], 0
+    for key, block in blocks:
+        index.append(b64([key], 4) + b64([offset], 4))
+        data.append(block)
+        offset += len(block)
+    return "".join(index), "".join(data), len(blocks)
+
+
 def main():
-    path, instance, name, out = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-    min_comp = int(sys.argv[5]) if len(sys.argv) > 5 else 25
+    args = sys.argv[1:]
+    heights = None
+    if "--heights" in args:
+        i = args.index("--heights")
+        heights = args[i + 1]
+        del args[i:i + 2]
+    path, instance, name, out = args[0], int(args[1]), args[2], args[3]
+    min_comp = int(args[4]) if len(args) > 4 else 25
     nodes, edges = read_graph(path)
     hx = nodes['y'].astype(np.float64)  # HBD x = world Y
     hy = nodes['x'].astype(np.float64)  # HBD y = world X
@@ -124,6 +191,12 @@ def main():
     c0, c1, c2 = b64(ukeys, 4), b64(ufirst, 3), b64(ucount, 3)
     cell_str = "".join(c0[i * 4:i * 4 + 4] + c1[i * 3:i * 3 + 3] + c2[i * 3:i * 3 + 3] for i in range(len(ukeys)))
 
+    hindex = hdata = ""
+    hcount = 0
+    if heights:
+        hindex, hdata, hcount = pack_heights(read_hgt(heights), set(ukeys.tolist()))
+        print("heights: %d cells, %.1f MB" % (hcount, (len(hindex) + len(hdata)) / 1e6))
+
     built = datetime.date.today().isoformat()
     with open(out, "w") as f:
         f.write("-- Pathfinding graph for %s, generated by tools/pack.py from the game's terrain and buildings. Do not edit.\n" % name)
@@ -133,6 +206,10 @@ def main():
         f.write('\tnodes = "%s",\n' % node_str)
         f.write('\tedges = "%s",\n' % edge_str)
         f.write('\tcells = "%s",\n' % cell_str)
+        if hcount:
+            f.write('\thc = %d, hs = 8,\n' % hcount)
+            f.write('\thcells = "%s",\n' % hindex)
+            f.write('\theights = "%s",\n' % hdata)
         f.write("})\n")
     print("wrote %s: %d nodes, %d directed edges, %d cells, %.1f MB" % (out, n, len(dst), len(ukeys),
           (len(node_str) + len(edge_str) + len(cell_str)) / 1e6))

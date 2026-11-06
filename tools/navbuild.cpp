@@ -2,6 +2,7 @@
 //
 //   navbuild tiles <geo_dir> <nav_dir> <threads>        one .nav per ADT tile (4x4 Detour tiles)
 //   navbuild graph <nav_dir> <out.graph> <threads>      graph over the whole map (NAV_DEBUG=1 for island and edge stats)
+//   navbuild heights <nav_dir> <out.hgt> <threads>      ground heights every 8 yards, all walkable layers (ground dots)
 //   navbuild probe <nav_dir> <worldX> <worldY> x       straight-walk checks between polygons around one point
 //
 // World coordinates: X north, Y west, Z up. Recast coordinates: (x, y, z) = (Y, Z, X).
@@ -717,6 +718,88 @@ struct Builder {
 		printf("simplified: %zu route corners dropped\n", removed);
 	}
 
+	// Ground heights for the addon's ground dots: every HS yards on a grid aligned with the addon's 64-yard
+	// lookup cells (HereBeDragons coords + 17100), all walkable layers at each point (bridges, caves, floors).
+	// HGT1 file: cell count, then per cell: cx, cy (int32), 64 layer counts (uint8), the heights (float32).
+	void heights(const std::string& path) {
+		static const float HS = 8.0f, OFF = 17100.0f, MERGE = 1.5f;
+		static const int PER = 8, MAX_LAYERS = 4;
+		int minx = INT32_MAX, maxx = INT32_MIN, minz = INT32_MAX, maxz = INT32_MIN;
+		for (int i = 0; i < nav->getMaxTiles(); i++) {
+			const dtMeshTile* t = ((const dtNavMesh*)nav)->getTile(i);
+			if (!t || !t->header) continue;
+			minx = std::min(minx, (int)floorf((t->header->bmin[0] + OFF) / CELL)); maxx = std::max(maxx, (int)floorf((t->header->bmax[0] + OFF) / CELL));
+			minz = std::min(minz, (int)floorf((t->header->bmin[2] + OFF) / CELL)); maxz = std::max(maxz, (int)floorf((t->header->bmax[2] + OFF) / CELL));
+		}
+		struct Cell { int cx, cy; unsigned char n[PER * PER]; std::vector<float> h; };
+		std::vector<Cell> out;
+		std::atomic<int> nextRow{ minz };
+		std::atomic<long> layered{ 0 }, samples{ 0 };
+		auto worker = [&]() {
+			dtNavMeshQuery* q = dtAllocNavMeshQuery();
+			q->init(nav, 4096);
+			std::vector<dtPolyRef> refs(8192);
+			for (;;) {
+				int cy = nextRow++;
+				if (cy > maxz) break;
+				std::vector<Cell> local;
+				for (int cx = minx; cx <= maxx; cx++) {
+					float c[3] = { (cx + 0.5f) * CELL - OFF, 0, (cy + 0.5f) * CELL - OFF };
+					float ext[3] = { CELL / 2, 5000, CELL / 2 };
+					int n = 0;
+					q->queryPolygons(c, ext, &filter, refs.data(), &n, (int)refs.size());
+					bool any = false;
+					for (int i = 0; i < n && !any; i++) { int ci = compOf(refs[i]); any = ci >= 0 && compArea[ci] >= MIN_ISLAND; }
+					if (!any) continue;
+					Cell cell{ cx, cy, {}, {} };
+					bool hit = false;
+					for (int j = 0; j < PER; j++) for (int i = 0; i < PER; i++) {
+						float p[3] = { cx * CELL - OFF + i * HS, 0, cy * CELL - OFF + j * HS };
+						float e[3] = { 0.05f, 5000, 0.05f };
+						int m = 0;
+						dtPolyRef r[64];
+						q->queryPolygons(p, e, &filter, r, &m, 64);
+						std::vector<float> hs;
+						for (int k = 0; k < m; k++) {
+							int ci = compOf(r[k]);
+							float h;
+							if (ci < 0 || compArea[ci] < MIN_ISLAND || dtStatusFailed(q->getPolyHeight(r[k], p, &h))) continue;
+							hs.push_back(h);
+						}
+						std::sort(hs.begin(), hs.end());
+						std::vector<float> layers;
+						for (float h : hs) if (layers.empty() || h - layers.back() > MERGE) layers.push_back(h);
+						if ((int)layers.size() > MAX_LAYERS) layers.resize(MAX_LAYERS);
+						cell.n[j * PER + i] = (unsigned char)layers.size();
+						cell.h.insert(cell.h.end(), layers.begin(), layers.end());
+						if (!layers.empty()) { hit = true; samples++; }
+						if (layers.size() > 1) layered++;
+					}
+					if (hit) local.push_back(std::move(cell));
+				}
+				std::lock_guard<std::mutex> l(m);
+				for (auto& cl : local) out.push_back(std::move(cl));
+			}
+			dtFreeNavMeshQuery(q);
+		};
+		std::vector<std::thread> pool;
+		for (int i = 0; i < threads; i++) pool.emplace_back(worker);
+		for (auto& t : pool) t.join();
+		std::sort(out.begin(), out.end(), [](const Cell& a, const Cell& b) { return a.cy != b.cy ? a.cy < b.cy : a.cx < b.cx; });
+		FILE* f = fopen(path.c_str(), "wb");
+		uint32_t nc = (uint32_t)out.size();
+		fwrite("HGT1", 1, 4, f);
+		fwrite(&nc, 4, 1, f);
+		for (auto& cl : out) {
+			int32_t xy[2] = { cl.cx, cl.cy };
+			fwrite(xy, 4, 2, f);
+			fwrite(cl.n, 1, PER * PER, f);
+			fwrite(cl.h.data(), 4, cl.h.size(), f);
+		}
+		fclose(f);
+		printf("heights: %u cells, %ld ground samples, %ld with more than one layer\n", nc, samples.load(), layered.load());
+	}
+
 	void write(const std::string& path) {
 		// drop dead nodes, dedupe edges
 		std::vector<int> remap(nodes.size(), -1);
@@ -795,6 +878,15 @@ int main(int argc, char** argv) {
 			printf("0->%d raycast status %x t %g pathCount %d last==target %d | straight %d walk %d len %.1f direct %.1f dev %.1f\n", i, st, hit.t, hit.pathCount,
 				hit.pathCount ? path[hit.pathCount - 1] == refs[i] : -1, s1, w, len, dtVdist(pts[0].data(), pts[i].data()), dev);
 		}
+		return 0;
+	}
+	if (cmd == "heights") {
+		Builder b;
+		b.nav = loadNavMesh(argv[2]);
+		if (!b.nav) return 1;
+		b.threads = threads;
+		b.labelComponents();
+		b.heights(argv[3]);
 		return 0;
 	}
 	if (cmd == "graph") {
