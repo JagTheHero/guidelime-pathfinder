@@ -90,6 +90,68 @@ SlashCmdList.GUIDELIMEPATHFINDER("status")
 local said = table.concat(M.prints, "\n")
 check(said:find("no path: Guidelime's current step has no map position", 1, true) ~= nil, "status says why there is no path")
 
+-- Questie fallback: the step has no map position, but Questie has icons for the quest the step names
+GuidelimeWindow = M.NewFrame()
+GuidelimeWindow.pinnedStepsFrame = M.NewFrame()
+GuidelimeWindow.steps = {}
+local function stepFrame(i, text, checked)
+	local f = M.NewFrame()
+	f.visible, f.checked, f.parent = true, checked, GuidelimeWindow
+	f.textBox = M.NewFrame()
+	f.textBox.text = text
+	GuidelimeWindow.steps[i] = f
+	return f
+end
+local questFrames = {}
+QuestieLoader = { ImportModule = function(_, name) if name == "QuestieMap" then return { questIdFrames = questFrames } end end }
+local icons = 0
+local function icon(questId, questName, kind, wx, wy, extra)
+	icons = icons + 1
+	local name = "QuestieFrame" .. icons
+	local f = { data = { Id = questId, Type = kind, QuestData = { name = questName }, Name = "Kobold Vermin" },
+		x = (M.zone.left - wx) / M.zone.w * 100, y = (M.zone.top - wy) / M.zone.h * 100, UiMapID = M.zone.id, miniMapIcon = false }
+	for k, v in pairs(extra or {}) do f[k] = v end
+	_G[name] = f
+	questFrames[questId] = questFrames[questId] or {}
+	questFrames[questId][name] = name
+	return f
+end
+icon(7001, "Kobold Camp Cleanup", "monster", 100, 200)
+icon(7001, "Kobold Camp Cleanup", "monster", -300, 50)
+icon(7001, "Kobold Camp Cleanup", "monster", 5, 5).data.ObjectiveData = { Completed = true }
+icon(7001, "Kobold Camp Cleanup", "monster", 2, 2, { miniMapIcon = true })
+icon(7002, "Far Away Quest", "complete", 10, 10)
+stepFrame(3, "|TInterface\\Icons\\a:12|t|cFF59C4F1Old Quest|r", true)
+stepFrame(4, "|TInterface\\Icons\\b:12|t[7] |cFF59C4F1Kobold Camp Cleanup|r\n    - |Tx:12|t Kobold Vermin: 0/10")
+local nextStep = stepFrame(5, "|cFF666666|TInterface\\Icons\\c:12|tTurn in Far Away Quest")
+M.px, M.py = 0, 0
+for _ = 1, 12 do M.Step(0.1) end
+local function goalAt(x, y) return ns.goal.x and math.abs(ns.goal.x - x) < 1 and math.abs(ns.goal.y - y) < 1 and ns.path ~= nil end
+check(goalAt(100, 200), "Questie fallback heads for the nearest objective icon of the active step's quest")
+M.prints = {}
+SlashCmdList.GUIDELIMEPATHFINDER("status")
+said = table.concat(M.prints, "\n")
+check(said:find("target from Questie", 1, true) and said:find("objective for Kobold Camp Cleanup", 1, true), "status names the Questie target")
+M.px, M.py = -100, 125
+for _ = 1, 12 do M.Step(0.1) end
+check(goalAt(100, 200), "the pick stays put while another icon is only a little closer")
+M.px, M.py = -250, 60
+for _ = 1, 12 do M.Step(0.1) end
+check(goalAt(-300, 50), "switches when another icon is much closer")
+GuidelimeWindow.steps[4].checked = true
+nextStep.textBox.text = "|TInterface\\Icons\\c:12|tTurn in |cFF59C4F1Far Away Quest|r"
+for _ = 1, 12 do M.Step(0.1) end
+check(goalAt(10, 10), "next active step: heads for the turn-in")
+GuidelimeArrow.element = { wx = 50, wy = 500, instance = 1 }
+for _ = 1, 3 do M.Step(0.1) end
+check(goalAt(50, 500), "Guidelime's own position wins when the step has one")
+GuidelimeArrow.element = nil
+GuidelimeWindow:Hide()
+for _ = 1, 12 do M.Step(0.1) end
+check(ns.path == nil and ns.WhyNoTarget():find("open Guidelime's window", 1, true), "window closed: no fallback, and status says why")
+GuidelimeWindow, QuestieLoader = nil, nil
+for _ = 1, 12 do M.Step(0.1) end
+
 -- real graph data: Northshire Abbey to Goldshire, then walk the route corner by corner
 if ns.Graph.Has(0) then
 	M.instance = 0

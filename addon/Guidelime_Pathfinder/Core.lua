@@ -4,7 +4,7 @@ GuidelimePathfinder = ns
 local HBD = LibStub("HereBeDragons-2.0")
 ns.HBD = HBD
 
-local floor, sqrt, min, max, huge = math.floor, math.sqrt, math.min, math.max, math.huge
+local floor, sqrt, min, max, abs, huge = math.floor, math.sqrt, math.min, math.max, math.abs, math.huge
 
 local DEFAULTS = {
 	enabled = true,
@@ -32,22 +32,125 @@ local offSince
 function ns.Print(...) print("|cff9fff3fGuidelime Pathfinder:|r", ...) end
 function ns.Debug(...) if ns.db and ns.db.debug then ns.Print(...) end end
 
+-- Fallback for steps Guidelime has no map position for (the custom WoW: Forever quests): read the active
+-- steps from Guidelime's window, find the quests they name among those Questie has map icons for, and head
+-- for the nearest icon. Questie draws where a quest goes next: its giver, its objectives or its turn-in.
+local KEEP_PICK = 30  -- yards: stay on the chosen icon until another is this much closer
+local fallback = { at = -10 }
+ns.fallback = fallback
+local questNames = {}
+
+local function plainText(s)
+	s = s:gsub("|T.-|t", " "):gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+	return (s:gsub("%[[^%]]*%]", " "):gsub("%(#%d+%)", ""))
+end
+
+-- Text of the steps Guidelime shows as active: pinned optional steps last, otherwise in guide order.
+local function activeSteps()
+	local win = _G.GuidelimeWindow
+	if not win or not win.steps or not win:IsShown() then return end
+	local inactive = GuidelimeData and GuidelimeData.fontColorInactive or "|cFF666666"
+	local list = {}
+	for i, f in pairs(win.steps) do
+		if f.visible and f.textBox and f:IsShown() and not f:GetChecked() then
+			local text = f.textBox:GetText() or ""
+			-- inactive steps start with the inactive colour (after an optional line number)
+			if not text:sub(1, #inactive + 6):find(inactive, 1, true) then
+				list[#list + 1] = { i = i, text = plainText(text), pinned = f:GetParent() == win.pinnedStepsFrame }
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		if a.pinned ~= b.pinned then return b.pinned end
+		return a.i < b.i
+	end)
+	return list
+end
+
+local function questName(questMap, questId)
+	if questNames[questId] then return questNames[questId] end
+	for _, name in pairs(questMap.questIdFrames[questId]) do
+		local f = _G[name]
+		local q = f and f.data and f.data.Id == questId and f.data.QuestData
+		if q and q.name then
+			questNames[questId] = q.name
+			return q.name
+		end
+	end
+end
+
+local function findFallback(px, py, instance)
+	local questMap = QuestieLoader and QuestieLoader:ImportModule("QuestieMap")
+	if not questMap or not questMap.questIdFrames then return nil, "Questie is not loaded" end
+	local steps = activeSteps()
+	if not steps then return nil, "open Guidelime's window so the step can be looked up in Questie" end
+	for _, step in ipairs(steps) do
+		local best, bestD, kept, keptD
+		for questId, frames in pairs(questMap.questIdFrames) do
+			local name = questName(questMap, questId)
+			if name and #name >= 3 and step.text:find(name, 1, true) then
+				for _, frameName in pairs(frames) do
+					local f = _G[frameName]
+					local d = f and f.data
+					if d and d.Id == questId and not f.miniMapIcon and f.x and f.UiMapID
+						and not (d.ObjectiveData and d.ObjectiveData.Completed) then
+						local x, y, inst = HBD:GetWorldCoordinatesFromZone(f.x / 100, f.y / 100, f.UiMapID)
+						if x and inst == instance then
+							local dd = (x - px) ^ 2 + (y - py) ^ 2
+							local c = { x = x, y = y, instance = inst, quest = name, kind = d.Type, name = d.Name }
+							if not bestD or dd < bestD then best, bestD = c, dd end
+							if fallback.x and abs(x - fallback.x) < 1 and abs(y - fallback.y) < 1 then kept, keptD = c, dd end
+						end
+					end
+				end
+			end
+		end
+		if best then
+			if kept and sqrt(keptD) <= sqrt(bestD) + KEEP_PICK then return kept end
+			return best
+		end
+	end
+	return nil, "Questie shows no map icons on this continent for the quests in Guidelime's active steps"
+end
+
+-- Recomputed at most once a second; the pick is sticky so the route does not flip between objective spawns.
+function ns.QuestieTarget(px, py, instance)
+	local now = GetTime()
+	if now - fallback.at >= 1 then
+		fallback.at = now
+		local pick, why = findFallback(px, py, instance)
+		fallback.why = why
+		fallback.x, fallback.y, fallback.instance = pick and pick.x, pick and pick.y, pick and pick.instance
+		fallback.quest, fallback.kind, fallback.name = pick and pick.quest, pick and pick.kind, pick and pick.name
+	end
+	return fallback.x, fallback.y, fallback.instance
+end
+
 -- The current Guidelime arrow target, in HereBeDragons world coordinates, or the corpse while a ghost.
+-- ns.targetSource says which: "guidelime", "questie" or "corpse".
 function ns.GetTarget()
+	ns.targetSource = nil
 	if UnitIsGhost("player") then
 		local zone = HBD:GetPlayerZone()
 		local corpse = zone and C_DeathInfo.GetCorpseMapPosition(zone)
 		if corpse then
 			local x, y, instance = HBD:GetWorldCoordinatesFromZone(corpse.x, corpse.y, zone)
-			if x then return x, y, instance end
+			if x then ns.targetSource = "corpse"; return x, y, instance end
 		end
 		return
 	end
 	local arrow = _G.GuidelimeArrow
 	local el = arrow and arrow.element
-	if not el or el.completed or not el.wx or not el.wy then return end
+	if not el or el.completed or not el.wx or not el.wy then
+		local px, py, instance = HBD:GetPlayerWorldPosition()
+		if not px then return end
+		local x, y, inst = ns.QuestieTarget(px, py, instance)
+		if x then ns.targetSource = "questie" end
+		return x, y, inst
+	end
 	local tomtom = GuidelimeData and GuidelimeData.useTomTomArrow and TomTom
 	if not arrow:IsShown() and not tomtom then return end
+	ns.targetSource = "guidelime"
 	return el.wx, el.wy, el.instance
 end
 
@@ -59,9 +162,12 @@ function ns.WhyNoTarget()
 	local arrow = _G.GuidelimeArrow
 	local el = arrow and arrow.element
 	if not arrow then return "Guidelime's arrow frame is not loaded" end
-	if not el then return "Guidelime's current step has no map position" end
-	if el.completed then return "Guidelime's current step is already done" end
-	if not el.wx or not el.wy then return "Guidelime's current step has no world position" end
+	if not el or el.completed or not el.wx or not el.wy then
+		local why = not el and "Guidelime's current step has no map position"
+			or el.completed and "Guidelime's current step is already done"
+			or "Guidelime's current step has no world position"
+		return why .. ", and no Questie fallback: " .. (fallback.why or "waiting for the next update")
+	end
 	local tomtom = GuidelimeData and GuidelimeData.useTomTomArrow and TomTom
 	if not arrow:IsShown() and not tomtom then return "Guidelime's arrow is hidden (show it in Guidelime's options)" end
 	if el.instance ~= instance then return format("the step is on another continent (%s, you are on %s)", tostring(el.instance), tostring(instance)) end
@@ -249,6 +355,11 @@ local function status()
 			n and n > 0 and format("%d path nodes, %d links (built %s)", n, e, built or "?") or "no path data yet (straight line)"))
 	end
 	local p = ns.path
+	if ns.targetSource == "questie" then
+		ns.Print(format("  target from Questie (Guidelime's step has no map position): %s for %s",
+			({ available = "quest giver", complete = "turn-in" })[fallback.kind] or "objective", fallback.quest or "?")
+			.. (fallback.name and (" (" .. fallback.name .. ")") or ""))
+	end
 	if p then
 		ns.Print(format("  path: %d corners, %s, next corner %d, %.0f yd to go", p.n, p.graph and "walkable route" or "straight line", p.k, p.remaining or 0))
 	else

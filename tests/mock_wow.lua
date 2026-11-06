@@ -31,6 +31,9 @@ function FrameMT:SetAlpha(a) self.alpha = a end
 function FrameMT:SetTexture(t) self.texture = t end
 function FrameMT:SetVertexColor() end
 function FrameMT:SetText(t) self.text = t end
+function FrameMT:GetText() return self.text end
+function FrameMT:GetChecked() return self.checked end
+function FrameMT:GetParent() return self.parent end
 function FrameMT:CreateTexture() local t = M.NewFrame(); t.shown = true; self.children = self.children or {}; table.insert(self.children, t); return t end
 function FrameMT:CreateFontString() return M.NewFrame() end
 
