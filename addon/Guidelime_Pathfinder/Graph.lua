@@ -294,6 +294,15 @@ function Graph.FindPath(instance, sx, sy, tx, ty, indoors, cb)
 	driver:Show()
 end
 
+-- Height of the path point nearest to (x, y), or nil if none within 30 yards (used by /gpath probe).
+function Graph.NearestZ(instance, x, y, indoors)
+	local g = graphs[instance]
+	if not g or (g.n or 0) == 0 then return end
+	decodeNodes(g)
+	local found = nearest(g, x, y, 1, indoors)
+	if found[1] and found[1][2] < 30 then return g.z[found[1][1]] end
+end
+
 function Graph.Stats(instance)
 	local g = graphs[instance]
 	if not g then return end

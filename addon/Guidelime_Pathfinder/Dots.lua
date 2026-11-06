@@ -310,7 +310,8 @@ function Dots.Probe()
 	local pz
 	if p and p.seg then _, _, pz = ns.PointOnSeg(p, p.seg, p.segT or 0) end
 	local u1, u2, u3, u4 = UnitPosition("player")
-	local z0 = pz or u3 or 0
+	local gz = ns.Graph.NearestZ(instance, px, py, IsIndoors())
+	local z0 = pz or gz or u3 or 0
 	local facing = GetPlayerFacing() or 0
 	local ui = UIParent:GetEffectiveScale()
 	local wcx, wcy = WorldFrame:GetCenter()
@@ -318,7 +319,7 @@ function Dots.Probe()
 	local rec = {
 		version = C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON, "Version"),
 		build = { GetBuildInfo() },
-		player = { x = px, y = py, instance = instance, pathZ = pz, unitPosition = { u1, u2, u3, u4 }, facing = facing,
+		player = { x = px, y = py, instance = instance, pathZ = pz, graphZ = gz, unitPosition = { u1, u2, u3, u4 }, facing = facing,
 			zoom = GetCameraZoom(), mounted = IsMounted(), indoors = IsIndoors(), race = select(2, UnitRace("player")),
 			sex = UnitSex("player"), map = C_Map.GetBestMapForUnit("player") },
 		screen = { ui = ui, uiW = UIParent:GetWidth(), uiH = UIParent:GetHeight(), worldW = WorldFrame:GetWidth(),

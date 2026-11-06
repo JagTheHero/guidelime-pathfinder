@@ -140,6 +140,15 @@ if ns.Graph.Has(0) then
 		wx, wy = M.WaypointWorld()
 		local q = ns.path
 		check(q and math.abs(wx - q.x[q.k]) < 1 and math.abs(wy - q.y[q.k]) < 1 and not ns.Marker.probing, "marker back on the path after the probe")
+
+		-- probe with no guide target: height comes from the nearest path point
+		GuidelimeArrow.element = nil
+		for _ = 1, 3 do M.Step(0.1) end
+		SlashCmdList.GUIDELIMEPATHFINDER("probe")
+		for _ = 1, 400 do M.Step(1 / 60) end
+		pr = ns.db.probes[#ns.db.probes]
+		check(pr.result == "done" and pr.player.graphZ and math.abs(pr.points[1].w[3] - M.pz) < 5 and M.waypoint == nil,
+			string.format("probe works without a guide target (height %.1f vs %.1f) and clears the marker after", pr.player.graphZ or -1, M.pz))
 	end
 end
 
