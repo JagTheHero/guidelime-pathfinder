@@ -74,6 +74,15 @@ function UnitIsGhost() return false end
 function GetPlayerFacing() return M.facing end
 function GetCameraZoom() return M.zoom end
 SlashCmdList = {}
+date = os.date
+function GetBuildInfo() return "1.60.1", "70790", "Nov 1 2026", 16001 end
+function GetPhysicalScreenSize() return M.W, M.H end
+function GetScreenWidth() return M.W end
+function GetScreenHeight() return M.H end
+function UnitPosition() return M.py, M.px, 0, M.instance end
+function UnitRace() return "Human", "Human", 1 end
+function UnitSex() return 2 end
+function Screenshot() M.screenshots = (M.screenshots or 0) + 1; M.pendingShot = true end
 C_CVar = { GetCVar = function(k) if k == "cameraFov" then return tostring(M.cvarFov or 90) end end }
 
 -- player + camera truth -------------------------------------------------------------------------
@@ -166,6 +175,7 @@ function M.Fire(event, ...)
 end
 function M.Step(dt)
 	M.now = M.now + dt
+	if M.pendingShot then M.pendingShot = false; M.Fire("SCREENSHOT_SUCCEEDED") end
 	M.UpdateNav()
 	for _, f in ipairs(M.frames) do
 		local fn = f.scripts.OnUpdate

@@ -97,6 +97,7 @@ if ns.Graph.Has(0) then
 		M.Step(0.05)
 		if ns.path and ns.path.graph then break end
 	end
+	for _ = 1, 3 do M.Step(0.1) end
 	local p = ns.path
 	check(p and p.graph and p.n > 3, "graph route planned (" .. (p and p.n or 0) .. " corners)")
 	if p and p.graph then
@@ -112,6 +113,30 @@ if ns.Graph.Has(0) then
 		check(onCorner, "marker steps to each next corner as the player walks")
 		wx, wy = M.WaypointWorld()
 		check(math.abs(wx - 62) < 1 and math.abs(wy + 9465) < 1, "last corner is the Guidelime target")
+
+		-- camera probe: walk back a bit so a path is active, then measure
+		M.px, M.py, M.pz = p.x[p.n - 2], p.y[p.n - 2], p.z[p.n - 2]
+		M.trueYaw, M.truePitch, M.facing = 2.4, 0.4, 2.4
+		for _ = 1, 3 do M.Step(0.1) end
+		local before = M.waypoint
+		SlashCmdList.GUIDELIMEPATHFINDER("probe")
+		for _ = 1, 400 do M.Step(1 / 60) end
+		local pr = ns.db.probes and ns.db.probes[#ns.db.probes]
+		check(pr and pr.result == "done" and #pr.points == 25 and M.screenshots == 1, "probe ran: 25 points and a screenshot")
+		local worst, seen = 0, 0
+		for _, pt in ipairs(pr and pr.points or {}) do
+			local s = pt.s[#pt.s]
+			local tx, ty = M.TrueProject(pt.w[1], pt.w[2], pt.w[3])
+			if s and tx and s[3] == 1 and s[4] == 0 then
+				seen = seen + 1
+				worst = math.max(worst, math.sqrt((s[1] - tx) ^ 2 + (s[2] - ty) ^ 2))
+			end
+		end
+		check(seen >= 10 and worst < 0.5, string.format("probe samples match where the game drew the marker (%d on screen)", seen))
+		check(pr and pr.capture and #pr.capture.dots > 0, "probe captured the dots frame")
+		wx, wy = M.WaypointWorld()
+		local q = ns.path
+		check(q and math.abs(wx - q.x[q.k]) < 1 and math.abs(wy - q.y[q.k]) < 1 and not ns.Marker.probing, "marker back on the path after the probe")
 	end
 end
 

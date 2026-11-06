@@ -258,10 +258,12 @@ SlashCmdList.GUIDELIMEPATHFINDER = function(msg)
 		ns.Print(cmd .. " = " .. db[field])
 	elseif cmd == "status" then
 		status()
+	elseif cmd == "probe" then
+		ns.Dots.Probe()
 	else
 		ns.Print("/gpath  - turn on/off")
 		ns.Print("/gpath marker | dots | minimap | worldmap | debug  - toggle a part")
-		ns.Print("/gpath status | replan")
+		ns.Print("/gpath status | replan | probe (measure the camera for the ground dots)")
 		ns.Print("/gpath spacing <yd> | range <yd> | size <yd> | height <yd> | fov <deg, 0 = auto>  - ground dot tuning")
 	end
 end

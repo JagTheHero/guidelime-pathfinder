@@ -132,7 +132,7 @@ end
 
 local function draw()
 	local db, p = ns.db, ns.path
-	if not db.dots or not db.marker or not p or not p.seg or not ns.Marker.IsActive() then return 0 end
+	if not db.dots or not db.marker or not p or not p.seg or ns.Marker.probing or not ns.Marker.IsActive() then return 0 end
 	local nav = C_Navigation.GetFrame()
 	if not nav or not C_Navigation.HasValidScreenPosition() or C_Navigation.WasClampedToScreen() then return 0 end
 	local px, py = ns.HBD:GetPlayerWorldPosition()
@@ -173,6 +173,14 @@ local function draw()
 	end
 	cam.yaw, cam.pitch = yaw, pitch
 	set(yaw, pitch)
+	-- one frame of the solve and the drawn dots, for /gpath probe
+	local cap = Dots.capture
+	if cap then
+		Dots.capture = nil
+		cap.solved = { nav = { ox, oy }, marker = m, focus = F, zoom = d, facing = facing, yaw = yaw, pitch = pitch, focal = focal, W = W, center = { scx, scy } }
+		cap.dots = {}
+	end
+	local rec = Dots.record or (cap and cap.dots)
 
 	local n = 0
 	local range, size = db.dotRange, db.dotSize
@@ -182,7 +190,7 @@ local function draw()
 		local sx, sy, cf, dirz = project(-x, y, z + 0.05)
 		if not sx then return end
 		n = n + 1
-		if Dots.record then Dots.record[n] = { x, y, z + 0.05, sx, sy } end
+		if rec then rec[n] = { x, y, z + 0.05, sx, sy } end
 		local t = dot(n)
 		local s = min(40, max(3, size * focal / cf))
 		t:SetSize(s, s * min(1, max(0.15, -dirz)))
@@ -206,3 +214,140 @@ layer:SetScript("OnUpdate", function()
 	end
 	for i = (ok and res or 0) + 1, #pool do pool[i]:Hide() end
 end)
+
+-- /gpath probe: measures the game's camera for offline fitting. Takes a screenshot with the dots, then moves
+-- the marker through points around the player and records where the game draws it on screen each time.
+-- Saved in GuidelimePathfinderDB.probes (written to disk on /reload or logout).
+local PROBE_ANGLES = { 0, 25, -25, 50, -50 }
+local PROBE_DISTANCES = { 6, 12, 24, 48 }
+local PROBE_RAISED = { { 12, 0, 5 }, { 24, 0, 10 }, { 12, 25, 5 }, { 24, -25, 10 }, { 12, 0, -3 } }
+local PROBE_FRAMES = 8 -- frames per point; the last half are recorded
+local PROBE_CVARS = { "cameraFov", "cameraDistanceMaxZoomFactor", "cameraPivot", "test_cameraOverShoulder",
+	"test_cameraDynamicPitch", "test_cameraHeadMovementStrength", "cameraIndirectVisibility", "cameraWaterCollision",
+	"renderScale", "uiScale", "useUiScale", "gxWindowedResolution", "gxFullscreenResolution", "gxMaximize", "screenshotFormat" }
+
+local probe
+local prober = CreateFrame("Frame")
+prober:Hide()
+
+local function cvar(name)
+	local ok, v = pcall(function() return C_CVar and C_CVar.GetCVar(name) or GetCVar(name) end)
+	return ok and v or nil
+end
+
+local function navSample()
+	local nav = C_Navigation.GetFrame()
+	local ui = UIParent:GetEffectiveScale()
+	local nx, ny, s = nil, nil, 1
+	if nav then
+		nx, ny = nav:GetCenter()
+		s = nav:GetEffectiveScale() / ui
+	end
+	return {
+		nx and nx * s, ny and ny * s,
+		C_Navigation.HasValidScreenPosition() and 1 or 0, C_Navigation.WasClampedToScreen() and 1 or 0,
+		C_Navigation.GetDistance(), GetPlayerFacing(), GetCameraZoom(), IsMouselooking() and 1 or 0,
+	}
+end
+
+local function finishProbe(msg)
+	local pr = probe
+	probe = nil
+	prober:Hide()
+	ns.Marker.probing = false
+	ns.Marker.pathId, ns.Marker.k = nil, nil -- put the marker back on the path at the next tick
+	if not ns.path then ns.Marker.Release() end
+	if not pr then return end
+	pr.rec.result = msg
+	local list = ns.db.probes or {}
+	ns.db.probes = list
+	list[#list + 1] = pr.rec
+	while #list > 6 do table.remove(list, 1) end
+	ns.Print(format("probe %d saved (%s, %d points). Type /reload so it is written to disk.", #list, msg, #pr.rec.points))
+end
+
+prober:SetScript("OnUpdate", function()
+	local pr = probe
+	if not pr then prober:Hide() return end
+	pr.frame = pr.frame + 1
+	if pr.stage == "capture" then
+		-- the dots layer filled Dots.capture during this frame (or could not draw); take the picture next
+		if pr.frame >= 2 then
+			pr.rec.capture = pr.capture.solved and pr.capture or nil
+			pr.rec.navBefore = navSample()
+			pr.rec.screenshot = date("%m%d%y_%H%M%S")
+			Screenshot()
+			pr.stage, pr.frame = "shot", 0
+		end
+	elseif pr.stage == "shot" then
+		if pr.shotDone or pr.frame > 90 then
+			ns.Marker.probing = true
+			pr.stage, pr.frame, pr.i = "points", 0, 0
+		end
+	elseif pr.stage == "points" then
+		local pt = pr.rec.points[pr.i]
+		if pt and pr.frame > PROBE_FRAMES / 2 then pt.s[#pt.s + 1] = navSample() end
+		if pr.i == 0 or pr.frame >= PROBE_FRAMES then
+			pr.i, pr.frame = pr.i + 1, 0
+			local nxt = pr.list[pr.i]
+			if not nxt then return finishProbe("done") end
+			if not ns.Marker.Place(nxt[1], nxt[2], nxt[3]) then return finishProbe("no map for a probe point") end
+			pr.rec.points[pr.i] = { w = nxt, s = {} }
+		end
+	end
+end)
+prober:RegisterEvent("SCREENSHOT_SUCCEEDED")
+prober:RegisterEvent("SCREENSHOT_FAILED")
+prober:SetScript("OnEvent", function(_, event)
+	if probe then probe.shotDone = event end
+end)
+
+function Dots.Probe()
+	if probe then return end
+	local px, py, instance = ns.HBD:GetPlayerWorldPosition()
+	if not px then ns.Print("probe: no player position here") return end
+	local p = ns.path
+	local pz
+	if p and p.seg then _, _, pz = ns.PointOnSeg(p, p.seg, p.segT or 0) end
+	local u1, u2, u3, u4 = UnitPosition("player")
+	local z0 = pz or u3 or 0
+	local facing = GetPlayerFacing() or 0
+	local ui = UIParent:GetEffectiveScale()
+	local wcx, wcy = WorldFrame:GetCenter()
+	local physW, physH = GetPhysicalScreenSize()
+	local rec = {
+		version = C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON, "Version"),
+		build = { GetBuildInfo() },
+		player = { x = px, y = py, instance = instance, pathZ = pz, unitPosition = { u1, u2, u3, u4 }, facing = facing,
+			zoom = GetCameraZoom(), mounted = IsMounted(), indoors = IsIndoors(), race = select(2, UnitRace("player")),
+			sex = UnitSex("player"), map = C_Map.GetBestMapForUnit("player") },
+		screen = { ui = ui, uiW = UIParent:GetWidth(), uiH = UIParent:GetHeight(), worldW = WorldFrame:GetWidth(),
+			worldH = WorldFrame:GetHeight(), worldScale = WorldFrame:GetEffectiveScale(), worldCenter = { wcx, wcy },
+			physical = { physW, physH }, screenW = GetScreenWidth(), screenH = GetScreenHeight() },
+		cvars = {},
+		settings = { focusHeight = ns.db.focusHeight, fov = ns.db.fov, calibF = ns.db.calibF },
+		points = {},
+	}
+	for _, name in ipairs(PROBE_CVARS) do rec.cvars[name] = cvar(name) end
+	if p then
+		rec.path = { n = p.n, k = p.k, seg = p.seg, segT = p.segT, graph = p.graph, corners = {} }
+		for i = max(1, p.k - 3), min(p.n, p.k + 6) do rec.path.corners[#rec.path.corners + 1] = { i, p.x[i], p.y[i], p.z and p.z[i] } end
+	end
+	local wp = C_Map.GetUserWaypoint()
+	if wp then rec.waypoint = { wp.uiMapID, wp.position.x, wp.position.y, wp.z } end
+
+	local list = {}
+	local function add(dist, ang, dz)
+		local a = facing + rad(ang)
+		list[#list + 1] = { px + dist * sin(a), py + dist * cos(a), z0 + dz }
+	end
+	for _, dist in ipairs(PROBE_DISTANCES) do
+		for _, ang in ipairs(PROBE_ANGLES) do add(dist, ang, 0) end
+	end
+	for _, r in ipairs(PROBE_RAISED) do add(r[1], r[2], r[3]) end
+
+	probe = { rec = rec, list = list, stage = "capture", frame = 0, capture = {} }
+	Dots.capture = probe.capture
+	ns.Print("probing the camera: hold still and keep the mouse off the camera for 4 seconds...")
+	prober:Show()
+end

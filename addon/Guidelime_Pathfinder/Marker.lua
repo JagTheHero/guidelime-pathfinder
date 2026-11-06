@@ -32,16 +32,22 @@ function Marker.IsActive()
 	return own ~= nil and C_SuperTrack.IsSuperTrackingUserWaypoint() and isOwn(C_Map.GetUserWaypoint())
 end
 
+-- Puts the super-tracked waypoint on a world point (HereBeDragons coordinates). False if no map takes it.
+function Marker.Place(x, y, z)
+	local m, mx, my = mapPointFor(x, y)
+	if not m then return false end
+	own = { m = m, x = mx, y = my }
+	C_Map.SetUserWaypoint(UiMapPoint.CreateFromCoordinates(m, mx, my, z))
+	C_SuperTrack.SetSuperTrackedUserWaypoint(true)
+	return true
+end
+
 function Marker.Update(p)
+	if Marker.probing then return end
 	if not p or not ns.db.marker or override then return Marker.Release() end
 	local k = p.k
 	if Marker.pathId == p.id and Marker.k == k then return end
-	local m, mx, my = mapPointFor(p.x[k], p.y[k])
-	if not m then return end
-	own = { m = m, x = mx, y = my }
-	Marker.pathId, Marker.k = p.id, k
-	C_Map.SetUserWaypoint(UiMapPoint.CreateFromCoordinates(m, mx, my, p.z and p.z[k] or nil))
-	C_SuperTrack.SetSuperTrackedUserWaypoint(true)
+	if Marker.Place(p.x[k], p.y[k], p.z and p.z[k] or nil) then Marker.pathId, Marker.k = p.id, k end
 end
 
 function Marker.Release()
@@ -76,7 +82,7 @@ function Marker.HookBlizzard()
 	local reached = SuperTrackedFrame.OnDestinationReached
 	SuperTrackedFrame.OnDestinationReached = function(self, isWaypoint)
 		local p = ns.path
-		if own and p and p.k < p.n then return end
+		if Marker.probing or (own and p and p.k < p.n) then return end
 		return reached(self, isWaypoint)
 	end
 	hooksecurefunc(SuperTrackedFrame, "UpdateDistanceText", function(self)
