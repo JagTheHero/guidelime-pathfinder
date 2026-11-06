@@ -151,7 +151,9 @@ local function draw()
 
 	local k = p.k
 	local _, _, pz = ns.PointOnSeg(p, p.seg, p.segT or 0)
-	local m = { -p.x[k], p.y[k], p.z and p.z[k] or 0 }
+	-- The game draws a user waypoint at the player's own height, whatever height it was given (measured
+	-- with /gpath probe), so the marker sits pz + 0 while the camera pivots at pz + focus height.
+	local m = { -p.x[k], p.y[k], pz }
 	if (m[1] + px) ^ 2 + (m[2] - py) ^ 2 < 36 then return 0 end -- marker too close to solve against
 	local h = db.focusHeight + (IsMounted() and 0.9 or 0)
 	local F = { -px, py, pz + h }

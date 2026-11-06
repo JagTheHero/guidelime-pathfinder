@@ -117,6 +117,17 @@ if ns.Graph.Has(0) then
 		wx, wy = M.WaypointWorld()
 		check(math.abs(wx - 62) < 1 and math.abs(wy + 9465) < 1, "last corner is the Guidelime target")
 
+		-- dots on a slope: the corners ahead are higher or lower than the player, the marker is not
+		local q = ns.path
+		local j = math.max(2, q.k - 2)
+		M.px, M.py, M.pz = q.x[j], q.y[j], q.z[j]
+		for _ = 1, 3 do M.Step(0.1) end
+		local yaw = math.atan2(q.x[q.k] - M.px, q.y[q.k] - M.py)
+		M.trueYaw, M.facing, M.truePitch = yaw, yaw, 0.4
+		worst, count = 0, 0
+		for _ = 1, 5 do worst, count = dotError() end
+		check(count > 3 and worst < 1.5, string.format("dots on a slope match (worst %.2f px, %d dots, next corner %.1f yd higher)", worst, count, q.z[q.k] - M.pz))
+
 		-- camera probe: walk back a bit so a path is active, then measure
 		M.px, M.py, M.pz = p.x[p.n - 2], p.y[p.n - 2], p.z[p.n - 2]
 		M.trueYaw, M.truePitch, M.facing = 2.4, 0.4, 2.4
@@ -129,7 +140,7 @@ if ns.Graph.Has(0) then
 		local worst, seen = 0, 0
 		for _, pt in ipairs(pr and pr.points or {}) do
 			local s = pt.s[#pt.s]
-			local tx, ty = M.TrueProject(pt.w[1], pt.w[2], pt.w[3])
+			local tx, ty = M.TrueProject(pt.w[1], pt.w[2], M.pz)
 			if s and tx and s[3] == 1 and s[4] == 0 then
 				seen = seen + 1
 				worst = math.max(worst, math.sqrt((s[1] - tx) ^ 2 + (s[2] - ty) ^ 2))

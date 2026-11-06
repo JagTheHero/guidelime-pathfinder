@@ -156,10 +156,10 @@ C_Navigation = {
 	GetDistance = function() local x, y = M.WaypointWorld(); return x and math.sqrt((x - M.px) ^ 2 + (y - M.py) ^ 2) or 0 end,
 }
 function M.UpdateNav()
-	local x, y, z = M.WaypointWorld()
+	local x, y = M.WaypointWorld()
 	M.navValid, M.navClamped = false, false
 	if not x or not M.superTracking then return end
-	local sx, sy = M.TrueProject(x, y, z)
+	local sx, sy = M.TrueProject(x, y, M.pz) -- like the game: drawn at the player's height, not the waypoint's
 	if not sx then M.navValid = true; M.navClamped = true; return end
 	M.navValid = true
 	M.navClamped = sx < 0 or sx > M.W or sy < 0 or sy > M.H

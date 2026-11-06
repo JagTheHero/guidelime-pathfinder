@@ -36,7 +36,6 @@ static const float SUBTILE = TILE / SUB;     // 133.33 yards
 static const int SUBCELLS = 266;             // Recast cells per Detour tile side
 static const float CS = SUBTILE / SUBCELLS;  // ~0.501 yards
 static const float CH = 0.25f;
-static const float SMALL_PROP = 4.0f;        // yards: M2 props narrower than this are not obstacles
 static const float AGENT_HEIGHT = 2.0f, AGENT_CLIMB = 1.25f, AGENT_RADIUS = 0.5f, MAX_SLOPE = 52.0f;
 
 enum Area : unsigned char { A_NULL = 0, A_GROUND = 1, A_SWIM = 2, A_INDOOR = 3 };
@@ -66,34 +65,6 @@ static bool readGeo(const std::string& path, Geo& g) {
 
 static std::string geoPath(const std::string& dir, int col, int row) { return dir + "/" + std::to_string(col) + "_" + std::to_string(row) + ".geo"; }
 
-// Standalone M2 props with a small footprint (tree trunks, posts, lamps, barrels, small rocks) are left out:
-// the player steers around them, and keeping them shreds open ground into slivers the graph has to route around.
-static void dropSmallProps(Geo& g) {
-	std::unordered_map<int64_t, std::array<float, 4>> box;
-	size_t nt = g.a.size();
-	for (size_t i = 0; i < nt; i++) {
-		int64_t k = g.k[i];
-		if (k < 0 || (k & 1)) continue;
-		auto it = box.emplace(k, std::array<float, 4>{ FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX }).first;
-		for (int j = 0; j < 3; j++) {
-			const float* v = &g.v[g.t[i * 3 + j] * 3];
-			auto& b = it->second;
-			b[0] = std::min(b[0], v[0]); b[1] = std::min(b[1], v[2]); b[2] = std::max(b[2], v[0]); b[3] = std::max(b[3], v[2]);
-		}
-	}
-	std::unordered_set<int64_t> small;
-	for (auto& kv : box) if (std::max(kv.second[2] - kv.second[0], kv.second[3] - kv.second[1]) < SMALL_PROP) small.insert(kv.first);
-	if (small.empty()) return;
-	size_t w = 0;
-	for (size_t i = 0; i < nt; i++) {
-		if (g.k[i] >= 0 && small.count(g.k[i])) continue;
-		for (int j = 0; j < 3; j++) g.t[w * 3 + j] = g.t[i * 3 + j];
-		g.a[w] = g.a[i]; g.k[w] = g.k[i];
-		w++;
-	}
-	g.t.resize(w * 3); g.a.resize(w); g.k.resize(w);
-}
-
 // Merge the 3x3 neighbourhood of an ADT tile, keeping each placed object once.
 static void loadNeighbourhood(const std::string& dir, int col, int row, Geo& out) {
 	std::unordered_set<int64_t> seen;
@@ -115,7 +86,6 @@ static void loadNeighbourhood(const std::string& dir, int col, int row, Geo& out
 		}
 		seen.insert(mine.begin(), mine.end());
 	}
-	dropSmallProps(out);
 }
 
 struct NavBlob { int tx, ty; std::vector<unsigned char> data; };
@@ -472,13 +442,14 @@ struct Builder {
 		return true;
 	}
 
-	// Close enough to straight that the player just steers around (tree trunks, posts, rocks).
+	// Straight, or bending at most a yard around something thin (a post); trees and rocks get routed around,
+	// since the ground dots are drawn exactly along these lines.
 	bool nearlyStraight(dtNavMeshQuery* q, const Node& a, const Node& b, unsigned char& flags) {
 		if (straight(q, a.ref, a.p, b.p, b.ref, flags) || straight(q, b.ref, b.p, a.p, a.ref, flags)) return true;
 		float len, dev;
 		if (!walk(q, a.ref, a.p, b.ref, b.p, len, dev, flags)) return false;
 		float d = dtVdist(a.p, b.p);
-		return len <= d * 1.06f + 1.0f && dev <= std::max(3.5f, d * 0.07f);
+		return len <= d * 1.02f + 0.5f && dev <= 1.0f;
 	}
 
 	// One node per walkable patch of every CELL x CELL square; points a short walk apart share a node.
