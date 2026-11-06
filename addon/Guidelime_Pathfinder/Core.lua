@@ -51,6 +51,23 @@ function ns.GetTarget()
 	return el.wx, el.wy, el.instance
 end
 
+-- Plain-words reason for /gpath status when there is no path.
+function ns.WhyNoTarget()
+	if not ns.db.enabled then return "turned off (/gpath turns it on)" end
+	local px, _, instance = HBD:GetPlayerWorldPosition()
+	if not px then return "the game gives no position here (instance or unmapped area)" end
+	local arrow = _G.GuidelimeArrow
+	local el = arrow and arrow.element
+	if not arrow then return "Guidelime's arrow frame is not loaded" end
+	if not el then return "Guidelime's current step has no map position" end
+	if el.completed then return "Guidelime's current step is already done" end
+	if not el.wx or not el.wy then return "Guidelime's current step has no world position" end
+	local tomtom = GuidelimeData and GuidelimeData.useTomTomArrow and TomTom
+	if not arrow:IsShown() and not tomtom then return "Guidelime's arrow is hidden (show it in Guidelime's options)" end
+	if el.instance ~= instance then return format("the step is on another continent (%s, you are on %s)", tostring(el.instance), tostring(instance)) end
+	return "waiting for the next update"
+end
+
 local function segDist(px, py, ax, ay, bx, by)
 	local dx, dy = bx - ax, by - ay
 	local l2 = dx * dx + dy * dy
@@ -183,11 +200,16 @@ end
 
 local ticker = CreateFrame("Frame")
 local elapsedSince = 0
+local shownErrors = {}
 ticker:SetScript("OnUpdate", function(_, elapsed)
 	elapsedSince = elapsedSince + elapsed
 	if elapsedSince < 0.1 then return end
 	elapsedSince = 0
-	tick()
+	local ok, err = pcall(tick)
+	if not ok and not shownErrors[err] then
+		shownErrors[err] = true
+		ns.Print("|cffff4040error:|r " .. tostring(err))
+	end
 end)
 ticker:Hide()
 
@@ -230,8 +252,9 @@ local function status()
 	if p then
 		ns.Print(format("  path: %d corners, %s, next corner %d, %.0f yd to go", p.n, p.graph and "walkable route" or "straight line", p.k, p.remaining or 0))
 	else
-		ns.Print("  no active Guidelime target")
+		ns.Print("  no path: " .. ns.WhyNoTarget())
 	end
+	ns.Print("  marker " .. (ns.Marker.IsActive() and "placed" or "not placed") .. (ns.Marker.probing and " (probing)" or ""))
 	ns.Print(format("  dots: spacing %d yd, range %d yd, size %.1f yd, camera height %.1f yd, fov %s",
 		db.dotSpacing, db.dotRange, db.dotSize, db.focusHeight, db.fov > 0 and db.fov or ns.Dots.FovText()))
 end

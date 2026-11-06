@@ -276,6 +276,7 @@ static int cmdTiles(const std::string& geoDir, const std::string& navDir, int th
 static const float CELL = 64.0f;          // graph cell size, yards
 static const int MAX_RAY_PATH = 512;
 static const float MIN_ISLAND = 400.0f;      // smaller walkable islands (roofs, tree tops, rocks) get no nodes
+static const float CLEAR = 8.0f;             // yards from walls that count as open ground when centring routes
 
 struct Node { float p[3]; dtPolyRef ref; int cx, cz; unsigned char area; };
 struct Edge { int a, b; unsigned char flags; };
@@ -395,6 +396,26 @@ struct Builder {
 		if (dtStatusSucceed(q->closestPointOnPoly(ref, m, out, &over))) dtVcopy(p, out);
 	}
 
+	// Shortest-path corners hug walls and rocks. Walk a point away from the nearest wall until it sits midway
+	// between walls, or CLEAR yards from any, so routes run down the middle of tunnels, doorways and passes.
+	void center(dtNavMeshQuery* q, dtPolyRef& ref, float* p) {
+		if (getenv("NAV_NOCENTER")) return;
+		float hd, hp[3], hn[3];
+		if (dtStatusFailed(q->findDistanceToWall(ref, p, CLEAR, &filter, &hd, hp, hn))) return;
+		float step = 2.0f, moved = 0;
+		for (int it = 0; it < 24 && hd < CLEAR && step > 0.1f && moved < CLEAR; it++) {
+			float target[3] = { p[0] + hn[0] * step, p[1], p[2] + hn[2] * step };
+			float res[3], h, nd, np[3], nn[3];
+			dtPolyRef visited[16]; int nv = 0;
+			if (dtStatusFailed(q->moveAlongSurface(ref, p, target, &filter, res, visited, &nv, 16)) || nv == 0) break;
+			dtPolyRef nref = visited[nv - 1];
+			if (dtStatusSucceed(q->getPolyHeight(nref, res, &h))) res[1] = h;
+			if (dtStatusFailed(q->findDistanceToWall(nref, res, CLEAR, &filter, &nd, np, nn)) || nd <= hd + 0.02f) { step *= 0.5f; continue; }
+			moved += dtVdist2D(p, res);
+			dtVcopy(p, res); ref = nref; hd = nd; dtVcopy(hn, nn);
+		}
+	}
+
 	unsigned char polyArea(dtPolyRef ref) {
 		const dtMeshTile* tile; const dtPoly* poly;
 		if (dtStatusFailed(nav->getTileAndPolyByRef(ref, &tile, &poly))) return 0;
@@ -491,6 +512,7 @@ struct Builder {
 						if (ci < 0 || compArea[ci] < MIN_ISLAND) continue;
 						if (dtStatusFailed(q->closestPointOnPoly(refs[i], c, cd.p, &over))) continue;
 						interior(q, refs[i], cd.p);
+						center(q, refs[i], cd.p);
 						float dx = cd.p[0] - c[0], dz = cd.p[2] - c[2];
 						if (fabsf(dx) > CELL / 2 || fabsf(dz) > CELL / 2) continue;
 						cd.d = dx * dx + dz * dz; cd.ref = refs[i];
@@ -605,6 +627,20 @@ struct Builder {
 				float len, dev; unsigned char fl;
 				if (!walk(q, a.ref, a.p, b.ref, b.p, len, dev, fl, &r.pts, &r.refs)) continue;
 				if (len > dtVdist(a.p, b.p) * 2.5f + 20) continue;
+				for (size_t k = 1; k + 1 < r.pts.size(); k++) {
+					Node prev, cur, nextN;
+					dtVcopy(prev.p, r.pts[k - 1].data()); prev.ref = k == 1 ? a.ref : r.refs[k - 1];
+					dtVcopy(cur.p, r.pts[k].data()); cur.ref = r.refs[k];
+					dtVcopy(nextN.p, r.pts[k + 1].data()); nextN.ref = k + 2 == r.pts.size() ? b.ref : r.refs[k + 1];
+					if (!cur.ref || !prev.ref || !nextN.ref) continue;
+					interior(q, cur.ref, cur.p); // corners sit exactly on the wall, where "away" has no direction
+					center(q, cur.ref, cur.p);
+					unsigned char f1, f2;
+					if (nearlyStraight(q, prev, cur, f1) && nearlyStraight(q, cur, nextN, f2)) {
+						r.pts[k] = { cur.p[0], cur.p[1], cur.p[2] };
+						r.refs[k] = cur.ref;
+					}
+				}
 				r.len = len;
 				r.fl.assign(r.pts.size(), fl);
 				lr.push_back(std::move(r));
@@ -722,6 +758,21 @@ struct Builder {
 			if (a == b || a < 0) continue;
 			uint64_t k = ((uint64_t)a << 32) | (uint32_t)b;
 			if (seen.insert(k).second) uniq.push_back({ a, b, e.flags });
+		}
+		if (getenv("NAV_DEBUG")) {
+			dtNavMeshQuery* q = dtAllocNavMeshQuery();
+			q->init(nav, 4096);
+			int hist[4] = { 0, 0, 0, 0 }, total = 0;
+			for (size_t i = 0; i < nodes.size(); i++) {
+				if (dead[i]) continue;
+				float hd, hp[3], hn[3];
+				if (dtStatusFailed(q->findDistanceToWall(nodes[i].ref, nodes[i].p, CLEAR, &filter, &hd, hp, hn))) continue;
+				total++;
+				hist[hd < 1 ? 0 : hd < 2 ? 1 : hd < 4 ? 2 : 3]++;
+			}
+			printf("wall clearance of nodes: <1 yd %.1f%%, 1-2 %.1f%%, 2-4 %.1f%%, 4+ %.1f%%\n", 100.0 * hist[0] / total,
+				100.0 * hist[1] / total, 100.0 * hist[2] / total, 100.0 * hist[3] / total);
+			dtFreeNavMeshQuery(q);
 		}
 		FILE* f = fopen(path.c_str(), "wb");
 		uint32_t ne = (uint32_t)uniq.size();

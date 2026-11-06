@@ -86,6 +86,9 @@ check(math.abs(wx - 50) < 1 and math.abs(wy - 500) < 1, "next guide step brings 
 GuidelimeArrow.element = nil
 for _ = 1, 3 do M.Step(0.1) end
 check(M.waypoint == nil, "marker cleared when Guidelime has no target")
+SlashCmdList.GUIDELIMEPATHFINDER("status")
+local said = table.concat(M.prints, "\n")
+check(said:find("no path: Guidelime's current step has no map position", 1, true) ~= nil, "status says why there is no path")
 
 -- real graph data: Northshire Abbey to Goldshire, then walk the route corner by corner
 if ns.Graph.Has(0) then
