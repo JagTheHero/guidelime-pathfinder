@@ -1,0 +1,142 @@
+"""Pack a navbuild .graph into the addon's Lua data file (format documented in Graph.lua).
+
+usage: pack.py <graph> <instance id> <map name> <out.lua> [min component nodes]
+
+Coordinates go to HereBeDragons world space (x = world Y, y = world X). Small disconnected pieces
+(mountain ledges, roofs) and swim nodes far out at sea are dropped.
+"""
+import datetime
+import sys
+
+import numpy as np
+
+from graphio import read_graph
+
+ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+OFFSET_XY, OFFSET_Z, Q = 17100, 4000, 4
+CS = 64  # lookup cell size, yards
+SEA_RANGE = 120  # swim nodes farther than this from any ground node are dropped
+NODE_INDOOR, NODE_SWIM = 1, 2
+AREA_SWIM, AREA_INDOOR = 2, 3
+
+
+def b64(values, width):
+    """Encode non-negative ints as fixed-width base-64 strings, concatenated."""
+    v = np.asarray(values, np.int64)
+    assert v.min(initial=0) >= 0 and v.max(initial=0) < 64 ** width, (v.min(), v.max(), width)
+    digits = np.stack([(v >> (6 * (width - 1 - k))) & 63 for k in range(width)], 1)
+    table = np.frombuffer(ALPHA.encode(), np.uint8)
+    return table[digits].tobytes().decode()
+
+
+def components(n, a, b):
+    parent = np.arange(n)
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+    for u, v in zip(a.tolist(), b.tolist()):
+        ru, rv = find(u), find(v)
+        if ru != rv:
+            parent[ru] = rv
+    return np.array([find(i) for i in range(n)])
+
+
+def keep_mask(hx, hy, area, a, b, min_comp):
+    n = len(hx)
+    keep = np.ones(n, bool)
+    # swim nodes far from any ground node
+    ground = area != AREA_SWIM
+    G = 128.0
+    cells = {}
+    for i in np.nonzero(ground)[0].tolist():
+        cells.setdefault((int(hx[i] // G), int(hy[i] // G)), []).append(i)
+    for i in np.nonzero(~ground)[0].tolist():
+        cx, cy = int(hx[i] // G), int(hy[i] // G)
+        near = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for j in cells.get((cx + dx, cy + dy), ()):
+                    if (hx[j] - hx[i]) ** 2 + (hy[j] - hy[i]) ** 2 < SEA_RANGE ** 2:
+                        near = True
+                        break
+                if near:
+                    break
+            if near:
+                break
+        keep[i] = near
+    # small components (after the sea cut)
+    m = keep[a] & keep[b]
+    comp = components(n, a[m], b[m])
+    _, inv, cnt = np.unique(comp, return_inverse=True, return_counts=True)
+    keep &= cnt[inv] >= min_comp
+    return keep
+
+
+def main():
+    path, instance, name, out = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+    min_comp = int(sys.argv[5]) if len(sys.argv) > 5 else 25
+    nodes, edges = read_graph(path)
+    hx = nodes['y'].astype(np.float64)  # HBD x = world Y
+    hy = nodes['x'].astype(np.float64)  # HBD y = world X
+    hz = nodes['z'].astype(np.float64)
+    area = nodes['area']
+    a, b, ef = edges['a'].astype(np.int64), edges['b'].astype(np.int64), edges['flags']
+
+    keep = keep_mask(hx, hy, area, a, b, min_comp)
+    em = keep[a] & keep[b]
+    print("%s: %d -> %d nodes, %d -> %d edges" % (name, len(hx), keep.sum(), len(a), em.sum()))
+
+    old = np.nonzero(keep)[0]
+    cx = np.floor((hx[old] + OFFSET_XY) / CS).astype(np.int64)
+    cy = np.floor((hy[old] + OFFSET_XY) / CS).astype(np.int64)
+    assert cx.max() < 1024 and cy.max() < 1024
+    key = cx + cy * 1024
+    order = np.lexsort((hy[old], hx[old], key))
+    old = old[order]
+    key = key[order]
+    new_id = np.full(len(hx), -1, np.int64)
+    new_id[old] = np.arange(len(old))
+
+    # directed adjacency, sorted by source then neighbour
+    ea, eb, efl = new_id[a[em]], new_id[b[em]], ef[em].astype(np.int64)
+    src = np.concatenate([ea, eb])
+    dst = np.concatenate([eb, ea])
+    fl = np.concatenate([efl, efl]) & 1
+    o = np.lexsort((dst, src))
+    src, dst, fl = src[o], dst[o], fl[o]
+    first = np.searchsorted(src, np.arange(len(old)))
+
+    n = len(old)
+    flags = np.where(area[old] == AREA_INDOOR, NODE_INDOOR, 0) | np.where(area[old] == AREA_SWIM, NODE_SWIM, 0)
+    qx = np.round((hx[old] + OFFSET_XY) * Q).astype(np.int64)
+    qy = np.round((hy[old] + OFFSET_XY) * Q).astype(np.int64)
+    qz = np.round((np.clip(hz[old], -OFFSET_Z, 60000) + OFFSET_Z) * Q).astype(np.int64)
+    rec = [b64(qx, 3), b64(qy, 3), b64(qz, 3), b64(flags, 1), b64(first, 4)]
+    node_str = "".join("".join(r[i * w:(i + 1) * w] for r, w in zip(rec, (3, 3, 3, 1, 4))) for i in range(n))
+    edge_rec = [b64(dst, 3), b64(fl, 1)]
+    edge_str = "".join(edge_rec[0][i * 3:i * 3 + 3] + edge_rec[1][i] for i in range(len(dst)))
+
+    ukeys, ufirst, ucount = np.unique(key, return_index=True, return_counts=True)
+    c0, c1, c2 = b64(ukeys, 4), b64(ufirst, 3), b64(ucount, 3)
+    cell_str = "".join(c0[i * 4:i * 4 + 4] + c1[i * 3:i * 3 + 3] + c2[i * 3:i * 3 + 3] for i in range(len(ukeys)))
+
+    built = datetime.date.today().isoformat()
+    with open(out, "w") as f:
+        f.write("-- Pathfinding graph for %s, generated by tools/pack.py from the game's terrain and buildings. Do not edit.\n" % name)
+        f.write("local _, ns = ...\n")
+        f.write("ns.Graph.Register(%d, {\n" % instance)
+        f.write('\tn = %d, e = %d, c = %d, cs = %d, built = "%s",\n' % (n, len(dst), len(ukeys), CS, built))
+        f.write('\tnodes = "%s",\n' % node_str)
+        f.write('\tedges = "%s",\n' % edge_str)
+        f.write('\tcells = "%s",\n' % cell_str)
+        f.write("})\n")
+    print("wrote %s: %d nodes, %d directed edges, %d cells, %.1f MB" % (out, n, len(dst), len(ukeys),
+          (len(node_str) + len(edge_str) + len(cell_str)) / 1e6))
+
+
+if __name__ == "__main__":
+    main()

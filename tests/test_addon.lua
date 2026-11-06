@@ -87,6 +87,34 @@ GuidelimeArrow.element = nil
 for _ = 1, 3 do M.Step(0.1) end
 check(M.waypoint == nil, "marker cleared when Guidelime has no target")
 
+-- real graph data: Northshire Abbey to Goldshire, then walk the route corner by corner
+if ns.Graph.Has(0) then
+	M.instance = 0
+	M.zone = { id = 1429, left = 1000, top = -8000, w = 3000, h = 3000 }
+	M.px, M.py = -133, -8914
+	GuidelimeArrow.element = { wx = 62, wy = -9465, instance = 0 }
+	for _ = 1, 200 do
+		M.Step(0.05)
+		if ns.path and ns.path.graph then break end
+	end
+	local p = ns.path
+	check(p and p.graph and p.n > 3, "graph route planned (" .. (p and p.n or 0) .. " corners)")
+	if p and p.graph then
+		wx, wy = M.WaypointWorld()
+		check(math.abs(wx - p.x[p.k]) < 1 and math.abs(wy - p.y[p.k]) < 1, "marker on the next corner, not the target")
+		local onCorner = true
+		for i = 2, p.n - 1 do
+			M.px, M.py = p.x[i], p.y[i]
+			for _ = 1, 3 do M.Step(0.1) end
+			wx, wy = M.WaypointWorld()
+			if ns.path ~= p or math.abs(wx - p.x[i + 1]) > 1 or math.abs(wy - p.y[i + 1]) > 1 then onCorner = false end
+		end
+		check(onCorner, "marker steps to each next corner as the player walks")
+		wx, wy = M.WaypointWorld()
+		check(math.abs(wx - 62) < 1 and math.abs(wy + 9465) < 1, "last corner is the Guidelime target")
+	end
+end
+
 -- slash commands do not error
 for _, cmd in ipairs({ "status", "dots", "dots", "fov 95", "fov 0", "help" }) do SlashCmdList.GUIDELIMEPATHFINDER(cmd) end
 check(true, "slash commands run")

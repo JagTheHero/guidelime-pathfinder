@@ -1,10 +1,11 @@
 local ADDON, ns = ...
 
 -- Walkable-path graphs, one per continent (instance ID), generated offline from the game's terrain,
--- buildings and doodads (tools/build_graph.py). Every edge is a straight line that was checked to be
--- walkable, so a path is just a list of corners. Data is packed into base-64 strings and read in place.
+-- buildings and doodads (tools/navbuild.cpp builds a navmesh and the graph, tools/pack.py packs it).
+-- Every edge is a straight line that was checked to be walkable (small props like trees aside), so a path
+-- is just a list of corners. Data is packed into base-64 strings and read in place.
 --
---   nodes: n records of 14 chars: x(3) y(3) z(3) flags(1) firstEdge(4)
+--   nodes: n records of 14 chars: x(3) y(3) z(3) flags(1: 1 indoor, 2 swim) firstEdge(4)
 --   edges: e records of 4 chars:  neighbour(3) flags(1)
 --   cells: c records of 10 chars: cellKey(4) firstNode(3) count(3)   (nodes are sorted by cell)
 -- Coordinates are HereBeDragons world coordinates (x west-positive, y north-positive), stored as
