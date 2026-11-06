@@ -244,6 +244,35 @@ if ns.Graph.Has(0) then
 	end
 end
 
+-- Ironforge: the halls lie under walkable mountainside. After a /reload on the Great Forge floor the player's
+-- height is the floor, the route leaves through the halls, and the dots stay on the floor.
+if ns.Graph.HasGround(0) then
+	M.instance = 0
+	M.zone = { id = 1455, left = 0, top = -4000, w = 3000, h = 3000 }
+	M.px, M.py, M.pz = -1166.4, -4808.5, 502.5
+	ns.player.gx, ns.player.z = nil, nil
+	GuidelimeArrow.element = { wx = -1400, wy = -5300, instance = 0 } -- southwest, where the mountainside is shorter
+	for _ = 1, 200 do
+		M.Step(0.05)
+		if ns.path and ns.path.graph then break end
+	end
+	for _ = 1, 3 do M.Step(0.1) end
+	local q = ns.path
+	check(ns.player.z and math.abs(ns.player.z - 502.5) < 3, string.format("Ironforge: the player's height is the forge floor (%.1f)", ns.player.z or -1))
+	check(q and q.graph and math.abs(q.z[1] - 502.5) < 8, string.format("Ironforge: the route starts in the halls (first corner at %.1f)", q and q.z[1] or -1))
+	if q and q.graph then
+		local yaw = math.atan2(q.x[q.k] - M.px, q.y[q.k] - M.py)
+		M.trueYaw, M.facing, M.truePitch = yaw, yaw, 0.4
+		for _ = 1, 3 do M.Step(1 / 60) end
+		ns.Dots.record = {}
+		M.Step(1 / 60)
+		local nd, worst = #ns.Dots.record, 0
+		for _, r in ipairs(ns.Dots.record) do worst = math.max(worst, math.abs(r[3] - M.pz)) end
+		ns.Dots.record = nil
+		check(nd > 3 and worst < 15, string.format("Ironforge: the dots stay in the halls (%d dots, at most %.1f yd from the floor)", nd, worst))
+	end
+end
+
 -- slash commands do not error
 for _, cmd in ipairs({ "status", "dots", "dots", "fov 95", "fov 0", "help" }) do SlashCmdList.GUIDELIMEPATHFINDER(cmd) end
 check(true, "slash commands run")

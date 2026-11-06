@@ -21,6 +21,7 @@ local DEFAULTS = {
 }
 
 local OFF_PATH = 25   -- yards away from the path before replanning
+local OFF_LAYER = 30  -- yards above or below the path's line before replanning (the route is on another layer)
 local ADVANCE = 7     -- yards from a corner before the marker moves to the next one
 local GROUND_LOST = 1 -- seconds without ground that continues the tracked height before it jumps (a fall)
 
@@ -283,8 +284,12 @@ function ns.Plan(px, py, keepCurrent)
 	ns.Graph.FindPath(g.instance, px, py, g.x, g.y, IsIndoors(), function(p)
 		ns.planning = false
 		if key ~= goalKey then return end
-		if p then ns.SetPath(p, true) end
-	end)
+		if p then
+			-- no route from the player's layer nearby: do not keep replanning for being on another layer
+			p.otherLayer = ns.player.z and abs(p.z[1] - ns.player.z) > OFF_LAYER
+			ns.SetPath(p, true)
+		end
+	end, ns.player.z)
 end
 
 function ns.Stop()
@@ -308,9 +313,10 @@ function ns.TrackGround(px, py, instance)
 	local lineZ = onRoute and select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))
 	local pred, reach = ref, moved
 	if not ref then
-		-- first height (login, teleport): the route's or the nearest route point's, which pick the floor of
-		-- a building or the layer of a bridge, then the ground under the player within a few yards of it
-		pred, reach = lineZ or ns.Graph.NearestZ(instance, px, py, IsIndoors()), 6
+		-- first height (login, teleport): the layer most path nodes around are on, which picks the floor of a
+		-- building or the halls under a mountain, then the ground under the player within a few yards of it.
+		-- Not the route's: a route can start on another layer (it is planned from this height).
+		pred, reach = ns.Graph.LikelyZ(instance, px, py), 6
 	elseif lineZ and pl.linePath == p.id then
 		pred = lineZ + ref - pl.lineZ
 	end
@@ -351,7 +357,9 @@ local function tick()
 			measure(p)
 		end
 		ns.Follow(p, px, py)
-		if p.graph and p.off > OFF_PATH then
+		local pz = ns.player.z
+		local offLayer = p.graph and pz and not p.otherLayer and abs(pz - select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))) > OFF_LAYER
+		if p.graph and (p.off > OFF_PATH or offLayer) then
 			offSince = offSince or GetTime()
 			if GetTime() - offSince > 1.5 and not ns.planning then
 				offSince = nil
@@ -420,6 +428,10 @@ local function status()
 		ns.Print(format("  target from Questie (Guidelime's step has no map position): %s for %s",
 			({ available = "quest giver", complete = "turn-in" })[fallback.kind] or "objective", fallback.quest or "?")
 			.. (fallback.name and (" (" .. fallback.name .. ")") or ""))
+	end
+	if ns.player.z then
+		local line = p and p.graph and p.seg and select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))
+		ns.Print(format("  ground height under you %.1f yd%s", ns.player.z, line and format(", route here %.1f yd", line) or ""))
 	end
 	if p then
 		ns.Print(format("  path: %d corners, %s, next corner %d, %.0f yd to go", p.n, p.graph and "walkable route" or "straight line", p.k, p.remaining or 0))

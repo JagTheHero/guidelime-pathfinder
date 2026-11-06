@@ -27,6 +27,7 @@ local NODE_INDOOR = 1
 -- edge cost multipliers by edge flag (low 3 bits): 0 walk, 1 swim, 2 steep/slow
 local MULT = { [0] = 1, [1] = 1.7, [2] = 1.25 }
 local HEURISTIC_WEIGHT = 1.15
+local LAYER_GAP = 8 -- yards of height between a node and the player before the node counts as another layer
 local FRAME_BUDGET_MS = 4
 
 local graphs = {}
@@ -100,11 +101,15 @@ end
 
 -- Up to `count` nodes nearest to (x, y), as {id, distance} sorted by distance.
 -- indoors (from IsIndoors()) breaks ties between stacked floors and caves under open ground.
-local function nearest(g, x, y, count, indoors)
+-- The `count` nodes nearest to (x, y), as { id, distance, score }. With z (the player's ground height) nodes on
+-- another layer score far worse: Ironforge's halls lie under walkable mountainside. Without z, the game's
+-- indoor flag is a weak hint only (it says outdoors in Ironforge, whose halls are indoor in the map data).
+local function nearest(g, x, y, count, indoors, z)
 	local cs = g.cs
 	local cx, cy = floor((x + OFFSET_XY) / cs), floor((y + OFFSET_XY) / cs)
 	local found = {}
 	for _, r in ipairs({ 1, 2, 4 }) do
+		local fit = 0
 		for dy = -r, r do
 			for dx = -r, r do
 				local first, cnt = cellNodes(g, cx + dx, cy + dy)
@@ -113,13 +118,19 @@ local function nearest(g, x, y, count, indoors)
 						local ddx, ddy = g.x[id] - x, g.y[id] - y
 						local d = sqrt(ddx * ddx + ddy * ddy)
 						local score = d
-						if indoors ~= nil and ((g.f[id] % 2 == NODE_INDOOR) ~= indoors) then score = score + 15 end
+						if z then
+							local dz = abs(g.z[id] - z)
+							if dz > LAYER_GAP then score = score + 3 * dz else fit = fit + 1 end
+						else
+							if indoors ~= nil and ((g.f[id] % 2 == NODE_INDOOR) ~= indoors) then score = score + 3 end
+							fit = fit + 1
+						end
 						found[#found + 1] = { id, d, score }
 					end
 				end
 			end
 		end
-		if #found >= count or r == 4 then break end
+		if fit >= count or r == 4 then break end
 		wipe(found)
 	end
 	table.sort(found, function(a, b) return a[3] < b[3] end)
@@ -159,10 +170,10 @@ local function heapPop(hk, hv, n)
 	return topK, topV, n
 end
 
-local function search(g, sx, sy, tx, ty, indoors)
+local function search(g, sx, sy, tx, ty, indoors, sz)
 	decodeNodes(g)
 	local gx, gy, gz = g.x, g.y, g.z
-	local starts = nearest(g, sx, sy, 4, indoors)
+	local starts = nearest(g, sx, sy, 4, indoors, sz)
 	local goals = nearest(g, tx, ty, 3, nil)
 	if #starts == 0 or #goals == 0 then return end
 
@@ -274,14 +285,15 @@ driver:SetScript("OnUpdate", function(self)
 	until debugprofilestop() - t0 > FRAME_BUDGET_MS
 end)
 
--- Calls cb(path) later with a path table {x, y, z, n} from (sx, sy) to (tx, ty), or cb(nil).
-function Graph.FindPath(instance, sx, sy, tx, ty, indoors, cb)
+-- Calls cb(path) later with a path table {x, y, z, n} from (sx, sy) to (tx, ty), or cb(nil). sz, the player's
+-- ground height if known, starts the path on the player's layer.
+function Graph.FindPath(instance, sx, sy, tx, ty, indoors, cb, sz)
 	local g = graphs[instance]
 	if not g or (g.n or 0) == 0 then cb(nil) return end
 	local j = { cb = cb }
 	j.co = create(function()
 		local t0 = debugprofilestop()
-		local ids, cost, expanded = search(g, sx, sy, tx, ty, indoors)
+		local ids, cost, expanded = search(g, sx, sy, tx, ty, indoors, sz)
 		if ids then
 			j.result = buildPath(g, smooth(g, ids), sx, sy, tx, ty)
 			ns.Debug(format("path: %d corners, %.0f yd, %d nodes searched, %.0f ms", j.result.n, cost, expanded, debugprofilestop() - t0))
@@ -412,6 +424,26 @@ function Graph.GroundZ(instance, x, y, ref, reach)
 	end
 	if wsum > 1e-3 then return sum / wsum end
 	if anyW > 1e-3 then return nil, any / anyW end
+end
+
+-- Most likely ground height at (x, y) when nothing else is known (login, teleport): the layer most path nodes
+-- within 40 yards are on, nearer nodes counting more. Ironforge's halls win over the mountainside above them.
+function Graph.LikelyZ(instance, x, y)
+	local g = graphs[instance]
+	if not g or (g.n or 0) == 0 then return end
+	decodeNodes(g)
+	local found = nearest(g, x, y, 12)
+	local best, bestScore
+	for _, a in ipairs(found) do
+		if a[2] < 40 then
+			local score = 0
+			for _, b in ipairs(found) do
+				if b[2] < 40 and abs(g.z[b[1]] - g.z[a[1]]) < LAYER_GAP then score = score + 1 / (b[2] + 10) end
+			end
+			if not bestScore or score > bestScore then best, bestScore = g.z[a[1]], score end
+		end
+	end
+	return best
 end
 
 function Graph.Stats(instance)
