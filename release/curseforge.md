@@ -8,7 +8,8 @@
 - Categories: Map & Minimap (main), Quests & Leveling
 - License: MIT License
 - Description: everything under "Description" below (Markdown)
-- Logo / gallery: 2-3 in-game screenshots of the marker, the ground dots and the map trail
+- Logo: `release/logo-draft.png` (1024x1024)
+- Gallery: 2-3 in-game screenshots of the marker, the ground dots and the map trail
 
 ## File upload
 
