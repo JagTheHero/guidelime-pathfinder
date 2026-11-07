@@ -1130,7 +1130,7 @@ int main(int argc, char** argv) {
 		}
 		return 0;
 	}
-	if (cmd == "line") { // navbuild line <nav_dir> <X1> <Y1> <Z1> <X2> <Y2> <Z2>: the edge checks between two world points
+	if (cmd == "line") { // navbuild line <nav_dir> <X1> <Y1> <Z1> <X2> <Y2> <Z2>: the edge checks between two world points (LINE_PROFILE=1: and the ground under it)
 		if (argc < 9) return 1;
 		Builder b;
 		b.nav = loadNavMesh(argv[2]);
@@ -1151,6 +1151,132 @@ int main(int argc, char** argv) {
 		printf("straight b->a %d flags %d\n", s2, fl);
 		bool w = b.walk(q, n[0].ref, n[0].p, n[1].ref, n[1].p, len, dev, fl);
 		printf("walk %d len %.1f direct %.1f dev %.1f flags %d\n", w, len, dtVdist(n[0].p, n[1].p), dev, fl);
+		if (getenv("LINE_PROFILE")) { // every walkable layer under the line, every yard: "profile <yards> <height>..."
+			float d = dtVdist2D(n[0].p, n[1].p);
+			for (int k = 0; k <= (int)d; k++) {
+				float t = k / std::max(d, 0.01f), p[3] = { n[0].p[0] + (n[1].p[0] - n[0].p[0]) * t, 0, n[0].p[2] + (n[1].p[2] - n[0].p[2]) * t };
+				float ext[3] = { 0.4f, 5000, 0.4f };
+				dtPolyRef refs[128]; int m = 0;
+				q->queryPolygons(p, ext, &b.filter, refs, &m, 128);
+				printf("profile %d", k);
+				for (int i = 0; i < m; i++) {
+					float cp[3]; bool over;
+					if (dtStatusSucceed(q->closestPointOnPoly(refs[i], p, cp, &over)) && dtVdist2D(cp, p) <= 0.3f) printf(" %.1f:%d", cp[1], b.polyArea(refs[i]));
+				}
+				printf("\n");
+			}
+		}
+		return 0;
+	}
+	if (cmd == "walkcheck") { // navbuild walkcheck <nav_dir> <graph> <threads> [failures.txt]: walks every edge on the navmesh a yard at a time
+		// A check independent of the raycasts that built the edges: from each end, follow the ground the line is on
+		// (the layer within MAX_STEP of the last height: the deck, not the river under it). Skimming a rock or a tree
+		// is fine: edges may bend up to a yard around something thin, so ground on the line's level within GRAZE
+		// yards counts. An edge fails where that ground is missing for more than MAX_GAP yards or the line ends off
+		// the other end's level: it runs off a bridge, a pier or a ledge ("drop": other ground under or over it
+		// there) or over a hole ("hole": none).
+		static const float STEP = 1.0f, MAX_STEP = 2.0f, MAX_GAP = 3.0f, END_LEVEL = 3.0f, GRAZE = 1.2f;
+		Builder b;
+		b.nav = loadNavMesh(argv[2]);
+		if (!b.nav) return 1;
+		FILE* f = fopen(argv[3], "rb");
+		char magic[4]; uint32_t nn = 0, ne = 0;
+		if (!f || fread(magic, 1, 4, f) != 4 || memcmp(magic, "GRF1", 4) || fread(&nn, 4, 1, f) != 1 || fread(&ne, 4, 1, f) != 1) { fprintf(stderr, "cannot read %s\n", argv[3]); return 1; }
+		std::vector<std::array<float, 3>> pos(nn); // recast coords
+		for (uint32_t i = 0; i < nn; i++) {
+			float w[3]; unsigned char area;
+			if (fread(w, 4, 3, f) != 3 || fread(&area, 1, 1, f) != 1) return 1;
+			pos[i] = { w[1], w[2], w[0] };
+		}
+		std::vector<Edge> es(ne);
+		for (uint32_t i = 0; i < ne; i++) {
+			int32_t ab[2]; unsigned char fl;
+			if (fread(ab, 4, 2, f) != 2 || fread(&fl, 1, 1, f) != 1) return 1;
+			es[i] = { ab[0], ab[1], fl };
+		}
+		fclose(f);
+		std::atomic<size_t> next{ 0 }, failed{ 0 }, failedLong{ 0 }, longEdges{ 0 }, drops{ 0 };
+		std::mutex m;
+		std::vector<std::string> shown;
+		FILE* out = argc > 5 ? fopen(argv[5], "w") : nullptr; // every failing edge: ends, flags, kind, where, line height, depth of the ground under it
+		// ground nearest height h within r yards of p (2D), and whether any ground at all is within 0.3 yards
+		auto groundNear = [&](dtNavMeshQuery* q, const float* p, float h, float r, bool* any) {
+			float ext[3] = { r + 0.1f, 60, r + 0.1f }, best = FLT_MAX;
+			dtPolyRef refs[128]; int m2 = 0;
+			q->queryPolygons(p, ext, &b.filter, refs, &m2, 128);
+			for (int i = 0; i < m2; i++) {
+				float cp[3]; bool over;
+				if (dtStatusFailed(q->closestPointOnPoly(refs[i], p, cp, &over))) continue;
+				float d = dtVdist2D(cp, p);
+				if (any && d <= 0.3f) *any = true;
+				if (d <= r && fabsf(cp[1] - h) < fabsf(best - h)) best = cp[1];
+			}
+			return best;
+		};
+		// at: where the walk lost its ground (at the line's height there)
+		auto walkOne = [&](dtNavMeshQuery* q, const float* a, const float* e, float* at, bool* drop) {
+			float dx = e[0] - a[0], dz = e[2] - a[2], len = sqrtf(dx * dx + dz * dz), h = a[1], gap = 0;
+			bool otherLevel = false;
+			int n = std::max(1, (int)ceilf(len / STEP));
+			for (int k = 1; k <= n; k++) {
+				float t = (float)k / n, p[3] = { a[0] + dx * t, h, a[2] + dz * t }, ext[3] = { 0.3f, 60, 0.3f };
+				dtPolyRef refs[64]; int m2 = 0;
+				q->queryPolygons(p, ext, &b.filter, refs, &m2, 64);
+				float best = FLT_MAX;
+				for (int i = 0; i < m2; i++) {
+					float cp[3]; bool over;
+					if (dtStatusFailed(q->closestPointOnPoly(refs[i], p, cp, &over)) || dtVdist2D(cp, p) > 0.3f) continue;
+					if (fabsf(cp[1] - h) < fabsf(best - h)) best = cp[1];
+				}
+				if (fabsf(best - h) <= MAX_STEP + gap * 1.3f) { h = best; gap = 0; otherLevel = false; continue; }
+				bool any = false;
+				float graze = groundNear(q, p, h, GRAZE, &any);
+				if (fabsf(graze - h) <= MAX_STEP + gap * 1.3f) { h = graze; gap = 0; otherLevel = false; continue; } // skims something
+				otherLevel = otherLevel || any;
+				if ((gap += len / n) > MAX_GAP) { dtVcopy(at, p); at[1] = h; *drop = otherLevel; return false; }
+			}
+			if (fabsf(h - e[1]) > END_LEVEL) { dtVcopy(at, e); at[1] = h; *drop = true; return false; }
+			return true;
+		};
+		auto worker = [&]() {
+			dtNavMeshQuery* q = dtAllocNavMeshQuery();
+			q->init(b.nav, 4096);
+			for (;;) {
+				size_t i = next++;
+				if (i >= es.size()) break;
+				const float* a = pos[es[i].a].data(); const float* e = pos[es[i].b].data();
+				bool isLong = dtVdist2D(a, e) > 145;
+				if (isLong) longEdges++;
+				float at[3]; bool drop = false;
+				if (walkOne(q, a, e, at, &drop) && walkOne(q, e, a, at, &drop)) continue;
+				failed++;
+				if (isLong) failedLong++;
+				if (drop) drops++;
+				if (out) {
+					bool any;
+					float under = groundNear(q, at, -1e6f, 0.3f, &any); // the lowest ground there
+					float t = dtVdist2D(a, at) / std::max(0.01f, dtVdist2D(a, e));
+					std::lock_guard<std::mutex> l(m);
+					fprintf(out, "%.1f %.1f %.1f %.1f %.1f %.1f %d %s %.2f %.1f %.1f\n", a[2], a[0], a[1], e[2], e[0], e[1], es[i].flags,
+						drop ? "drop" : "hole", std::min(t, 1 - t), at[1], under == FLT_MAX ? NAN : at[1] - under);
+				}
+				std::lock_guard<std::mutex> l(m);
+				if (shown.size() < 25) {
+					char line[256];
+					snprintf(line, sizeof line, "  world (%.1f %.1f %.1f) - (%.1f %.1f %.1f), %.0f yd, flags %d: %s at (%.1f %.1f %.1f)",
+						a[2], a[0], a[1], e[2], e[0], e[1], dtVdist2D(a, e), es[i].flags, drop ? "drop" : "hole", at[2], at[0], at[1]);
+					shown.push_back(line);
+				}
+			}
+			dtFreeNavMeshQuery(q);
+		};
+		std::vector<std::thread> pool;
+		for (int i = 0; i < std::max(1, threads); i++) pool.emplace_back(worker);
+		for (auto& t : pool) t.join();
+		for (auto& s : shown) printf("%s\n", s.c_str());
+		if (out) fclose(out);
+		printf("edges walked: %u, off their ground: %zu (%.3f%%), %zu of them drops; long edges (over 145 yd): %zu, off their ground: %zu\n",
+			ne, failed.load(), 100.0 * failed / std::max<uint32_t>(1, ne), drops.load(), longEdges.load(), failedLong.load());
 		return 0;
 	}
 	if (cmd == "paths") { // navbuild paths <nav_dir> <pairs.txt> <threads>: Detour's string-pulled path per "X1 Y1 Z1 X2 Y2 Z2" line

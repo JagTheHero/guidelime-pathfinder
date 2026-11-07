@@ -1,6 +1,6 @@
 # Guidelime Pathfinder
 
-## Unreleased
+## 0.4.0 (beta)
 
 - Routes no longer step off bridges and piers: every shortcut in the path data is checked to be a straight
   walk, and narrow walkways and water cost more, so a route takes the bridge deck or the street instead of a
