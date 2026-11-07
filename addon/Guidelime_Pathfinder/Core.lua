@@ -24,6 +24,12 @@ local OFF_PATH = 25   -- yards away from the path before replanning
 local OFF_LAYER = 30  -- yards above or below the path's line before replanning (the route is on another layer)
 local ADVANCE = 7     -- yards from a corner before the marker moves to the next one
 local GROUND_LOST = 1 -- seconds without ground that continues the tracked height before it jumps (a fall)
+-- trips (flight paths, boats, zeppelins, lifts, the tram, portals): yards from where a ride starts that count as
+-- being there, and from where it ends that count as arrived (a ship stops off its dock); seconds past a ride's
+-- wait and ride before it counts as missed
+local AT_START = { boat = 30, zeppelin = 30, lift = 8, tram = 15, portal = 15 }
+local ARRIVED = { boat = 50, zeppelin = 40, lift = 60, tram = 40, portal = 40 } -- a lift's end is told by height
+local RIDE_SPARE = 90
 
 ns.player = {}
 ns.goal = {}
@@ -172,7 +178,9 @@ function ns.WhyNoTarget()
 	end
 	local tomtom = GuidelimeData and GuidelimeData.useTomTomArrow and TomTom
 	if not arrow:IsShown() and not tomtom then return "Guidelime's arrow is hidden (show it in Guidelime's options)" end
-	if el.instance ~= instance then return format("the step is on another continent (%s, you are on %s)", tostring(el.instance), tostring(instance)) end
+	if el.instance ~= instance then
+		return format("the step is on another continent (%s, you are on %s) and no boat or zeppelin you can take goes there", tostring(el.instance), tostring(instance))
+	end
 	return "waiting for the next update"
 end
 
@@ -273,15 +281,19 @@ function ns.Follow(p, px, py)
 	p.remaining = dist(px, py, p.x[k], p.y[k]) + p.len[p.n] - p.len[k]
 end
 
+-- Plans the trip to the goal (unless keepCurrent: an off-route replan) and the walk to where its next ride or
+-- flight starts, or to the goal.
 function ns.Plan(px, py, keepCurrent)
-	local g = ns.goal
+	if not keepCurrent then ns.PlanTrip(px, py) end
+	local d = ns.dest
+	if not d or d.instance ~= ns.player.instance then return ns.Pause() end
 	if not keepCurrent or not ns.path then
-		ns.SetPath({ x = { px, g.x }, y = { py, g.y }, n = 2 }, false)
+		ns.SetPath({ x = { px, d.x }, y = { py, d.y }, n = 2 }, false)
 	end
-	if not ns.Graph.Has(g.instance) then return end
+	if not ns.Graph.Has(d.instance) or d.straight then return end
 	local key = goalKey
 	ns.planning = true
-	ns.Graph.FindPath(g.instance, px, py, g.x, g.y, IsIndoors(), function(p)
+	ns.Graph.FindPath(d.instance, px, py, d.x, d.y, IsIndoors(), function(p)
 		ns.planning = false
 		if key ~= goalKey then return end
 		if p then
@@ -289,14 +301,182 @@ function ns.Plan(px, py, keepCurrent)
 			p.otherLayer = ns.player.z and abs(p.z[1] - ns.player.z) > OFF_LAYER
 			ns.SetPath(p, true)
 		end
-	end, ns.player.z)
+	end, ns.player.z, d.z)
 end
 
 function ns.Stop()
 	if goalKey or ns.path then
 		goalKey, ns.path, ns.planning = nil, nil, false
+		ns.trip, ns.dest, ns.riding = nil, nil, nil
 		ns.Marker.Release()
 		ns.Trail.Refresh()
+	end
+end
+
+-- Nothing to walk for now (flying, on a boat, no way there): no marker or trail, but the plan stays.
+function ns.Pause()
+	if ns.path then
+		ns.path = nil
+		ns.Marker.Release()
+		ns.Trail.Refresh()
+	end
+end
+
+-- Trips -------------------------------------------------------------------------------------------------------
+-- Graph.PlanTrip picks walking, flight paths and rides; the route walks to where the next flight or ride
+-- starts (ns.trip.next), and the plan is made again from wherever the player is once it is over. The game
+-- says which flight masters the player has found; the taxi map highlights where to fly.
+local CONTINENT_MAP = { [0] = 1415, [1] = 1414 }
+local FACTION = { Alliance = "A", Horde = "H" }
+local TAXI_FACTION = { Horde = 1, Alliance = 2 } -- Enum.FlightPathFaction; 0 is neutral
+local KNOWN_FOR = 10 -- seconds the list of found flight masters is reused
+local known, knownAt, knownCount = {}, -huge, 0
+
+local function taxiNodes(mapID, mine, into)
+	local nodes = C_TaxiMap.GetTaxiNodesForMap(mapID) or {}
+	for _, n in ipairs(nodes) do
+		if not n.isUndiscovered and (n.faction == 0 or n.faction == mine) and n.nodeID then into[n.nodeID] = n.name end
+	end
+	return #nodes
+end
+
+-- [node id] = name of every flight master the player has found and may use
+function ns.KnownTaxi()
+	if GetTime() - knownAt < KNOWN_FOR then return known, knownCount end
+	knownAt = GetTime()
+	local found = {}
+	if C_TaxiMap and C_TaxiMap.GetTaxiNodesForMap then
+		local mine = TAXI_FACTION[UnitFactionGroup("player")]
+		for _, mapID in pairs(CONTINENT_MAP) do
+			-- no nodes on the continent map: ask its zones
+			if taxiNodes(mapID, mine, found) == 0 and C_Map.GetMapChildrenInfo then
+				for _, child in ipairs(C_Map.GetMapChildrenInfo(mapID, 3) or {}) do taxiNodes(child.mapID, mine, found) end
+			end
+		end
+	end
+	local n, changed = 0, false
+	for id, name in pairs(found) do
+		n = n + 1
+		if known[id] ~= name then changed = true end
+	end
+	if changed or n ~= knownCount then
+		known, knownCount = found, n
+		if not ns.riding then goalKey = nil end -- plan again with them
+	end
+	return known, knownCount
+end
+
+function ns.Speed()
+	local _, run = GetUnitSpeed("player")
+	return max(7, run or 7)
+end
+
+-- the zone at a world position, for a ship whose far stop has no name in the data
+local function placeName(pl)
+	local mapID = CONTINENT_MAP[pl.instance]
+	local x, y = mapID and HBD:GetZoneCoordinatesFromWorld(pl.x, pl.y, mapID, true)
+	local info = x and C_Map.GetMapInfoAtPosition and C_Map.GetMapInfoAtPosition(mapID, x, y)
+	return info and info.name
+end
+
+function ns.LegText(l)
+	if l.kind == "flight" then return "fly to " .. (l.to.name or "the next flight master") end
+	if l.kind == "lift" then return "take the lift " .. l.name end
+	local to = l.name ~= "" and l.name or placeName(l.to) or "the far shore"
+	if l.kind == "tram" then return "ride the Deeprun Tram to " .. to end
+	return "take the " .. l.kind .. " to " .. to
+end
+
+function ns.TripText(trip)
+	local parts = {}
+	for _, l in ipairs(trip.legs) do
+		if l.kind ~= "walk" then parts[#parts + 1] = ns.LegText(l) end
+	end
+	return table.concat(parts, ", then ")
+end
+
+local function hint(text)
+	ns.Print(text)
+	if UIErrorsFrame then UIErrorsFrame:AddMessage(text, 0.62, 1, 0.25) end
+end
+
+local said
+function ns.PlanTrip(px, py)
+	local pl, g = ns.player, ns.goal
+	local trip, unreachable = ns.Graph.PlanTrip({ instance = pl.instance, x = px, y = py, z = pl.z }, { instance = g.instance, x = g.x, y = g.y },
+		{ speed = ns.Speed(), faction = FACTION[UnitFactionGroup("player")], known = (ns.KnownTaxi()) })
+	ns.trip, ns.riding = trip, nil
+	local nextLeg
+	for _, l in ipairs(trip and trip.legs or {}) do
+		if l.kind ~= "walk" then nextLeg = l break end
+	end
+	if nextLeg then
+		trip.next = nextLeg
+		local f = nextLeg.from
+		ns.dest = { instance = f.instance, x = f.x, y = f.y, z = f.z }
+		local text = ns.TripText(trip)
+		if text ~= said then
+			said = text
+			ns.Print(format("route: %s (about %d min)", text, floor(trip.cost / 60 + 0.5)))
+		end
+	else
+		said = nil
+		-- no walkable way there (no lift, boat or portal either): a straight line, without a hopeless search
+		ns.dest = g.instance == pl.instance and { instance = g.instance, x = g.x, y = g.y, straight = unreachable } or nil
+	end
+end
+
+-- While the next leg is a ride: says what to do at its start, notices the ride under way and its end (then
+-- the plan is made again). Returns true while riding (nothing to walk).
+function ns.FollowRide(px, py, instance)
+	local trip = ns.trip
+	local l = trip and trip.next
+	if not l then return false end
+	local f, t, pz = l.from, l.to, ns.player.z
+	if l.kind == "flight" then -- the flight itself is UnitOnTaxi's
+		if not trip.boarded and instance == f.instance and dist(px, py, f.x, f.y) < 12 then
+			trip.boarded = GetTime()
+			hint(ns.LegText(l) .. ": talk to the flight master")
+		end
+		return false
+	end
+	local near = AT_START[l.kind] or 15
+	local dFrom = instance == f.instance and dist(px, py, f.x, f.y) or huge
+	local atStart = dFrom < near and (l.kind ~= "lift" or not pz or abs(pz - f.z) < 10)
+	if atStart then
+		if not trip.boarded then hint(ns.LegText(l)) end
+		trip.boarded = GetTime()
+	end
+	local arrived = instance == t.instance and dist(px, py, t.x, t.y) < (ARRIVED[l.kind] or 40)
+		and (l.kind ~= "lift" or (pz and abs(pz - t.z) < 10))
+	if arrived then
+		ns.riding, goalKey = nil, nil -- plan the rest from here
+		return false
+	end
+	if trip.boarded and dFrom > near + 10 then
+		if GetTime() - trip.boarded > l.wait * 2 + l.ride + RIDE_SPARE then
+			ns.riding, goalKey = nil, nil -- missed it, or got off: plan again
+			return false
+		end
+		ns.riding = l
+		return true
+	end
+	ns.riding = nil
+	return false
+end
+
+-- the taxi map: highlight the flight master to fly to
+local lit
+local function lightTaxi()
+	local l = ns.trip and ns.trip.next
+	if not l or l.kind ~= "flight" or not NumTaxiNodes then return end
+	for i = 1, NumTaxiNodes() do
+		if TaxiNodeName(i) == l.to.name then
+			lit = _G["TaxiButton" .. i]
+			if lit and lit.LockHighlight then lit:LockHighlight() end
+			ns.Print("fly to " .. l.to.name)
+			return
+		end
 	end
 end
 
@@ -333,22 +513,33 @@ function ns.TrackGround(px, py, instance)
 	return pl.z
 end
 
+local planInstance
 local function tick()
 	local db = ns.db
 	if not db.enabled then return ns.Stop() end
+	if UnitOnTaxi("player") then
+		ns.flying = true
+		return ns.Pause()
+	end
+	if ns.flying then ns.flying, goalKey = nil, nil end -- landed: plan the rest from here
 	local px, py, instance = HBD:GetPlayerWorldPosition()
 	if px then ns.TrackGround(px, py, instance) end
 	local tx, ty, tinstance = ns.GetTarget()
-	if not px or not tx or tinstance ~= instance then return ns.Stop() end
+	if not px or not tx then return ns.Stop() end
 	ns.player.x, ns.player.y, ns.player.instance = px, py, instance
+	ns.KnownTaxi()
+	local riding = ns.FollowRide(px, py, instance)
+	if instance ~= planInstance and not riding then goalKey = nil end
 
-	local key = instance .. ":" .. floor(tx) .. ":" .. floor(ty)
+	local key = tinstance .. ":" .. floor(tx) .. ":" .. floor(ty)
 	if key ~= goalKey then
-		goalKey = key
-		ns.goal.x, ns.goal.y, ns.goal.instance = tx, ty, instance
+		goalKey, planInstance = key, instance
+		ns.goal.x, ns.goal.y, ns.goal.instance = tx, ty, tinstance
 		ns.Marker.ResetOverride()
 		ns.Plan(px, py)
 	end
+	if riding then return ns.Pause() end
+	if not ns.dest or ns.dest.instance ~= instance then return ns.Pause() end
 
 	local p = ns.path
 	if p then
@@ -392,6 +583,9 @@ local events = CreateFrame("Frame")
 events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 events:RegisterEvent("USER_WAYPOINT_UPDATED")
+events:RegisterEvent("TAXIMAP_OPENED")
+events:RegisterEvent("TAXIMAP_CLOSED")
+events:RegisterEvent("TAXI_NODE_STATUS_CHANGED")
 events:SetScript("OnEvent", function(_, event, arg1)
 	if event == "ADDON_LOADED" then
 		if arg1 == ADDON then
@@ -407,6 +601,14 @@ events:SetScript("OnEvent", function(_, event, arg1)
 		ticker:Show()
 	elseif event == "USER_WAYPOINT_UPDATED" then
 		ns.Marker.OnWaypointUpdated()
+	else -- the taxi map: a flight master just found counts at once
+		knownAt = -huge
+		if event == "TAXIMAP_OPENED" then
+			C_Timer.After(0, lightTaxi) -- after the taxi frame has made its buttons
+		elseif event == "TAXIMAP_CLOSED" and lit then
+			lit:UnlockHighlight()
+			lit = nil
+		end
 	end
 end)
 
@@ -433,8 +635,17 @@ local function status()
 		local line = p and p.graph and p.seg and select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))
 		ns.Print(format("  ground height under you %.1f yd%s", ns.player.z, line and format(", route here %.1f yd", line) or ""))
 	end
+	local _, found = ns.KnownTaxi()
+	ns.Print(format("  flight paths: %d found%s", found, found == 0 and " (the game lists none yet)" or ""))
+	local trip = ns.trip
+	if trip and trip.next then
+		ns.Print(format("  trip: %s (about %d min)%s", ns.TripText(trip), floor(trip.cost / 60 + 0.5),
+			ns.flying and ", flying now" or ns.riding and ", under way" or ""))
+	end
 	if p then
 		ns.Print(format("  path: %d corners, %s, next corner %d, %.0f yd to go", p.n, p.graph and "walkable route" or "straight line", p.k, p.remaining or 0))
+	elseif ns.flying or ns.riding then
+		ns.Print("  no path while " .. (ns.flying and "flying" or "riding") .. ": the route goes on from where it ends")
 	else
 		ns.Print("  no path: " .. ns.WhyNoTarget())
 	end

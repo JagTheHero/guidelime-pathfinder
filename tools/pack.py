@@ -1,12 +1,14 @@
 """Pack a navbuild .graph into the addon's Lua data file (format documented in Graph.lua).
 
-usage: pack.py <graph> <instance id> <map name> <out.lua> [min component nodes] [--heights <file.hgt>]
+usage: pack.py <graph> <instance id> <map name> <out.lua> [min component nodes] [--heights <file.hgt>] [--links <links.json>]
 
 Coordinates go to HereBeDragons world space (x = world Y, y = world X). Small disconnected pieces
 (mountain ledges, roofs) and swim nodes far out at sea are dropped. With --heights, the ground heights
-(navbuild heights) of the cells near the kept nodes are packed too, for the ground dots.
+(navbuild heights) of the cells near the kept nodes are packed too, for the ground dots. With --links, this
+continent's flight paths, boats, lifts and portals (tools/links.py) are written as a plain table.
 """
 import datetime
+import json
 import sys
 
 import numpy as np
@@ -137,12 +139,43 @@ def pack_heights(cells, node_keys):
     return "".join(index), "".join(data), len(blocks)
 
 
+def lua_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return '"%s"' % v.replace("\\", "\\\\").replace('"', '\\"')
+    return repr(v)
+
+
+def lua_links(d, instance, piece_at):
+    """The links table; each flight master and ride end on this continent also gets its walkable piece (the
+    piece of a ride's far end on another continent is left false: the far continent's reverse ride has it)."""
+    if not d:
+        return ""
+    out = ["\tlinks = {\n", "\t\ttaxi = {\n"]
+    for node, pos in sorted(d["taxi"].items(), key=lambda kv: int(kv[0])):
+        out.append("\t\t\t[%s] = { %s },\n" % (node, ", ".join(map(lua_value, pos + [piece_at(*pos)]))))
+    out.append("\t\t},\n\t\tflights = {\n")
+    for f in d["flights"]:
+        out.append("\t\t\t%s,\n" % ", ".join(map(lua_value, f)))
+    out.append("\t\t},\n\t\trides = {\n")
+    for r in d["rides"]:
+        far = piece_at(*r[6:9]) if r[5] == instance else False
+        out.append("\t\t\t{ %s },\n" % ", ".join(map(lua_value, r + [piece_at(*r[2:5]), far])))
+    out.append("\t\t},\n\t},\n")
+    return "".join(out)
+
+
 def main():
     args = sys.argv[1:]
-    heights = None
+    heights = links = None
     if "--heights" in args:
         i = args.index("--heights")
         heights = args[i + 1]
+        del args[i:i + 2]
+    if "--links" in args:
+        i = args.index("--links")
+        links = args[i + 1]
         del args[i:i + 2]
     path, instance, name, out = args[0], int(args[1]), args[2], args[3]
     min_comp = int(args[4]) if len(args) > 4 else 25
@@ -187,6 +220,13 @@ def main():
     edge_rec = [b64(dst, 3), b64(fl, 1)]
     edge_str = "".join(edge_rec[0][i * 3:i * 3 + 3] + edge_rec[1][i] for i in range(len(dst)))
 
+    # walkable pieces: 0 for the biggest, then by size; links tell which piece a dock or landing is on
+    comp = components(n, ea, eb)
+    _, inv, cnt = np.unique(comp, return_inverse=True, return_counts=True)
+    rank = np.empty(len(cnt), np.int64)
+    rank[np.argsort(-cnt, kind="stable")] = np.arange(len(cnt))
+    comp_str = b64(rank[inv], 2)
+
     ukeys, ufirst, ucount = np.unique(key, return_index=True, return_counts=True)
     c0, c1, c2 = b64(ukeys, 4), b64(ufirst, 3), b64(ucount, 3)
     cell_str = "".join(c0[i * 4:i * 4 + 4] + c1[i * 3:i * 3 + 3] + c2[i * 3:i * 3 + 3] for i in range(len(ukeys)))
@@ -210,6 +250,17 @@ def main():
             f.write('\thc = %d, hs = 8,\n' % hcount)
             f.write('\thcells = "%s",\n' % hindex)
             f.write('\theights = "%s",\n' % hdata)
+        f.write('\tcomps = "%s",\n' % comp_str)
+        if links:
+            kx, ky, kz, kp = hx[old], hy[old], hz[old], rank[inv]
+
+            def piece_at(x, y, z):
+                d2 = np.hypot(kx - x, ky - y)
+                d3 = np.where((d2 < 60) & (kz <= z + 5), np.sqrt(d2 ** 2 + (kz - z) ** 2), np.inf)
+                j = int(d3.argmin())
+                return int(kp[j]) if np.isfinite(d3[j]) else False  # not on the ground (a ship route's node)
+            with open(links) as lf:
+                f.write(lua_links(json.load(lf).get(str(instance)), instance, piece_at))
         f.write("})\n")
     print("wrote %s: %d nodes, %d directed edges, %d cells, %.1f MB" % (out, n, len(dst), len(ukeys),
           (len(node_str) + len(edge_str) + len(cell_str)) / 1e6))

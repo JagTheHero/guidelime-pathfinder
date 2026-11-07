@@ -273,6 +273,124 @@ if ns.Graph.HasGround(0) then
 	end
 end
 
+-- trips: walk to where a lift, portal, boat, zeppelin or flight starts, say what to do there, wait out the ride,
+-- then plan the rest from where it ends
+if ns.Graph.Has(0) and ns.Graph.Has(1) then
+	local function goTo(inst, x, y, z)
+		M.instance, M.px, M.py, M.pz = inst, x, y, z or M.pz
+		M.zone = { id = 1411, left = x + 2000, top = y + 2000, w = 4000, h = 4000 }
+		-- walked there on this layer (z given) or arrived out of nowhere (a teleport: height from scratch)
+		local pl = ns.player
+		if z then pl.z, pl.gx, pl.gy, pl.ginstance = z, x, y, inst else pl.gx, pl.z = nil, nil end
+	end
+	local function settle()
+		for _ = 1, 200 do
+			M.Step(0.05)
+			if ns.path and ns.path.graph and not ns.planning then break end
+		end
+		for _ = 1, 3 do M.Step(0.1) end
+	end
+	local function near(p, q, r) return p and q and math.sqrt((p.x - q.x) ^ 2 + (p.y - q.y) ^ 2) < r end
+	local function lastHint() return M.hints and M.hints[#M.hints] or "" end
+	local function routeEnd() local p = ns.path return p and { x = p.x[p.n], y = p.y[p.n] } end
+
+	-- Thunder Bluff: the city's mesas are reached only by lift
+	M.faction = "Horde"
+	goTo(1, -400, -1300)
+	GuidelimeArrow.element = { wx = 29.9, wy = -1197.0, instance = 1 } -- the flight master on the mesa
+	settle()
+	local l = ns.trip and ns.trip.next
+	check(l and l.kind == "lift" and l.name == "up", "Thunder Bluff: up the lift (" .. (l and ns.TripText(ns.trip) or "no trip") .. ")")
+	check(l and near(routeEnd(), l.from, 3) and ns.path.graph, "Thunder Bluff: the route walks to the lift")
+	if l then
+		goTo(1, l.from.x, l.from.y, l.from.z)
+		for _ = 1, 3 do M.Step(0.1) end
+		check(lastHint() == "take the lift up", "Thunder Bluff: at the lift it says to take it up (" .. lastHint() .. ")")
+		goTo(1, l.to.x, l.to.y, l.to.z) -- the ride up: the height jumps to the top landing
+		settle()
+		local p = ns.path
+		check(not ns.trip.next and p and p.graph and math.abs(p.z[1] - l.to.z) < 15,
+			string.format("Thunder Bluff: at the top the route goes on across the mesa (starts at %.0f)", p and p.z[1] or -1))
+	end
+
+	-- Teldrassil to Darkshore: the portal down to Rut'theran Village, then the boat
+	M.faction = "Alliance"
+	goTo(1, 960, 9850)
+	GuidelimeArrow.element = { wx = 558.4, wy = 6341.5, instance = 1 } -- Auberdine's flight master
+	settle()
+	l = ns.trip and ns.trip.next
+	check(l and l.kind == "portal" and ns.path and ns.path.graph, "Teldrassil: the route walks to the portal (" .. (l and ns.TripText(ns.trip) or "no trip") .. ")")
+	if l then
+		goTo(1, l.to.x, l.to.y) -- through the portal
+		settle()
+		l = ns.trip.next
+		check(l and l.kind == "boat" and l.name == "Auberdine" and near(routeEnd(), l.from, 3), "Rut'theran Village: on to the boat to Auberdine")
+	end
+	if l and l.kind == "boat" then
+		goTo(1, l.from.x, l.from.y, l.from.z)
+		for _ = 1, 3 do M.Step(0.1) end
+		check(lastHint() == "take the boat to Auberdine", "at the dock it says to take the boat")
+		goTo(1, l.from.x - 150, l.from.y - 300) -- out at sea
+		for _ = 1, 20 do M.Step(0.1) end
+		check(ns.riding and not ns.path and not M.waypoint, "on the boat: no route or marker, the trip waits")
+		goTo(1, l.to.x, l.to.y)
+		settle()
+		check(ns.trip and not ns.trip.next and ns.path and ns.path.graph and not ns.riding, "off the boat: the route walks on to the goal")
+	end
+
+	-- a flight: from Crossroads to Orgrimmar once both flight masters are found
+	M.faction = "Horde"
+	goTo(1, -2570, -470)
+	GuidelimeArrow.element = { wx = -4330, wy = 1660, instance = 1 }
+	settle()
+	check(ns.trip and not ns.trip.next, "no flight masters found: the way is walked")
+	M.taxiNodes = { [1414] = {
+		{ nodeID = 25, name = "Crossroads, The Barrens", faction = 1, isUndiscovered = false },
+		{ nodeID = 23, name = "Orgrimmar, Durotar", faction = 1, isUndiscovered = false },
+		{ nodeID = 22, name = "Thunder Bluff, Mulgore", faction = 1, isUndiscovered = true },
+	} }
+	M.Fire("TAXI_NODE_STATUS_CHANGED")
+	settle()
+	l = ns.trip and ns.trip.next
+	check(l and l.kind == "flight" and l.to.node == 23 and near(routeEnd(), l.from, 3), "both found: walk to the flight master, fly to Orgrimmar")
+	if l then
+		goTo(1, l.from.x, l.from.y, l.from.z)
+		for _ = 1, 3 do M.Step(0.1) end
+		check(lastHint() == "fly to Orgrimmar, Durotar: talk to the flight master", "at the flight master it says where to fly (" .. lastHint() .. ")")
+	end
+	M.taxiSlots = { "Crossroads, The Barrens", "Orgrimmar, Durotar" }
+	TaxiButton2 = { LockHighlight = function(b) b.lit = true end, UnlockHighlight = function(b) b.lit = false end }
+	M.Fire("TAXIMAP_OPENED", 1)
+	check(TaxiButton2.lit, "the taxi map highlights Orgrimmar")
+	M.Fire("TAXIMAP_CLOSED")
+	check(not TaxiButton2.lit, "and lets go when it closes")
+	M.onTaxi = true
+	for _ = 1, 3 do M.Step(0.1) end
+	check(ns.flying and not ns.path, "flying: no route")
+	M.onTaxi = false
+	goTo(1, -4315.6, 1678.5)
+	settle()
+	check(ns.trip and not ns.trip.next and ns.path and ns.path.graph, "landed: the route walks on to the goal")
+
+	-- another continent: the zeppelin from Orgrimmar to the Undercity
+	goTo(1, -4600, 1450)
+	GuidelimeArrow.element = { wx = 269, wy = 1568, instance = 0 } -- the Undercity's flight master
+	settle()
+	l = ns.trip and ns.trip.next
+	check(l and l.kind == "zeppelin" and l.name == "Undercity" and near(routeEnd(), l.from, 3), "goal on another continent: walk to the zeppelin to the Undercity")
+	if l then
+		goTo(1, l.from.x, l.from.y, l.from.z)
+		for _ = 1, 3 do M.Step(0.1) end
+		goTo(0, l.to.x + 400, l.to.y - 300) -- over the Eastern Kingdoms
+		for _ = 1, 20 do M.Step(0.1) end
+		check(ns.riding and not ns.path, "riding: the new continent does not start a new plan")
+		goTo(0, l.to.x, l.to.y)
+		settle()
+		check(ns.trip and not ns.trip.next and ns.path and ns.path.graph and ns.dest.instance == 0, "off the zeppelin: on to the goal")
+	end
+	M.faction, M.taxiNodes, M.taxiSlots = nil, nil, nil
+end
+
 -- slash commands do not error
 for _, cmd in ipairs({ "status", "dots", "dots", "fov 95", "fov 0", "help" }) do SlashCmdList.GUIDELIMEPATHFINDER(cmd) end
 check(true, "slash commands run")

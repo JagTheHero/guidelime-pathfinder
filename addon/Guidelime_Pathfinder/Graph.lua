@@ -37,6 +37,11 @@ local function v3(s, p)
 	return (DEC[a] * 64 + DEC[b]) * 64 + DEC[c]
 end
 
+local function v2(s, p)
+	local a, b = byte(s, p, p + 1)
+	return DEC[a] * 64 + DEC[b]
+end
+
 local function v4(s, p)
 	local a, b, c, d = byte(s, p, p + 3)
 	return ((DEC[a] * 64 + DEC[b]) * 64 + DEC[c]) * 64 + DEC[d]
@@ -170,11 +175,11 @@ local function heapPop(hk, hv, n)
 	return topK, topV, n
 end
 
-local function search(g, sx, sy, tx, ty, indoors, sz)
+local function search(g, sx, sy, tx, ty, indoors, sz, tz)
 	decodeNodes(g)
 	local gx, gy, gz = g.x, g.y, g.z
 	local starts = nearest(g, sx, sy, 4, indoors, sz)
-	local goals = nearest(g, tx, ty, 3, nil)
+	local goals = nearest(g, tx, ty, 3, nil, tz)
 	if #starts == 0 or #goals == 0 then return end
 
 	local goalCost = {}
@@ -286,14 +291,14 @@ driver:SetScript("OnUpdate", function(self)
 end)
 
 -- Calls cb(path) later with a path table {x, y, z, n} from (sx, sy) to (tx, ty), or cb(nil). sz, the player's
--- ground height if known, starts the path on the player's layer.
-function Graph.FindPath(instance, sx, sy, tx, ty, indoors, cb, sz)
+-- ground height if known, starts the path on the player's layer; tz, the target's, ends it on the target's.
+function Graph.FindPath(instance, sx, sy, tx, ty, indoors, cb, sz, tz)
 	local g = graphs[instance]
 	if not g or (g.n or 0) == 0 then cb(nil) return end
 	local j = { cb = cb }
 	j.co = create(function()
 		local t0 = debugprofilestop()
-		local ids, cost, expanded = search(g, sx, sy, tx, ty, indoors, sz)
+		local ids, cost, expanded = search(g, sx, sy, tx, ty, indoors, sz, tz)
 		if ids then
 			j.result = buildPath(g, smooth(g, ids), sx, sy, tx, ty)
 			ns.Debug(format("path: %d corners, %.0f yd, %d nodes searched, %.0f ms", j.result.n, cost, expanded, debugprofilestop() - t0))
@@ -444,6 +449,142 @@ function Graph.LikelyZ(instance, x, y)
 		end
 	end
 	return best
+end
+
+-- Trips: walking plus flight paths, boats, zeppelins, lifts, the tram and portals (tools/links.py, g.links):
+--   taxi:    [node id] = { x, y, z, piece }  flight masters, by the ids C_TaxiMap reports
+--   flights: flat triples from, to, seconds (direct flights)
+--   rides:   { kind, to name, x, y, z, to instance, x, y, z, ride s, wait s, faction, piece, to piece }
+-- A piece (g.comps: 2 chars per node, 0 the biggest) is a walkable part of a continent cut off from the rest:
+-- Thunder Bluff's mesas, Teldrassil's treetop. Trips are planned on a small graph of places: the start, the
+-- goal, the known flight masters, every dock, landing and portal. Walking counts only within one piece, at
+-- the straight-line distance times WALK_DETOUR; flights chain through known flight masters like the game's.
+local WALK_DETOUR = 1.3
+local TAKE_FLIGHT, LAND = 20, 5 -- seconds: talking to the flight master and taking off; landing
+local TAKE_RIDE = 15            -- seconds: getting on and off a boat, a zeppelin, a lift, the tram
+
+-- The walkable piece under (x, y) on the layer at height z (any layer without z), nil off the graph.
+function Graph.Piece(instance, x, y, z)
+	local g = graphs[instance]
+	if not g or not g.comps or (g.n or 0) == 0 then return end
+	decodeNodes(g)
+	local f = nearest(g, x, y, 1, nil, z)[1]
+	if f and f[2] < 60 and (not z or abs(g.z[f[1]] - z) <= LAYER_GAP) then return v2(g.comps, (f[1] - 1) * 2 + 1) end
+end
+
+-- the far end's piece of a ride to another continent: that continent's ride back starts there
+local function farPiece(r)
+	local g = graphs[r[6]]
+	for _, back in ipairs(g and g.links and g.links.rides or {}) do
+		if abs(back[3] - r[7]) < 1 and abs(back[4] - r[8]) < 1 and abs(back[5] - r[9]) < 1 then return back[13] end
+	end
+	return Graph.Piece(r[6], r[7], r[8], r[9])
+end
+
+-- s, t: { instance, x, y, z } (t.z may be nil). opts: speed (yards per second on foot), faction ("A" or "H"),
+-- known ([node id] = name, the flight masters the player can fly from and to). Returns
+-- { cost = seconds, legs = { { kind, from = place, to = place, ... } } }; nil off the graph, nil, true when the
+-- goal is on the graph but out of reach.
+-- A leg's kind is "walk", "flight" (to.node, to.name; hops) or the ride's kind (name, ride, wait).
+function Graph.PlanTrip(s, t, opts)
+	local places, out = {}, {}
+	local function add(inst, x, y, z, piece, pl)
+		pl = pl or {}
+		pl.instance, pl.x, pl.y, pl.z, pl.piece = inst, x, y, z, piece
+		places[#places + 1], out[pl] = pl, {}
+		return pl
+	end
+	local function link(a, b, cost, kind, ride)
+		local e = out[a]
+		e[#e + 1] = { b, cost, kind, ride }
+	end
+	local S = add(s.instance, s.x, s.y, s.z, Graph.Piece(s.instance, s.x, s.y, s.z), { kind = "start" })
+	local T = add(t.instance, t.x, t.y, t.z, Graph.Piece(t.instance, t.x, t.y, t.z), { kind = "goal" })
+	if not S.piece or not T.piece then return end
+	local known, air = opts.known or {}, {}
+	for inst, g in pairs(graphs) do
+		for id, pos in pairs(g.links and g.links.taxi or {}) do
+			if known[id] and pos[4] then
+				local fm = add(inst, pos[1], pos[2], pos[3], pos[4], { kind = "taxi", node = id, name = known[id] })
+				air[id] = add(inst, pos[1], pos[2], pos[3], nil, { kind = "air", node = id, name = known[id] })
+				link(fm, air[id], TAKE_FLIGHT, "board")
+				link(air[id], fm, LAND, "land")
+			end
+		end
+	end
+	for inst, g in pairs(graphs) do
+		local L = g.links
+		if L then
+			local f = L.flights
+			for k = 1, #f, 3 do
+				if air[f[k]] and air[f[k + 1]] then link(air[f[k]], air[f[k + 1]], f[k + 2], "fly") end
+			end
+			for _, r in ipairs(L.rides) do
+				if (r[12] == "" or r[12] == opts.faction) and r[13] then
+					local to = r[14]
+					if to == false then to = farPiece(r) end
+					if to then
+						local a = add(inst, r[3], r[4], r[5], r[13], { kind = "dock" })
+						local b = add(r[6], r[7], r[8], r[9], to, { kind = "dock" })
+						link(a, b, r[10] + r[11] + TAKE_RIDE, r[1], r)
+					end
+				end
+			end
+		end
+	end
+
+	-- Dijkstra over the places; walking edges are worked out as needed
+	local speed = opts.speed or 7
+	local cost, prev, how, done = { [S] = 0 }, {}, {}, {}
+	while true do
+		local u, cu
+		for _, pl in ipairs(places) do
+			local c = cost[pl]
+			if c and not done[pl] and (not cu or c < cu) then u, cu = pl, c end
+		end
+		if not u or u == T then break end
+		done[u] = true
+		local function relax(v, c, kind, ride)
+			if not cost[v] or cu + c < cost[v] then cost[v], prev[v], how[v] = cu + c, u, { kind, ride } end
+		end
+		if u.piece then
+			for _, v in ipairs(places) do
+				if v.piece == u.piece and v.instance == u.instance and v ~= u and v ~= S and not done[v] then
+					local dx, dy = v.x - u.x, v.y - u.y
+					relax(v, sqrt(dx * dx + dy * dy) * WALK_DETOUR / speed, "walk")
+				end
+			end
+		end
+		for _, e in ipairs(out[u]) do relax(e[1], e[2], e[3], e[4]) end
+	end
+	if not cost[T] then return nil, true end
+
+	-- steps back from the goal, then legs: walks joined, a flight from boarding to landing
+	local steps = {}
+	local v = T
+	while prev[v] do
+		table.insert(steps, 1, { from = prev[v], to = v, kind = how[v][1], ride = how[v][2] })
+		v = prev[v]
+	end
+	local legs = {}
+	for _, st in ipairs(steps) do
+		local last = legs[#legs]
+		if st.kind == "walk" and last and last.kind == "walk" then
+			last.to = st.to
+		elseif st.kind == "walk" then
+			legs[#legs + 1] = { kind = "walk", from = st.from, to = st.to }
+		elseif st.kind == "board" then
+			legs[#legs + 1] = { kind = "flight", from = st.from, hops = 0 }
+		elseif st.kind == "fly" then
+			last.hops = last.hops + 1
+		elseif st.kind == "land" then
+			last.to = st.to
+		else
+			local r = st.ride
+			legs[#legs + 1] = { kind = st.kind, from = st.from, to = st.to, name = r[2], ride = r[10], wait = r[11] }
+		end
+	end
+	return { cost = cost[T], legs = legs }
 end
 
 function Graph.Stats(instance)
