@@ -424,6 +424,7 @@ function ns.Plan(px, py, keepCurrent)
 	if not ns.Graph.Has(d.instance) or d.straight then return end
 	local key = goalKey
 	ns.planning = true
+	ns.Graph.SetThreat(UnitLevel("player"), ({ Alliance = 1, Horde = 2 })[UnitFactionGroup("player")] or 0)
 	ns.Graph.FindPath(d.instance, px, py, d.x, d.y, IsIndoors(), function(p)
 		ns.planning = false
 		if key ~= goalKey then return end

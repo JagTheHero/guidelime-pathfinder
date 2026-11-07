@@ -29,6 +29,9 @@ local MULT = { [0] = 1, [1] = 2.5, [2] = 2.5, [3] = 2.5 }
 local POI_REACH = 5 -- yards from the target within which a quest giver's, quest object's or service's nodes are its goals
 local SWIM_GOAL = 15 -- yards a goal in the water counts as farther than one on land
 local HEURISTIC_WEIGHT = 1.15
+-- yards every leg costs on top of its length (navbuild's LEG_COST): of two routes about as long, the one with
+-- fewer, longer straight legs, which is less to steer
+local LEG_COST = 10
 local LAYER_GAP = 8 -- yards of height between a node and the player before the node counts as another layer
 local FRAME_BUDGET_MS = 4
 
@@ -90,7 +93,7 @@ local function edgeFlag(g, a, b)
 	local first, last = edgeRange(g, a)
 	for j = first, last - 1 do
 		local v, fl = edgeAt(g, j)
-		if v == b then return fl end
+		if v == b then return fl, j end
 	end
 end
 
@@ -193,13 +196,155 @@ local function goalNodes(g, tx, ty, tz)
 		end
 	end
 	if #onLayer > 0 then return onLayer end
-	if #poi > 0 and not tz then return poi end
+	if #poi > 0 then return poi end -- on the level of the NPC's height where known (tools/pois.py), so over a guessed tz
 	for _, c in ipairs(found) do
 		if flag(g.f[c[1]], NODE_SWIM) then c[3] = c[3] + SWIM_GOAL end
 	end
 	table.sort(found, function(a, b) return a[3] < b[3] end)
 	for i = 4, #found do found[i] = nil end
 	return found
+end
+
+-- Hostile mobs as traffic (tools/mobs.py; packed by cell like the nodes):
+--   mobs:   m records of 14 chars: x(3) y(3) z(3) minLevel(1) maxLevel(1) detection(1) wander(1) flags(1)
+--   mcells: records of 10 chars: cellKey(4) firstMob(3) count(3)
+-- flags: 1 hostile to the Alliance, 2 to the Horde, 4 elite, 8 a point on a patrol path. A mob that is not gray
+-- to the player aggroes within its detection range less the levels the player is above it (more, up to 25 levels,
+-- when it is above the player), at least 5 yards (CMaNGOS's Unit::GetAttackDistance), widened by its wander. Like
+-- a traffic jam, each yard of route inside such a zone costs 1 + JAM x weight yards, at most JAM_MAX yards in
+-- all, so routes go around camps near the player's level when the way around is not much longer (at most
+-- JAM_MAX times the jammed stretch), and still through them when it is. The weight is by the mob's colour to the
+-- player (CON: green, yellow, orange, red), times ELITE for an elite and PATROL for a point on a patrol path.
+local JAM, JAM_MAX, ELITE, PATROL = 1.5, 4, 2.5, 0.5
+local CON = { green = 0.3, yellow = 1, orange = 2, red = 4 }
+local MOB_W, MOB_LAYER, ZONE_MAX = 14, 12, 64 -- record width; yards of height to another level; widest zone
+local threat = { level = 0, side = 0 }
+
+local function grayLevel(L)
+	if L <= 5 then return 0 elseif L <= 39 then return L - 5 - floor(L / 10) elseif L <= 59 then return L - 1 - floor(L / 5) end
+	return L - 9
+end
+
+local function conWeight(L, lvl)
+	local d = lvl - L
+	return d >= 5 and CON.red or d >= 3 and CON.orange or d >= -2 and CON.yellow or CON.green
+end
+
+-- Who routes are for: level (UnitLevel) and side (1 Alliance, 2 Horde; 0 ignores mobs).
+function Graph.SetThreat(level, side)
+	if threat.level ~= level or threat.side ~= side then
+		threat.level, threat.side = level, side
+		for _, g in pairs(graphs) do g.zones, g.mobZones, g.jam = nil, nil, nil end
+	end
+end
+
+-- The aggro zones of the mobs packed in one 64-yard cell for the current threat: { x, y, z, radius, weight }.
+local function mobZones(g, key)
+	local zs = {}
+	local s, lo, hi = g.mcells, 0, floor(#g.mcells / CELL_W) - 1
+	while lo <= hi do
+		local mid = floor((lo + hi) / 2)
+		local p = mid * CELL_W + 1
+		local k = v4(s, p)
+		if k == key then
+			local first, cnt = v3(s, p + 4), v3(s, p + 7)
+			local L, gray, side, m = threat.level, grayLevel(threat.level), threat.side, g.mobs
+			for i = first, first + cnt - 1 do
+				local q = i * MOB_W + 1
+				local fl = DEC[byte(m, q + 13)]
+				local lvl = DEC[byte(m, q + 10)]
+				if flag(fl, side) and lvl > gray then
+					local r = max(5, DEC[byte(m, q + 11)] - max(-25, L - lvl)) + DEC[byte(m, q + 12)]
+					zs[#zs + 1] = { v3(m, q) / Q - OFFSET_XY, v3(m, q + 3) / Q - OFFSET_XY, v3(m, q + 6) / Q - OFFSET_Z, min(r, ZONE_MAX),
+						conWeight(L, lvl) * (flag(fl, 4) and ELITE or 1) * (flag(fl, 8) and PATROL or 1) }
+				end
+			end
+			return zs
+		end
+		if k < key then lo = mid + 1 else hi = mid - 1 end
+	end
+	return zs
+end
+
+-- The aggro zones that reach into one 64-yard cell (zones are at most ZONE_MAX = one cell wide).
+local function cellZones(g, cx, cy)
+	local key = cx + cy * 1024
+	local zs = g.zones[key]
+	if zs then return zs end
+	zs = {}
+	local cs = g.cs
+	local x0, y0 = cx * cs - OFFSET_XY, cy * cs - OFFSET_XY
+	for dy = -1, 1 do
+		for dx = -1, 1 do
+			local k = key + dx + dy * 1024
+			local own = g.mobZones[k]
+			if not own then
+				own = mobZones(g, k)
+				g.mobZones[k] = own
+			end
+			for _, z in ipairs(own) do
+				local nx, ny = min(max(z[1], x0), x0 + cs), min(max(z[2], y0), y0 + cs)
+				if (nx - z[1]) ^ 2 + (ny - z[2]) ^ 2 < z[4] * z[4] then zs[#zs + 1] = z end
+			end
+		end
+	end
+	g.zones[key] = zs
+	return zs
+end
+
+-- Extra cost of walking the segment a -> b (HBD x, y, z) through aggro zones: JAM x the weighted yards inside them.
+local stamp = 0
+local function segmentJam(g, ax, ay, az, bx, by, bz)
+	local dx, dy = bx - ax, by - ay
+	local l2 = dx * dx + dy * dy
+	if l2 < 1e-4 then return 0 end
+	local len = sqrt(l2)
+	local cs = g.cs
+	local x0, x1 = floor((min(ax, bx) + OFFSET_XY) / cs), floor((max(ax, bx) + OFFSET_XY) / cs)
+	local y0, y1 = floor((min(ay, by) + OFFSET_XY) / cs), floor((max(ay, by) + OFFSET_XY) / cs)
+	stamp = stamp + 1
+	local inside = 0
+	for cy = y0, y1 do
+		for cx = x0, x1 do
+			for _, z in ipairs(cellZones(g, cx, cy)) do
+				if z[6] ~= stamp then
+					z[6] = stamp
+					local mx, my, r = z[1], z[2], z[4]
+					local t = ((mx - ax) * dx + (my - ay) * dy) / l2
+					local px, py = ax + t * dx - mx, ay + t * dy - my
+					local h2 = r * r - (px * px + py * py)
+					if h2 > 0 then
+						local half = sqrt(h2) / len
+						local t0, t1 = max(0, t - half), min(1, t + half)
+						local tc = min(1, max(0, t))
+						if t1 > t0 and abs(az + tc * (bz - az) - z[3]) < MOB_LAYER then inside = inside + (t1 - t0) * len * z[5] end
+					end
+				end
+			end
+		end
+	end
+	return min(JAM * inside, (JAM_MAX - 1) * len)
+end
+
+local function edgeJam(g, j, a, b)
+	if threat.side == 0 or not g.mobs then return 0 end
+	g.zones, g.mobZones, g.jam = g.zones or {}, g.mobZones or {}, g.jam or {}
+	local c = g.jam[j]
+	if not c then
+		c = segmentJam(g, g.x[a], g.y[a], g.z[a], g.x[b], g.y[b], g.z[b])
+		g.jam[j] = c
+	end
+	return c
+end
+
+-- Weighted yards of aggro zones along a path { x, y, z, n } for the current threat (for /gpath status and tests).
+function Graph.PathJam(instance, p)
+	local g = graphs[instance]
+	if not g or not g.mobs or threat.side == 0 then return 0 end
+	g.zones, g.mobZones = g.zones or {}, g.mobZones or {}
+	local sum = 0
+	for i = 2, p.n do sum = sum + segmentJam(g, p.x[i - 1], p.y[i - 1], p.z[i - 1], p.x[i], p.y[i], p.z[i]) / JAM end
+	return sum
 end
 
 local function search(g, sx, sy, tx, ty, indoors, sz, tz)
@@ -239,7 +384,7 @@ local function search(g, sx, sy, tx, ty, indoors, sz, tz)
 				local v, fl = edgeAt(g, j)
 				if not closed[v] then
 					local dx, dy, dz = gx[v] - ux, gy[v] - uy, gz[v] - uz
-					local c = gu + sqrt(dx * dx + dy * dy + dz * dz) * (MULT[fl % 8] or 1)
+					local c = gu + sqrt(dx * dx + dy * dy + dz * dz) * (MULT[fl % 8] or 1) + LEG_COST + edgeJam(g, j, u, v)
 					local old = gs[v]
 					if not old or c < old then
 						gs[v], came[v] = c, u
@@ -262,19 +407,28 @@ local function search(g, sx, sy, tx, ty, indoors, sz, tz)
 	return ids, best, expanded
 end
 
--- Drop corners that a direct graph edge (an already-checked straight walk) can skip.
+-- Of the found path's corners, the cheapest chain by the search's own costs over direct graph edges (each an
+-- already-checked straight walk) between corners up to SKIP apart: fewer, longer legs where the graph has them.
+local SKIP = 10
 local function smooth(g, ids)
-	local out = { ids[1] }
-	local i = 1
-	while i < #ids do
-		local j = min(#ids, i + 10)
-		while j > i + 1 do
-			local fl = edgeFlag(g, ids[i], ids[j])
-			if fl and fl % 8 == 0 then break end
-			j = j - 1
+	local n = #ids
+	local best, from = { [1] = 0 }, {}
+	for j = 2, n do
+		local v = ids[j]
+		for i = max(1, j - SKIP), j - 1 do
+			local fl, e = edgeFlag(g, ids[i], v)
+			if fl then
+				local u = ids[i]
+				local dx, dy, dz = g.x[v] - g.x[u], g.y[v] - g.y[u], g.z[v] - g.z[u]
+				local c = best[i] + sqrt(dx * dx + dy * dy + dz * dz) * (MULT[fl % 8] or 1) + LEG_COST + edgeJam(g, e, u, v)
+				if not best[j] or c < best[j] then best[j], from[j] = c, i end
+			end
 		end
-		out[#out + 1] = ids[j]
-		i = j
+	end
+	local out, j = {}, n
+	while j do
+		table.insert(out, 1, ids[j])
+		j = from[j]
 	end
 	return out
 end
@@ -461,9 +615,14 @@ end
 -- Most likely ground height at (x, y) when nothing else is known (login, teleport): the layer most path nodes
 -- within 40 yards are on, nearer nodes counting more. Ironforge's halls win over the mountainside above them.
 -- The nodes where NPCs stand do not vote: each has one on every layer over its spot, the mountainside too.
+-- At a flight master (where a flight lands) it is the flight master's: Orgrimmar's stands on top of a tower.
+local AT_TAXI = 8
 function Graph.LikelyZ(instance, x, y)
 	local g = graphs[instance]
 	if not g or (g.n or 0) == 0 then return end
+	for _, pos in pairs(g.links and g.links.taxi or {}) do
+		if (pos[1] - x) ^ 2 + (pos[2] - y) ^ 2 < AT_TAXI * AT_TAXI then return pos[3] end
+	end
 	decodeNodes(g)
 	local found = {}
 	for _, a in ipairs(nearest(g, x, y, 36)) do
@@ -503,8 +662,8 @@ function Graph.Piece(instance, x, y, z)
 	if f and f[2] < 60 and (not z or abs(g.z[f[1]] - z) <= LAYER_GAP) then return v2(g.comps, (f[1] - 1) * 2 + 1) end
 end
 
--- The pieces a route to (x, y) can end in: those of the nodes the search could end at (an NPC's spot can have
--- a layer in another piece, such as a mesa's top and the hollow under it).
+-- The pieces a route to (x, y) can end in: those of the nodes the search could end at (an NPC's spot without a
+-- known height can have a layer in another piece, such as a mesa's top and the hollow under it).
 local function goalPieces(instance, x, y, z)
 	local g = graphs[instance]
 	if not g or not g.comps or (g.n or 0) == 0 then return {} end
@@ -512,7 +671,7 @@ local function goalPieces(instance, x, y, z)
 	local out, seen = {}, {}
 	for _, c in ipairs(goalNodes(g, x, y, z)) do
 		local piece = v2(g.comps, (c[1] - 1) * 2 + 1)
-		if c[2] < 60 and (not z or abs(g.z[c[1]] - z) <= LAYER_GAP) and not seen[piece] then
+		if c[2] < 60 and (not z or abs(g.z[c[1]] - z) <= LAYER_GAP or flag(g.f[c[1]], NODE_POI)) and not seen[piece] then
 			seen[piece] = true
 			out[#out + 1] = piece
 		end

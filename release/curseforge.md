@@ -6,7 +6,7 @@
 - Name: Guidelime Pathfinder
 - Summary: Walks you to Guidelime's current step along real walkable paths, flights and boats.
 - Categories: Map & Minimap (main), Quests & Leveling
-- License: MIT License
+- License: GNU General Public License version 3 (GPLv3)
 - Description: everything under "Description" below (Markdown)
 - Logo: `release/logo-draft.png` (1024x1024)
 - Gallery: 2-3 in-game screenshots of the marker, the ground dots and the map trail
@@ -35,6 +35,10 @@ along real walkable paths, not a straight line through the mountain in the way.
   the path drawn on the world map and the minimap. Experimental: dots on the ground ahead of you.
 - **Floors and tunnels.** Ironforge's halls under the mountain, bridges over rivers, buildings with upper
   floors: the route stays on the level you are on.
+- **Long straight runs.** Where the shortest walk runs straight, so does the route: few, long legs you can
+  line up with and run.
+- **Around mob camps.** Hostile mobs near your level count like a traffic jam: the route skirts their aggro
+  range when the way around is not much longer.
 - **Flights, boats and more.** Takes the flight paths you have found (and highlights where to fly on the flight
   map), boats, zeppelins, Thunder Bluff's lifts, the Deeprun Tram and the Teldrassil portal, and tells you what
   to do at each stop.

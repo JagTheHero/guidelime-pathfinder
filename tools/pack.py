@@ -1,11 +1,13 @@
 """Pack a navbuild .graph into the addon's Lua data file (format documented in Graph.lua).
 
 usage: pack.py <graph> <instance id> <map name> <out.lua> [min component nodes] [--heights <file.hgt>] [--links <links.json>]
+               [--mobs <file.mobs>]
 
 Coordinates go to HereBeDragons world space (x = world Y, y = world X). Small disconnected pieces
 (mountain ledges, roofs) and swim nodes far out at sea are dropped. With --heights, the ground heights
 (navbuild heights) of the cells near the kept nodes are packed too, for the ground dots. With --links, this
-continent's flight paths, boats, lifts and portals (tools/links.py) are written as a plain table.
+continent's flight paths, boats, lifts and portals (tools/links.py) are written as a plain table. With --mobs,
+the hostile mobs and patrol points (tools/mobs.py) in the kept cells and around them, by cell.
 """
 import datetime
 import json
@@ -140,6 +142,34 @@ def pack_heights(cells, node_keys):
     return "".join(index), "".join(data), len(blocks)
 
 
+def pack_mobs(path, node_keys):
+    """Mobs (tools/mobs.py) in HBD coordinates, sorted by 64-yard cell, in cells with path nodes or next to them:
+    mobs: m records of 14 chars x(3) y(3) z(3) minLevel(1) maxLevel(1) detection(1) wander(1) flags(1);
+    mcells: records of 10 chars cellKey(4) firstMob(3) count(3)."""
+    rows = np.loadtxt(path, ndmin=2)
+    x, y, z = rows[:, 1], rows[:, 0], rows[:, 2]  # HBD x = world Y, y = world X
+    cx = np.floor((x + OFFSET_XY) / CS).astype(np.int64)
+    cy = np.floor((y + OFFSET_XY) / CS).astype(np.int64)
+    near = set()
+    for k in node_keys:
+        for d in (-1025, -1024, -1023, -1, 0, 1, 1023, 1024, 1025):
+            near.add(k + d)
+    key = cx + cy * 1024
+    keep = np.isin(key, list(near))
+    rows, x, y, z, key = rows[keep], x[keep], y[keep], z[keep], key[keep]
+    o = np.argsort(key, kind="stable")
+    rows, x, y, z, key = rows[o], x[o], y[o], z[o], key[o]
+    cols = [b64(np.round((x + OFFSET_XY) * Q), 3), b64(np.round((y + OFFSET_XY) * Q), 3),
+            b64(np.round((np.clip(z, -OFFSET_Z, 60000) + OFFSET_Z) * Q), 3)]
+    cols += [b64(np.clip(rows[:, k], 0, 63), 1) for k in range(3, 8)]
+    widths = [3, 3, 3, 1, 1, 1, 1, 1]
+    mob_str = "".join("".join(c[i * w:(i + 1) * w] for c, w in zip(cols, widths)) for i in range(len(rows)))
+    ukeys, ufirst, ucount = np.unique(key, return_index=True, return_counts=True)
+    c0, c1, c2 = b64(ukeys, 4), b64(ufirst, 3), b64(ucount, 3)
+    mcell_str = "".join(c0[i * 4:i * 4 + 4] + c1[i * 3:i * 3 + 3] + c2[i * 3:i * 3 + 3] for i in range(len(ukeys)))
+    return len(rows), mob_str, mcell_str
+
+
 def lua_value(v):
     if isinstance(v, bool):
         return "true" if v else "false"
@@ -178,6 +208,11 @@ def main():
         i = args.index("--links")
         links = args[i + 1]
         del args[i:i + 2]
+    mobs = None
+    if "--mobs" in args:
+        i = args.index("--mobs")
+        mobs = args[i + 1]
+        del args[i:i + 2]
     path, instance, name, out = args[0], int(args[1]), args[2], args[3]
     min_comp = int(args[4]) if len(args) > 4 else 25
     nodes, edges = read_graph(path)
@@ -213,6 +248,8 @@ def main():
     first = np.searchsorted(src, np.arange(len(old)))
 
     n = len(old)
+    if n > 64 ** 3:
+        raise SystemExit("%d nodes: an edge's neighbour has only 3 base-64 chars (at most %d nodes)" % (n, 64 ** 3))
     flags = (np.where(area[old] == AREA_INDOOR, NODE_INDOOR, 0) | np.where(area[old] == AREA_SWIM, NODE_SWIM, 0)
              | np.where(poi[old] > 0, NODE_POI, 0))
     qx = np.round((hx[old] + OFFSET_XY) * Q).astype(np.int64)
@@ -254,6 +291,12 @@ def main():
             f.write('\thcells = "%s",\n' % hindex)
             f.write('\theights = "%s",\n' % hdata)
         f.write('\tcomps = "%s",\n' % comp_str)
+        if mobs:
+            m, mob_str, mcell_str = pack_mobs(mobs, set(ukeys.tolist()))
+            f.write('\tm = %d,\n' % m)
+            f.write('\tmobs = "%s",\n' % mob_str)
+            f.write('\tmcells = "%s",\n' % mcell_str)
+            print("mobs: %d, %.2f MB" % (m, (len(mob_str) + len(mcell_str)) / 1e6))
         if links:
             kx, ky, kz, kp = hx[old], hy[old], hz[old], rank[inv]
 

@@ -4,7 +4,7 @@
 ## Author: Jag
 ## Version: 0.3.0
 ## Dependencies: Guidelime, Questie
-## X-License: MIT
+## X-License: GPL-3.0-or-later
 ## SavedVariables: GuidelimePathfinderDB
 
 Graph.lua

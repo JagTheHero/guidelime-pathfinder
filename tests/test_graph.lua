@@ -73,6 +73,38 @@ for _, c in ipairs(CASES) do
 end
 if dump then dump:close() end
 if hdump then hdump:close() end
+
+-- long straight runs: across the Barrens most of the way is in legs of 100 yards or more, the longest 300+
+do
+	local p, _, _, len = route(1, -2650, -450, -3720, -955)
+	local longest, long = 0, 0
+	for i = 2, p and p.n or 0 do
+		local l = math.sqrt((p.x[i] - p.x[i - 1]) ^ 2 + (p.y[i] - p.y[i - 1]) ^ 2)
+		longest = math.max(longest, l)
+		if l >= 100 then long = long + l end
+	end
+	check(p and longest >= 300 and long >= len * 0.6, string.format(
+		"Crossroads -> Ratchet runs straight: longest leg %.0f yd, %.0f%% of the way in legs of 100+ yd", longest, p and 100 * long / len or 0))
+end
+
+-- hostile mobs as traffic: west of Kharanos the troggs and wolves are level 5-9. A level 8 Alliance player goes
+-- around them for a slightly longer walk; at level 60 they are gray and the route is the plain one.
+do
+	local G = ns.Graph
+	G.SetThreat(60, 1)
+	local plain, _, _, plainLen = route(0, -324.3, -5619.9, -1213.5, -5587.5)
+	local plainZones = plain and G.PathJam(0, plain) or -1
+	G.SetThreat(8, 1)
+	local inZones = plain and G.PathJam(0, plain) or -1
+	local around, ms, _, aroundLen = route(0, -324.3, -5619.9, -1213.5, -5587.5)
+	local after = around and G.PathJam(0, around) or -1
+	check(plainZones == 0 and inZones > 100 and after < inZones * 0.25 and aroundLen and aroundLen < plainLen * 1.15,
+		string.format("level 8 goes around Dun Morogh's mobs: %.0f -> %.0f yards in aggro zones, %.0f -> %.0f yd long (%.0f ms); none at level 60",
+			inZones, after, plainLen or -1, aroundLen or -1, ms))
+	G.SetThreat(8, 2)
+	check(G.PathJam(0, plain) > 100, "the Horde gets the same troggs (hostile to both sides)")
+	G.SetThreat(0, 0)
+end
 print(string.format("     Lua memory after searches %.0f MB", collectgarbage("count") / 1024))
 
 print(fails == 0 and "ALL PASSED" or (fails .. " FAILED"))

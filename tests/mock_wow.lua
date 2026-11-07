@@ -88,6 +88,7 @@ function UnitSex() return 2 end
 function Screenshot() M.screenshots = (M.screenshots or 0) + 1; M.pendingShot = true end
 C_CVar = { GetCVar = function(k) if k == "cameraFov" then return tostring(M.cvarFov or 90) end end }
 function UnitFactionGroup() return M.faction or "Alliance" end
+function UnitLevel() return M.level or 60 end
 function UnitOnTaxi() return M.onTaxi end
 function GetUnitSpeed() return 0, M.runSpeed or 7, 0, 4.7 end
 -- flight masters: M.taxiNodes[uiMapID] = { { nodeID, name, faction, isUndiscovered }, ... }; the taxi map's slots

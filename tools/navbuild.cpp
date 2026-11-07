@@ -26,6 +26,7 @@
 #include <map>
 #include <mutex>
 #include <queue>
+#include <random>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -446,11 +447,12 @@ struct Builder {
 	bool walk(dtNavMeshQuery* q, dtPolyRef aRef, const float* a, dtPolyRef bRef, const float* b,
 		float& len, float& dev, unsigned char& flags, std::vector<std::array<float, 3>>* corners = nullptr,
 		std::vector<dtPolyRef>* cornerRefs = nullptr) {
-		dtPolyRef path[512];
+		static const int MAX_POLYS = 2048, MAX_CORNERS = 256;
+		dtPolyRef path[MAX_POLYS];
 		int np = 0;
-		if (dtStatusFailed(q->findPath(aRef, bRef, a, b, &filter, path, &np, 512)) || np == 0 || path[np - 1] != bRef) return false;
-		float sp[128 * 3]; unsigned char spf[128]; dtPolyRef spr[128]; int ns = 0;
-		if (dtStatusFailed(q->findStraightPath(a, b, path, np, sp, spf, spr, &ns, 128, 0)) || ns < 2) return false;
+		if (dtStatusFailed(q->findPath(aRef, bRef, a, b, &filter, path, &np, MAX_POLYS)) || np == 0 || path[np - 1] != bRef) return false;
+		float sp[MAX_CORNERS * 3]; unsigned char spf[MAX_CORNERS]; dtPolyRef spr[MAX_CORNERS]; int ns = 0;
+		if (dtStatusFailed(q->findStraightPath(a, b, path, np, sp, spf, spr, &ns, MAX_CORNERS, 0)) || ns < 2) return false;
 		len = 0; dev = 0;
 		float dx = b[0] - a[0], dz = b[2] - a[2], d2 = dx * dx + dz * dz;
 		for (int k = 0; k < ns; k++) {
@@ -634,18 +636,57 @@ struct Builder {
 		for (auto& t : pool) t.join();
 		edges = found;
 		printf("direct edges: %zu, pairs to route around obstacles: %zu\n", edges.size(), missing.size());
-		repair(missing);
+		repair(missing, 1.2f, 8.0f, 0, false);
 	}
 
-	// For neighbouring cells without a straight walk, follow the navmesh path and add its corners.
-	void repair(const std::vector<std::pair<int, int>>& pairs) {
+	// Long straight runs. Edges reach two cells at most, so a straight run across open land or down a valley
+	// zigzags over the cell nodes. The navmesh's shortest paths between cell nodes LONG_MIN to LONG_MAX yards
+	// apart show where real routes run straight; one is added (its legs as edges, its corners as nodes) when
+	// the graph has nothing within LONG_SPAN of it, counting LEG_COST yards per leg as the add-on's search does.
+	static constexpr float LONG_MIN = 150, LONG_MAX = 600, LONG_SPAN = 1.03f, LEG_COST = 10;
+	static const int LONG_PAIRS = 6; // per cell node, in as many directions
+	void longRuns() {
+		std::mt19937 rng(1);
+		std::uniform_real_distribution<float> u01(0, 1);
+		std::vector<std::pair<int, int>> pairs;
+		for (auto& kv : cells) for (int i : kv.second) {
+			const Node& a = nodes[i];
+			if (a.poi || dead[i]) continue;
+			for (int k = 0; k < LONG_PAIRS; k++) {
+				float ang = 6.2831853f * (k + u01(rng)) / LONG_PAIRS, d = LONG_MIN + u01(rng) * (LONG_MAX - LONG_MIN);
+				float tx = a.p[0] + cosf(ang) * d, tz = a.p[2] + sinf(ang) * d;
+				auto it = cells.find({ (int)floorf(tx / CELL), (int)floorf(tz / CELL) });
+				if (it == cells.end()) continue;
+				int best = -1; float bd = FLT_MAX;
+				for (int j : it->second) {
+					const Node& b = nodes[j];
+					if (b.poi || dead[j] || fabsf(a.p[1] - b.p[1]) > 150 || compOf(a.ref) != compOf(b.ref)) continue;
+					float dx = b.p[0] - tx, dz = b.p[2] - tz;
+					if (dx * dx + dz * dz < bd) { bd = dx * dx + dz * dz; best = j; }
+				}
+				if (best >= 0) pairs.push_back({ i, best });
+			}
+		}
+		printf("long runs: %zu pairs\n", pairs.size());
+		size_t before = edges.size();
+		repair(pairs, LONG_SPAN, 0, LEG_COST, true);
+		printf("long runs: %zu edges added\n", edges.size() - before);
+	}
+
+	// Follows the navmesh path of each pair and adds it, its corners as nodes, unless the graph already has a
+	// way within stretch x its cost + slack (pairs of neighbouring cells without a straight walk: obstacles to
+	// route around; long runs). legCost: yards each leg costs on top of its length in that test. strict: a route
+	// with a leg that is no straight walk once its corners are snapped to nodes is left out (else the leg is
+	// kept: the navmesh path is walkable, only not checked as a straight line).
+	void repair(const std::vector<std::pair<int, int>>& pairs, float stretch, float slack, float legCost, bool strict) {
+		dead.resize(nodes.size(), 0);
 		std::atomic<size_t> next{ 0 };
 		// fl: flags per segment; cost: length weighted by costOf, like the addon's search
 		struct Route { int a, b; float cost; std::vector<std::array<float, 3>> pts; std::vector<dtPolyRef> refs; std::vector<unsigned char> fl; };
 		std::vector<Route> routes;
 		auto worker = [&]() {
 			dtNavMeshQuery* q = dtAllocNavMeshQuery();
-			q->init(nav, 8192);
+			q->init(nav, 65535);
 			std::vector<Route> lr;
 			for (;;) {
 				size_t i = next++;
@@ -679,7 +720,7 @@ struct Builder {
 					dtVcopy(v.p, r.pts[k + 1].data()); v.ref = k + 2 == n ? b.ref : r.refs[k + 1];
 					unsigned char f;
 					if (u.ref && v.ref && nearlyStraight(q, u, v, f)) r.fl[k] = f;
-					r.cost += dtVdist(u.p, v.p) * costOf(r.fl[k]);
+					r.cost += dtVdist(u.p, v.p) * costOf(r.fl[k]) + legCost;
 				}
 				lr.push_back(std::move(r));
 			}
@@ -691,19 +732,20 @@ struct Builder {
 		for (int i = 0; i < threads; i++) pool.emplace_back(worker);
 		for (auto& t : pool) t.join();
 
-		// Cheapest routes first; a route is only added when the graph has no path within 20% of its cost already
-		// (a greedy spanner), and its corners reuse any node within SNAP yards that still sees the route's
+		// Cheapest routes first; a route is only added when the graph has no path within stretch of its cost
+		// already (a greedy spanner), and its corners reuse any node within SNAP yards that still sees the route's
 		// corners on both sides (a corner snapped blindly turns a bridge into a line beside it).
 		std::sort(routes.begin(), routes.end(), [](const Route& x, const Route& y) { return x.cost < y.cost; });
 		const float SNAP = 6.0f;
 		std::vector<std::vector<std::pair<int, float>>> adj(nodes.size());
 		auto link = [&](int a, int b, unsigned char fl) {
 			edges.push_back({ a, b, fl });
-			float d = dtVdist(nodes[a].p, nodes[b].p) * costOf(fl);
+			float d = dtVdist(nodes[a].p, nodes[b].p) * costOf(fl) + legCost;
 			adj[a].push_back({ b, d }); adj[b].push_back({ a, d });
 		};
 		for (auto& e : edges) {
-			float d = dtVdist(nodes[e.a].p, nodes[e.b].p) * costOf(e.flags);
+			if (dead[e.a] || dead[e.b]) continue;
+			float d = dtVdist(nodes[e.a].p, nodes[e.b].p) * costOf(e.flags) + legCost;
 			adj[e.a].push_back({ e.b, d }); adj[e.b].push_back({ e.a, d });
 		}
 		std::vector<float> dist;
@@ -752,10 +794,10 @@ struct Builder {
 		q->init(nav, 8192);
 		size_t before = nodes.size(), used = 0, unsnapped = 0, unchecked = 0;
 		std::vector<int> near;
+		std::vector<int> orphans;
 		for (auto& r : routes) {
-			if (within(r.a, r.b, r.cost * 1.2f + 8.0f)) continue;
-			used++;
-			size_t n = r.pts.size();
+			if (within(r.a, r.b, r.cost * stretch + slack)) continue;
+			size_t n = r.pts.size(), first = nodes.size();
 			std::vector<int> ids(n);
 			ids[0] = r.a; ids[n - 1] = r.b;
 			for (size_t k = 1; k + 1 < n; k++) {
@@ -773,34 +815,51 @@ struct Builder {
 				if (id < 0) { id = newNode(r.pts[k], ref); if (!near.empty()) unsnapped++; }
 				ids[k] = id;
 			}
+			std::vector<unsigned char> fs(n, 0);
+			bool ok = true;
 			for (size_t k = 1; k < n; k++) {
 				if (ids[k] == ids[k - 1]) continue;
-				unsigned char f;
-				if (!nearlyStraight(q, nodes[ids[k - 1]], nodes[ids[k]], f)) { f = r.fl[k - 1]; unchecked++; }
-				link(ids[k - 1], ids[k], f);
+				if (!nearlyStraight(q, nodes[ids[k - 1]], nodes[ids[k]], fs[k])) { fs[k] = r.fl[k - 1]; unchecked++; ok = false; }
 			}
+			if (!ok && strict) { // its new corners stay unused, and no later route snaps to them
+				for (size_t id = first; id < nodes.size(); id++) {
+					auto& cellIds = grid[key(nodes[id].p)];
+					cellIds.erase(std::remove(cellIds.begin(), cellIds.end(), (int)id), cellIds.end());
+					orphans.push_back((int)id);
+				}
+				continue;
+			}
+			used++;
+			for (size_t k = 1; k < n; k++) if (ids[k] != ids[k - 1]) link(ids[k - 1], ids[k], fs[k]);
 		}
 		dtFreeNavMeshQuery(q);
 		printf("routes added: %zu of %zu; corners kept off a nearby node that could not see the route: %zu; "
 			"segments without a straight walk: %zu\n", used, routes.size(), unsnapped, unchecked);
-		printf("routed pairs: %zu, corner nodes added: %zu\n", routes.size(), nodes.size() - before);
-		dead.assign(nodes.size(), 0);
+		printf("routed pairs: %zu, corner nodes added: %zu\n", routes.size(), nodes.size() - before - orphans.size());
+		dead.resize(nodes.size(), 0);
+		for (int id : orphans) dead[id] = 1;
 	}
 
 	// Nodes where quest givers, quest objects and town services stand (tools/pois.py: "worldX worldY" per line),
 	// one on every walkable layer within POI_REACH yards that is not water. Without them a route ends at the
 	// nearest node in plan view, which can be the beach under the pier the NPC stands on.
 	void addPois(const std::string& path) {
-		static const float POI_REACH = 3.0f, POI_LAYER = 3.0f, POI_REUSE = 2.0f;
+		// a spot with a height (from tools/pois.py) gets a node on the level nearest it, if one is within POI_HEIGHT;
+		// one without, on every level
+		static const float POI_REACH = 3.0f, POI_LAYER = 3.0f, POI_REUSE = 2.0f, POI_HEIGHT = 5.0f;
 		FILE* f = fopen(path.c_str(), "r");
 		if (!f) { fprintf(stderr, "cannot read %s\n", path.c_str()); return; }
-		std::vector<std::array<float, 2>> pts;
-		float X, Y;
-		while (fscanf(f, "%f %f", &X, &Y) == 2) pts.push_back({ X, Y });
+		std::vector<std::array<float, 3>> pts;
+		char line[128];
+		while (fgets(line, sizeof line, f)) {
+			float X, Y, Z;
+			int n = sscanf(line, "%f %f %f", &X, &Y, &Z);
+			if (n >= 2) pts.push_back({ X, Y, n == 3 ? Z : NAN });
+		}
 		fclose(f);
 		dtNavMeshQuery* q = dtAllocNavMeshQuery();
 		q->init(nav, 4096);
-		size_t added = 0, reused = 0, none = 0;
+		size_t added = 0, reused = 0, none = 0, onLevel = 0;
 		for (auto& w : pts) {
 			float c[3] = { w[1], 0, w[0] }, ext[3] = { POI_REACH, 5000, POI_REACH };
 			dtPolyRef refs[256]; int n = 0;
@@ -817,6 +876,15 @@ struct Builder {
 				if (s.d <= POI_REACH) spots.push_back(s);
 			}
 			std::sort(spots.begin(), spots.end(), [](const Spot& a, const Spot& b) { return a.p[1] < b.p[1]; });
+			if (!std::isnan(w[2]) && !spots.empty()) {
+				const Spot* best = &spots[0];
+				for (const Spot& s : spots) if (fabsf(s.p[1] - w[2]) < fabsf(best->p[1] - w[2])) best = &s;
+				if (fabsf(best->p[1] - w[2]) <= POI_HEIGHT) {
+					float h = best->p[1];
+					spots.erase(std::remove_if(spots.begin(), spots.end(), [&](const Spot& s) { return fabsf(s.p[1] - h) > POI_LAYER; }), spots.end());
+					onLevel++;
+				}
+			}
 			for (size_t i = 0; i < spots.size();) { // per layer, the spot nearest the POI
 				size_t best = i, j = i;
 				for (; j < spots.size() && spots[j].p[1] - spots[i].p[1] <= POI_LAYER; j++) if (spots[j].d < spots[best].d) best = j;
@@ -841,8 +909,8 @@ struct Builder {
 			if (spots.empty()) none++;
 		}
 		dtFreeNavMeshQuery(q);
-		printf("points of interest: %zu, nodes added %zu, existing nodes used %zu, no walkable ground near %zu\n",
-			pts.size(), added, reused, none);
+		printf("points of interest: %zu (%zu on the level of their height), nodes added %zu, existing nodes used %zu, no walkable ground near %zu\n",
+			pts.size(), onLevel, added, reused, none);
 	}
 
 	// Every edge must still be a (nearly) straight walk; reports the ones that are not.
@@ -901,6 +969,7 @@ struct Builder {
 	// Ground heights for the addon's ground dots: every HS yards on a grid aligned with the addon's 64-yard
 	// lookup cells (HereBeDragons coords + 17100), all walkable layers at each point (bridges, caves, floors).
 	// HGT1 file: cell count, then per cell: cx, cy (int32), 64 layer counts (uint8), the heights (float32).
+
 	void heights(const std::string& path) {
 		static const float HS = 8.0f, OFF = 17100.0f, MERGE = 1.5f;
 		static const int PER = 8, MAX_LAYERS = 4;
@@ -1084,6 +1153,38 @@ int main(int argc, char** argv) {
 		printf("walk %d len %.1f direct %.1f dev %.1f flags %d\n", w, len, dtVdist(n[0].p, n[1].p), dev, fl);
 		return 0;
 	}
+	if (cmd == "paths") { // navbuild paths <nav_dir> <pairs.txt> <threads>: Detour's string-pulled path per "X1 Y1 Z1 X2 Y2 Z2" line
+		Builder b;
+		b.nav = loadNavMesh(argv[2]);
+		b.threads = 1;
+		dtNavMeshQuery* q = dtAllocNavMeshQuery();
+		q->init(b.nav, 65535);
+		FILE* f = fopen(argv[3], "r");
+		if (!f) return 1;
+		static dtPolyRef poly[16384];
+		static float corners[2048 * 3];
+		float w[6];
+		for (int i = 0; fscanf(f, "%f %f %f %f %f %f", &w[0], &w[1], &w[2], &w[3], &w[4], &w[5]) == 6; i++) {
+			Node n[2];
+			for (int k = 0; k < 2; k++) {
+				float c[3] = { w[k * 3 + 1], w[k * 3 + 2], w[k * 3] }, ext[3] = { 2, 4, 2 };
+				q->findNearestPoly(c, ext, &b.filter, &n[k].ref, n[k].p);
+			}
+			int np = 0, nc = 0;
+			if (!n[0].ref || !n[1].ref || dtStatusFailed(q->findPath(n[0].ref, n[1].ref, n[0].p, n[1].p, &b.filter, poly, &np, 16384)) || !np
+				|| dtStatusFailed(q->findStraightPath(n[0].p, n[1].p, poly, np, corners, nullptr, nullptr, &nc, 2048))) {
+				printf("%d none\n", i);
+				continue;
+			}
+			float len = 0;
+			for (int k = 1; k < nc; k++) len += dtVdist(&corners[(k - 1) * 3], &corners[k * 3]);
+			printf("%d %.1f %d", i, len, nc);
+			for (int k = 0; k < nc; k++) printf(" %.1f,%.1f,%.1f", corners[k * 3 + 2], corners[k * 3], corners[k * 3 + 1]);
+			printf("\n");
+		}
+		fclose(f);
+		return 0;
+	}
 	if (cmd == "heights") {
 		Builder b;
 		b.nav = loadNavMesh(argv[2]);
@@ -1102,6 +1203,7 @@ int main(int argc, char** argv) {
 		b.sampleCells();
 		if (argc > 5) b.addPois(argv[5]);
 		b.connect();
+		b.longRuns();
 		b.simplify();
 		b.verify();
 		b.write(argv[3]);

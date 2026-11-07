@@ -14,6 +14,17 @@
   quest's finisher while objectives are left), not to the quest giver of another quest with the same name
   (Darkshore's beached sea turtles).
 - After a `/reload` the ground height under you is where it was, not a guess (under the Great Forge's walkway).
+  After a flight you are on the flight master's platform (Orgrimmar's tower), not on the ground under it.
+- Long straight runs: the path data has long straight edges where the shortest walk really runs straight
+  (across the Barrens, down a valley), and the search counts a little for every leg, so of two routes about
+  as long you get the one with fewer, longer legs: line yourself up and run.
+- Routes go around hostile mobs near your level like around a traffic jam: every yard inside a mob's aggro
+  range costs more (more for orange and red mobs, elites and patrols, less for green ones, nothing for gray),
+  so a route skirts a camp when the way around is not much longer and still goes through when it is. Mobs,
+  their levels, aggro ranges and patrol paths come from the CMaNGOS classic database.
+- NPCs and objects stand at their exact height (from the CMaNGOS classic database), so a route to a quest
+  giver on a tower, a pier or an upper floor ends on that level.
+- License: GNU General Public License version 3 or later (the CMaNGOS data is GPL-3.0).
 
 ## 0.3.0 (beta)
 

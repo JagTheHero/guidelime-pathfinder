@@ -1,12 +1,14 @@
 """Where quest givers, quest objects and town services stand, from the installed QuestieDB, for navbuild graph.
 
-usage: pois.py <out_dir>    writes <out_dir>/Azeroth.pois and Kalimdor.pois: "worldX worldY" per line
+usage: pois.py <out_dir>    writes <out_dir>/Azeroth.pois and Kalimdor.pois: "worldX worldY [worldZ]" per line
 
-Routes end at the graph node nearest the target, so navbuild puts a node on every walkable layer where these
-stand (a pier's deck, an inn's upper floor) instead of leaving the nearest one to chance. QuestieDB keeps its
-rows as base-64 CBOR in TOC metadata: ## X-Npc-<id>-<field> (S: the scalar fields, 7: spawns, 10/11: quests it
-starts/ends) and ## X-Object-<id>-<field> (2/3: quests it starts/ends, 4: spawns). Spawns are zone percent per
-area id; QuestieDB maps area ids to UiMap ids, and the client's UiMapAssignment to world coordinates.
+Routes end at the graph node nearest the target, so navbuild puts a node where these stand: on the level of
+their height when known (a pier's deck, an inn's upper floor), on every walkable level over the spot otherwise.
+QuestieDB keeps its rows as base-64 CBOR in TOC metadata: ## X-Npc-<id>-<field> (S: the scalar fields, 7:
+spawns, 10/11: quests it starts/ends) and ## X-Object-<id>-<field> (2/3: quests it starts/ends, 4: spawns).
+Spawns are zone percent per area id; QuestieDB maps area ids to UiMap ids, and the client's UiMapAssignment to
+world coordinates. Questie's spots have no height: the same NPC's or object's spawn in the CMaNGOS classic
+database (tools/cmangos.py) within MATCH yards gives the exact spot and height; WoW: Forever's own NPCs have none.
 """
 import base64
 import os
@@ -15,6 +17,7 @@ import struct
 import sys
 
 from casc import Casc, WOW_DIR
+from cmangos import table
 from db2 import WDC5
 
 QUESTIE = os.path.join(WOW_DIR, "_forever_/Interface/AddOns/QuestieDB")
@@ -23,6 +26,7 @@ AREA2UI = QUESTIE + "/support/Forever/Zones/areaIdToUiMapId.lua"
 UIMAPASSIGNMENT = 1957219
 CONTINENTS = {0: "Azeroth", 1: "Kalimdor"}
 MAX_SPAWNS = 30  # an NPC with more spawns than this is a wandering mob that happens to give a quest
+MATCH = 10  # yards between Questie's spot and a CMaNGOS spawn of the same NPC or object that count as one
 
 
 def cbor(b, i=0):
@@ -118,7 +122,13 @@ def main():
                 wanted.append((kind, id_, "7"))
         elif kind == "Object" and field in ("2", "3"):
             wanted.append((kind, id_, "4"))
-    pts = {m: set() for m in CONTINENTS}
+    exact = {}  # (kind, id, map) -> [(x, y, z)], world coordinates
+    for kind, name in (("Npc", "creature"), ("Object", "gameobject")):
+        for r in table(name):
+            if r[2] in CONTINENTS:
+                exact.setdefault((kind, r[1], r[2]), []).append((r[4], r[5], r[6]))
+    pts = {m: {} for m in CONTINENTS}
+    matched = total = 0
     for key in sorted(set(wanted)):
         s = rows.get(key)
         if not s:
@@ -138,12 +148,20 @@ def main():
                     continue
                 wy = y1 - p[0] / 100 * (y1 - y0)
                 wx = x1 - p[1] / 100 * (x1 - x0)
-                pts[mapid].add((round(wx, 1), round(wy, 1)))
+                near = min(exact.get((key[0], key[1], mapid), []), key=lambda e: (e[0] - wx) ** 2 + (e[1] - wy) ** 2,
+                           default=None)
+                total += 1
+                if near and (near[0] - wx) ** 2 + (near[1] - wy) ** 2 <= MATCH ** 2:
+                    matched += 1
+                    pts[mapid][(round(near[0], 1), round(near[1], 1))] = round(near[2], 1)
+                else:
+                    pts[mapid].setdefault((round(wx, 1), round(wy, 1)), None)
+    print("spots with a CMaNGOS height: %d of %d" % (matched, total))
     for mapid, name in CONTINENTS.items():
         path = os.path.join(out_dir, name + ".pois")
         with open(path, "w") as f:
-            for wx, wy in sorted(pts[mapid]):
-                f.write("%.1f %.1f\n" % (wx, wy))
+            for (wx, wy), wz in sorted(pts[mapid].items()):
+                f.write("%.1f %.1f\n" % (wx, wy) if wz is None else "%.1f %.1f %.1f\n" % (wx, wy, wz))
         print("%s: %d points" % (path, len(pts[mapid])))
 
 
