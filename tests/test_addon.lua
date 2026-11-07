@@ -154,6 +154,77 @@ GuidelimeArrow.element = nil
 GuidelimeWindow:Hide()
 for _ = 1, 12 do M.Step(0.1) end
 check(ns.path == nil and ns.WhyNoTarget():find("open Guidelime's window", 1, true), "window closed: no fallback, and status says why")
+
+-- what the step does with a quest picks the icon. Darkshore has five quests named "Beached Sea Turtle": a turn-in
+-- goes to the turn-in, not to another one's quest giver on the beach nearby, and an accept the other way round.
+GuidelimeWindow:Show()
+GuidelimeWindow.steps = {}
+for k in pairs(questFrames) do questFrames[k] = nil end
+local function pct(wx, wy) return { (M.zone.left - wx) / M.zone.w * 100, (M.zone.top - wy) / M.zone.h * 100 } end
+local quests, npcs, questLog = {}, {}, {}
+local modules = {
+	QuestieMap = { questIdFrames = questFrames },
+	QuestiePlayer = { currentQuestlog = questLog },
+	QuestieDB = {
+		QueryQuestSingle = function(id, field) return quests[id] and quests[id][field] end,
+		QueryNPCSingle = function(id, field) return npcs[id] and npcs[id][field] end,
+		QueryObjectSingle = function() end,
+	},
+	ZoneDB = { GetUiMapIdByAreaId = function() return M.zone.id end, IsDungeonZone = function() return false end },
+}
+QuestieLoader = { ImportModule = function(_, name) return modules[name] end }
+icon(7101, "Beached Sea Turtle", "available", 100, 200)
+icon(7102, "Beached Sea Turtle", "complete", 50, 500)
+local GOSSIP = "|TInterface\\GossipFrame\\%s:12|t"
+local step = stepFrame(6, GOSSIP:format("ActiveQuestIcon") .. "Turn in |cFF59C4F1Beached Sea Turtle|r")
+M.px, M.py = 0, 0
+for _ = 1, 12 do M.Step(0.1) end
+check(goalAt(50, 500), "turn-in: Questie's turn-in icon, not the quest giver of a quest with the same name nearer by")
+step.textBox.text = GOSSIP:format("AvailableQuestIcon") .. "Accept |cFF59C4F1Beached Sea Turtle|r"
+for _ = 1, 12 do M.Step(0.1) end
+check(goalAt(100, 200), "accept: Questie's quest giver icon")
+step.textBox.text = GOSSIP:format("UI-CheckBox-Check") .. "Accept |cFF59C4F1Beached Sea Turtle|r"
+for _ = 1, 12 do M.Step(0.1) end
+check(ns.path == nil, "a quest the step shows as done is not a target")
+-- objectives left: Questie draws no turn-in icon yet; the quest's finisher in its database, if it is in the log
+for k in pairs(questFrames[7102]) do _G[k] = nil end
+questFrames[7102] = nil
+quests[7102] = { name = "Beached Sea Turtle", finishedBy = { { 9101 } } }
+npcs[9101] = { name = "Gwennyth Bly'Leggonde", spawns = { [148] = { pct(-300, 50) } } }
+step.textBox.text = GOSSIP:format("IncompleteQuestIcon") .. "Turn in |cFF59C4F1Beached Sea Turtle|r"
+for _ = 1, 12 do M.Step(0.1) end
+check(ns.path == nil, "objectives left, quest not in the log: no target")
+questLog[7102] = true
+for _ = 1, 12 do M.Step(0.1) end
+check(goalAt(-300, 50), "objectives left, quest in the log: heads for the quest's finisher")
+M.prints = {}
+SlashCmdList.GUIDELIMEPATHFINDER("status")
+check(table.concat(M.prints, "\n"):find("turn-in for Beached Sea Turtle (Gwennyth Bly'Leggonde)", 1, true), "status names the finisher")
+GuidelimeWindow.steps = {}
+
+-- Guidelime's own spot for a turn-in or a quest giver, checked against Questie's: a few yards off, the NPC's own
+-- spot (the route ends where it stands); far off (moved on WoW: Forever), the NPC, said once
+quests[7103] = { finishedBy = { { 9102 } } }
+npcs[9102] = { name = "Thundris Windweaver", spawns = { [148] = { pct(100, 200) } } }
+GuidelimeArrow.element = { wx = 112, wy = 214, instance = M.instance, attached = { questId = 7103, t = "TURNIN", title = "Tools of the Highborne" } }
+for _ = 1, 12 do M.Step(0.1) end
+check(goalAt(100, 200) and ns.targetSource == "guidelime", "a Guidelime turn-in spot a few yards off: the NPC's own spot")
+quests[7104] = { startedBy = { { 9103 } } }
+npcs[9103] = { name = "Gubber Blump", spawns = { [148] = { pct(-300, 50) } } }
+M.prints = {}
+GuidelimeArrow.element = { wx = 50, wy = 500, instance = M.instance, attached = { questId = 7104, t = "ACCEPT", title = "Fruit of the Sea" } }
+for _ = 1, 12 do M.Step(0.1) end
+local note = "Guidelime's spot for Fruit of the Sea is 570 yd from Gubber Blump in Questie's data; heading there instead"
+local count = 0
+for _, line in ipairs(M.prints) do if line:find(note, 1, true) then count = count + 1 end end
+check(goalAt(-300, 50) and count == 1, "a Guidelime quest giver spot far off: Questie's NPC, said once (" .. table.concat(M.prints, " / ") .. ")")
+M.prints = {}
+SlashCmdList.GUIDELIMEPATHFINDER("status")
+check(table.concat(M.prints, "\n"):find(note, 1, true), "status says so too")
+GuidelimeArrow.element = { wx = 50, wy = 500, instance = M.instance, attached = { questId = 7104, t = "ACCEPT", completed = true } }
+for _ = 1, 3 do M.Step(0.1) end
+check(goalAt(50, 500), "no check once Guidelime counts the quest element done")
+GuidelimeArrow.element = nil
 GuidelimeWindow, QuestieLoader = nil, nil
 for _ = 1, 12 do M.Step(0.1) end
 
@@ -244,12 +315,17 @@ if ns.Graph.Has(0) then
 	end
 end
 
--- Ironforge: the halls lie under walkable mountainside. After a /reload on the Great Forge floor the player's
--- height is the floor, the route leaves through the halls, and the dots stay on the floor.
+-- Ironforge: the halls lie under walkable mountainside, and a walkway crosses over the Great Forge. With no
+-- height to go on, the likely one is in the halls; after a /reload on the forge floor the player's height is the
+-- floor, the route leaves through the halls, and the dots stay on the floor.
 if ns.Graph.HasGround(0) then
 	M.instance = 0
 	M.zone = { id = 1455, left = 0, top = -4000, w = 3000, h = 3000 }
 	M.px, M.py, M.pz = -1166.4, -4808.5, 502.5
+	local likely = ns.Graph.LikelyZ(0, M.px, M.py)
+	check(likely and likely < 600, string.format("Ironforge: the likely height is in the halls, not on the mountainside (%.1f)", likely or -1))
+	ns.player.gx, ns.player.gy, ns.player.ginstance, ns.player.z = M.px, M.py, 0, M.pz -- on the floor at the /reload
+	M.Fire("PLAYER_LOGOUT")
 	ns.player.gx, ns.player.z = nil, nil
 	GuidelimeArrow.element = { wx = -1400, wy = -5300, instance = 0 } -- southwest, where the mountainside is shorter
 	for _ = 1, 200 do

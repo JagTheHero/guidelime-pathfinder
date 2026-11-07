@@ -21,7 +21,8 @@ OFFSET_XY, OFFSET_Z, Q = 17100, 4000, 4
 CS = 64  # lookup cell size, yards
 HEIGHT_REACH = 2  # height cells are kept within this many cells of a kept node (edges are up to 143 yd long)
 SEA_RANGE = 120  # swim nodes farther than this from any ground node are dropped
-NODE_INDOOR, NODE_SWIM = 1, 2
+NODE_INDOOR, NODE_SWIM, NODE_POI = 1, 2, 4
+EDGE_FLAGS = 3  # 1 swims, 2 crosses a narrow walkway (navbuild F_SWIM, F_NARROW)
 AREA_SWIM, AREA_INDOOR = 2, 3
 
 
@@ -183,7 +184,8 @@ def main():
     hx = nodes['y'].astype(np.float64)  # HBD x = world Y
     hy = nodes['x'].astype(np.float64)  # HBD y = world X
     hz = nodes['z'].astype(np.float64)
-    area = nodes['area']
+    area = nodes['area'] & 0x7f
+    poi = nodes['area'] >> 7  # navbuild's high bit: where a quest giver, quest object or town service stands
     a, b, ef = edges['a'].astype(np.int64), edges['b'].astype(np.int64), edges['flags']
 
     keep = keep_mask(hx, hy, area, a, b, min_comp)
@@ -205,13 +207,14 @@ def main():
     ea, eb, efl = new_id[a[em]], new_id[b[em]], ef[em].astype(np.int64)
     src = np.concatenate([ea, eb])
     dst = np.concatenate([eb, ea])
-    fl = np.concatenate([efl, efl]) & 1
+    fl = np.concatenate([efl, efl]) & EDGE_FLAGS
     o = np.lexsort((dst, src))
     src, dst, fl = src[o], dst[o], fl[o]
     first = np.searchsorted(src, np.arange(len(old)))
 
     n = len(old)
-    flags = np.where(area[old] == AREA_INDOOR, NODE_INDOOR, 0) | np.where(area[old] == AREA_SWIM, NODE_SWIM, 0)
+    flags = (np.where(area[old] == AREA_INDOOR, NODE_INDOOR, 0) | np.where(area[old] == AREA_SWIM, NODE_SWIM, 0)
+             | np.where(poi[old] > 0, NODE_POI, 0))
     qx = np.round((hx[old] + OFFSET_XY) * Q).astype(np.int64)
     qy = np.round((hy[old] + OFFSET_XY) * Q).astype(np.int64)
     qz = np.round((np.clip(hz[old], -OFFSET_Z, 60000) + OFFSET_Z) * Q).astype(np.int64)

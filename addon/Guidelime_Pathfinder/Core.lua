@@ -42,18 +42,37 @@ function ns.Debug(...) if ns.db and ns.db.debug then ns.Print(...) end end
 
 -- Fallback for steps Guidelime has no map position for (the custom WoW: Forever quests): read the active
 -- steps from Guidelime's window, find the quests they name among those Questie has map icons for, and head
--- for the nearest icon. Questie draws where a quest goes next: its giver, its objectives or its turn-in.
+-- for the nearest icon that fits what the step does with the quest: the quest giver for an accept, the turn-in
+-- (or, objectives left, the quest's finisher) for a turn-in, objectives otherwise. Several quests can share a
+-- name (Darkshore's beached sea creatures): a turn-in is never sent to another one's quest giver.
 local KEEP_PICK = 30  -- yards: stay on the chosen icon until another is this much closer
 local fallback = { at = -10 }
 ns.fallback = fallback
 local questNames = {}
+-- what the icon Guidelime puts in front of each quest a step names says (its addon.icons); any other icon is
+-- an objective's
+local ICON_KINDS = { AvailableQuestIcon = "accept", questunavailable = "accept", ActiveQuestIcon = "turnin",
+	IncompleteQuestIcon = "turnin", ["UI-CheckBox-Check"] = "done", ["UI-GroupLoot-Pass-Up"] = "done" }
 
 local function plainText(s)
 	s = s:gsub("|T.-|t", " "):gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
 	return (s:gsub("%[[^%]]*%]", " "):gsub("%(#%d+%)", ""))
 end
 
--- Text of the steps Guidelime shows as active: pinned optional steps last, otherwise in guide order.
+-- A step's text in parts, one per icon: { kind = what the icon says (nil before the first), text }.
+local function stepParts(text)
+	local parts, pos, kind = {}, 1, nil
+	while true do
+		local s, e, icon = text:find("|T([^:|]+)[^|]*|t", pos)
+		local chunk = text:sub(pos, (s or 0) - 1)
+		if chunk:find("%w") then parts[#parts + 1] = { kind = kind, text = plainText(chunk) } end
+		if not s then return parts end
+		kind = ICON_KINDS[icon:match("([^\\/]+)$")] or "complete"
+		pos = e + 1
+	end
+end
+
+-- The steps Guidelime shows as active, in parts: pinned optional steps last, otherwise in guide order.
 local function activeSteps()
 	local win = _G.GuidelimeWindow
 	if not win or not win.steps or not win:IsShown() then return end
@@ -64,7 +83,7 @@ local function activeSteps()
 			local text = f.textBox:GetText() or ""
 			-- inactive steps start with the inactive colour (after an optional line number)
 			if not text:sub(1, #inactive + 6):find(inactive, 1, true) then
-				list[#list + 1] = { i = i, text = plainText(text), pinned = f:GetParent() == win.pinnedStepsFrame }
+				list[#list + 1] = { i = i, parts = stepParts(text), pinned = f:GetParent() == win.pinnedStepsFrame }
 			end
 		end
 	end
@@ -77,7 +96,7 @@ end
 
 local function questName(questMap, questId)
 	if questNames[questId] then return questNames[questId] end
-	for _, name in pairs(questMap.questIdFrames[questId]) do
+	for _, name in pairs(questMap and questMap.questIdFrames[questId] or {}) do
 		local f = _G[name]
 		local q = f and f.data and f.data.Id == questId and f.data.QuestData
 		if q and q.name then
@@ -85,6 +104,48 @@ local function questName(questMap, questId)
 			return q.name
 		end
 	end
+	local DB = QuestieLoader:ImportModule("QuestieDB")
+	local name = DB and DB.QueryQuestSingle and DB.QueryQuestSingle(questId, "name")
+	questNames[questId] = name
+	return name
+end
+
+-- does a Questie map icon of this type fit what the step does with its quest?
+local function iconFits(kind, icon)
+	if kind == "accept" then return icon == "available" end
+	if kind == "turnin" then return icon == "complete" end
+	if kind == "complete" then return icon ~= "available" end
+	return true
+end
+
+-- Where an NPC or object stands, from Questie's database (query: QueryNPCSingle or QueryObjectSingle), added
+-- to out as { instance, x, y, uiMap } in world coordinates.
+local function spawnSpots(query, id, out)
+	local Z = QuestieLoader:ImportModule("ZoneDB")
+	for area, list in pairs(query(id, "spawns") or {}) do
+		local uiMap = not Z.IsDungeonZone(area) and Z:GetUiMapIdByAreaId(area)
+		for _, c in ipairs(uiMap and list or {}) do
+			local x, y, inst
+			if c[1] >= 0 then x, y, inst = HBD:GetWorldCoordinatesFromZone(c[1] / 100, c[2] / 100, uiMap) end
+			if x then out[#out + 1] = { instance = inst, x = x, y = y, uiMap = uiMap } end
+		end
+	end
+	return out
+end
+
+-- Where a quest starts (field "startedBy") or ends ("finishedBy"): its NPCs' and objects' spots, with names.
+local function questSpots(questId, field)
+	local DB = QuestieLoader:ImportModule("QuestieDB")
+	local by = DB and DB.QueryQuestSingle and DB.QueryQuestSingle(questId, field)
+	local out = {}
+	for k, query in ipairs({ DB and DB.QueryNPCSingle or false, DB and DB.QueryObjectSingle or false }) do
+		for _, id in ipairs(query and by and by[k] or {}) do
+			local n = #out
+			spawnSpots(query, id, out)
+			for i = n + 1, #out do out[i].name = query(id, "name") end
+		end
+	end
+	return out
 end
 
 local function findFallback(px, py, instance)
@@ -92,22 +153,41 @@ local function findFallback(px, py, instance)
 	if not questMap or not questMap.questIdFrames then return nil, "Questie is not loaded" end
 	local steps = activeSteps()
 	if not steps then return nil, "open Guidelime's window so the step can be looked up in Questie" end
+	local questiePlayer = QuestieLoader:ImportModule("QuestiePlayer")
+	local log = questiePlayer and questiePlayer.currentQuestlog or {}
+	local ids = {}
+	for questId in pairs(questMap.questIdFrames) do ids[questId] = true end
+	for questId in pairs(log) do ids[questId] = true end
 	for _, step in ipairs(steps) do
 		local best, bestD, kept, keptD
-		for questId, frames in pairs(questMap.questIdFrames) do
-			local name = questName(questMap, questId)
-			if name and #name >= 3 and step.text:find(name, 1, true) then
-				for _, frameName in pairs(frames) do
-					local f = _G[frameName]
-					local d = f and f.data
-					if d and d.Id == questId and not f.miniMapIcon and f.x and f.UiMapID
-						and not (d.ObjectiveData and d.ObjectiveData.Completed) then
-						local x, y, inst = HBD:GetWorldCoordinatesFromZone(f.x / 100, f.y / 100, f.UiMapID)
-						if x and inst == instance then
-							local dd = (x - px) ^ 2 + (y - py) ^ 2
-							local c = { x = x, y = y, instance = inst, quest = name, kind = d.Type, name = d.Name }
-							if not bestD or dd < bestD then best, bestD = c, dd end
-							if fallback.x and abs(x - fallback.x) < 1 and abs(y - fallback.y) < 1 then kept, keptD = c, dd end
+		local function consider(x, y, inst, c)
+			if not x or inst ~= instance then return end
+			local dd = (x - px) ^ 2 + (y - py) ^ 2
+			c.x, c.y, c.instance = x, y, inst
+			if not bestD or dd < bestD then best, bestD = c, dd end
+			if fallback.x and abs(x - fallback.x) < 1 and abs(y - fallback.y) < 1 then kept, keptD = c, dd end
+		end
+		for _, part in ipairs(step.parts) do
+			if part.kind ~= "done" then
+				for questId in pairs(ids) do
+					local name = questName(questMap, questId)
+					if name and #name >= 3 and part.text:find(name, 1, true) then
+						local icons = 0
+						for _, frameName in pairs(questMap.questIdFrames[questId] or {}) do
+							local f = _G[frameName]
+							local d = f and f.data
+							if d and d.Id == questId and not f.miniMapIcon and f.x and f.UiMapID and iconFits(part.kind, d.Type)
+								and not (d.ObjectiveData and d.ObjectiveData.Completed) then
+								icons = icons + 1
+								local x, y, inst = HBD:GetWorldCoordinatesFromZone(f.x / 100, f.y / 100, f.UiMapID)
+								consider(x, y, inst, { quest = name, kind = d.Type, name = d.Name })
+							end
+						end
+						-- a turn-in Questie draws no icon for yet (objectives left): the quest's finisher
+						if part.kind == "turnin" and icons == 0 and log[questId] then
+							for _, sp in ipairs(questSpots(questId, "finishedBy")) do
+								consider(sp.x, sp.y, sp.instance, { quest = name, kind = "complete", name = sp.name })
+							end
 						end
 					end
 				end
@@ -119,6 +199,48 @@ local function findFallback(px, py, instance)
 		end
 	end
 	return nil, "Questie shows no map icons on this continent for the quests in Guidelime's active steps"
+end
+
+-- Guidelime's spot for a quest giver or a turn-in, checked against Questie's database (its WoW: Forever data):
+-- within CHECK_REACH of one of the quest's NPCs or objects, that one's own spot is the target, so the route ends
+-- where it stands (on its floor, its pier); farther from all of them, Guidelime's spot is wrong for Forever and
+-- the nearest of them is the target, said once.
+local CHECK_REACH = 40
+local checked = setmetatable({}, { __mode = "k" })
+local function checkedSpot(el, px, py)
+	local q = el.attached
+	local field = q and q.questId and not q.completed and (q.t == "TURNIN" and "finishedBy" or q.t == "ACCEPT" and "startedBy")
+	if not field or not QuestieLoader then return end
+	local c = checked[el]
+	if c == nil then
+		c = false
+		local spots, near, nearD = {}, nil, nil
+		for _, sp in ipairs(questSpots(q.questId, field)) do
+			if sp.instance == el.instance then
+				spots[#spots + 1] = sp
+				local d = sqrt((sp.x - el.wx) ^ 2 + (sp.y - el.wy) ^ 2)
+				if not nearD or d < nearD then near, nearD = sp, d end
+			end
+		end
+		if near and nearD <= CHECK_REACH then
+			c = { spot = near }
+		elseif near then
+			c = { spots = spots, note = format("Guidelime's spot for %s is %d yd from %s in Questie's data; heading there instead",
+				q.title or questName(nil, q.questId) or "this quest",
+				floor(nearD + 0.5), near.name or "its NPC") }
+			ns.Print(c.note)
+		end
+		checked[el] = c
+	end
+	if not c then return end
+	ns.checkNote = c.note
+	if c.spot then return c.spot end
+	local best, bestD
+	for _, sp in ipairs(c.spots) do
+		local d = (sp.x - px) ^ 2 + (sp.y - py) ^ 2
+		if not bestD or d < bestD then best, bestD = sp, d end
+	end
+	return best
 end
 
 -- Recomputed at most once a second; the pick is sticky so the route does not flip between objective spawns.
@@ -138,7 +260,7 @@ end
 -- town service from /gpath go (with its height). ns.targetSource says which: "guidelime", "questie", "corpse"
 -- or "service".
 function ns.GetTarget()
-	ns.targetSource = nil
+	ns.targetSource, ns.checkNote = nil, nil
 	if UnitIsGhost("player") then
 		local zone = HBD:GetPlayerZone()
 		local corpse = zone and C_DeathInfo.GetCorpseMapPosition(zone)
@@ -165,6 +287,9 @@ function ns.GetTarget()
 	local tomtom = GuidelimeData and GuidelimeData.useTomTomArrow and TomTom
 	if not arrow:IsShown() and not tomtom then return end
 	ns.targetSource = "guidelime"
+	local px, py = HBD:GetPlayerWorldPosition()
+	local spot = px and checkedSpot(el, px, py)
+	if spot then return spot.x, spot.y, spot.instance end
 	return el.wx, el.wy, el.instance
 end
 
@@ -520,7 +645,7 @@ end
 
 -- every place one of them stands that the player's faction may use, in world coordinates
 local function serviceSpots(name, ids)
-	local DB, Z = QuestieLoader:ImportModule("QuestieDB"), QuestieLoader:ImportModule("ZoneDB")
+	local DB = QuestieLoader:ImportModule("QuestieDB")
 	local C = QuestieLoader:ImportModule("QuestieCorrections")
 	local blacklist = C and C.questNPCBlacklist or {}
 	local object = name == "Mailbox" or name == "Meeting Stones"
@@ -530,15 +655,11 @@ local function serviceSpots(name, ids)
 	for _, id in ipairs(ids) do
 		local friendly = not object and query(id, "friendlyToFaction")
 		if not blacklist[id] and (not friendly or friendly == "AH" or friendly == mine) then
-			for area, list in pairs(query(id, "spawns") or {}) do
-				local uiMap = not Z.IsDungeonZone(area) and Z:GetUiMapIdByAreaId(area)
-				for _, c in ipairs(uiMap and list or {}) do
-					local x, y, inst
-					if c[1] >= 0 then x, y, inst = HBD:GetWorldCoordinatesFromZone(c[1] / 100, c[2] / 100, uiMap) end
-					if x then
-						spots[#spots + 1] = { instance = inst, x = x, y = y, z = ns.Graph.LikelyZ(inst, x, y), name = query(id, "name"), uiMap = uiMap }
-					end
-				end
+			local n = #spots
+			spawnSpots(query, id, spots)
+			for i = n + 1, #spots do
+				local sp = spots[i]
+				sp.z, sp.name = ns.Graph.LikelyZ(sp.instance, sp.x, sp.y), query(id, "name")
 			end
 		end
 	end
@@ -602,10 +723,13 @@ function ns.TrackGround(px, py, instance)
 	local onRoute = p and p.graph and p.seg and (p.off or huge) < 10
 	local lineZ = onRoute and select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))
 	local pred, reach = ref, moved
-	if not ref then
-		-- first height (login, teleport): the layer most path nodes around are on, which picks the floor of a
-		-- building or the halls under a mountain, then the ground under the player within a few yards of it.
-		-- Not the route's: a route can start on another layer (it is planned from this height).
+	local saved = not pl.gx and ns.db.ground
+	if saved and saved[1] == instance and sqrt((px - saved[2]) ^ 2 + (py - saved[3]) ^ 2) < 3 then
+		pred, reach = saved[4], 0 -- after a /reload or a login: where the player stood at the logout
+	elseif not ref then
+		-- first height (a teleport, or no saved one): the layer most path nodes around are on, which picks the
+		-- floor of a building or the halls under a mountain, then the ground under the player within a few
+		-- yards of it. Not the route's: a route can start on another layer (it is planned from this height).
 		pred, reach = ns.Graph.LikelyZ(instance, px, py), 6
 	elseif lineZ and pl.linePath == p.id then
 		pred = lineZ + ref - pl.lineZ
@@ -697,6 +821,7 @@ ticker:Hide()
 local events = CreateFrame("Frame")
 events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
+events:RegisterEvent("PLAYER_LOGOUT")
 events:RegisterEvent("USER_WAYPOINT_UPDATED")
 events:RegisterEvent("TAXIMAP_OPENED")
 events:RegisterEvent("TAXIMAP_CLOSED")
@@ -714,6 +839,9 @@ events:SetScript("OnEvent", function(_, event, arg1)
 	elseif event == "PLAYER_LOGIN" then
 		ns.Marker.HookBlizzard()
 		ticker:Show()
+	elseif event == "PLAYER_LOGOUT" then -- also on /reload: the height to start from after it
+		local pl = ns.player
+		ns.db.ground = pl.gx and pl.z and { pl.ginstance, pl.gx, pl.gy, pl.z } or nil
 	elseif event == "USER_WAYPOINT_UPDATED" then
 		ns.Marker.OnWaypointUpdated()
 	else -- the taxi map: a flight master just found counts at once
@@ -749,6 +877,7 @@ local function status()
 			({ available = "quest giver", complete = "turn-in" })[fallback.kind] or "objective", fallback.quest or "?")
 			.. (fallback.name and (" (" .. fallback.name .. ")") or ""))
 	end
+	if ns.checkNote then ns.Print("  " .. ns.checkNote) end
 	if ns.player.z then
 		local line = p and p.graph and p.seg and select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))
 		ns.Print(format("  ground height under you %.1f yd%s", ns.player.z, line and format(", route here %.1f yd", line) or ""))

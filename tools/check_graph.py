@@ -46,7 +46,7 @@ def main():
         dr.line([px(a['x'], a['y']), px(b['x'], b['y'])], fill=col, width=1)
     for i, n in enumerate(nodes):
         x, y = px(n['x'], n['y'])
-        col = (255, 150, 0, 255) if n['area'] == 3 else ((255, 255, 255, 230) if comp[i] == main_c else (255, 60, 60, 255))
+        col = (255, 150, 0, 255) if n['area'] & 0x7f == 3 else ((255, 255, 255, 230) if comp[i] == main_c else (255, 60, 60, 255))
         dr.ellipse([x - 1.5, y - 1.5, x + 1.5, y + 1.5], fill=col)
     Image.alpha_composite(img, ov).convert('RGB').save(out)
     print('nodes', len(nodes), 'edges', len(edges), 'components', len(uc), 'main', cc.max())

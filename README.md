@@ -70,8 +70,9 @@ into the Lua data files. You need Linux, a WoW: Forever install, `cmake`, `ninja
    python3 tools/extract.py 8                       # collision geometry -> data/geo (8 workers)
    tools/build_tiles.sh 12                          # navmesh tiles -> data/nav
    mkdir -p data/graph
+   python3 tools/pois.py data/graph                 # where quest givers, quest objects and services stand
    for m in Azeroth Kalimdor; do
-     build/navbuild graph data/nav/$m data/graph/$m.graph 12
+     build/navbuild graph data/nav/$m data/graph/$m.graph 12 data/graph/$m.pois
      build/navbuild heights data/nav/$m data/graph/$m.hgt 12
    done
    python3 tools/links.py data/graph/links.json     # flight paths, boats, zeppelins, lifts, tram, portal
@@ -82,7 +83,8 @@ into the Lua data files. You need Linux, a WoW: Forever install, `cmake`, `ninja
    ```
 
    `tools/build_tiles.sh` runs `navbuild` in a memory-capped systemd scope (16 GB); drop the `systemd-run`
-   prefix if you have no user systemd.
+   prefix if you have no user systemd. `tools/pois.py` reads the installed QuestieDB add-on: routes end on a
+   graph node at every walkable level where an NPC stands (a pier's deck, not the sea beside it).
 
 ## License
 

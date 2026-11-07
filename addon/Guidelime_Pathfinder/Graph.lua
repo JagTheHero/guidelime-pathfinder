@@ -5,8 +5,8 @@ local ADDON, ns = ...
 -- Every edge is a straight line that was checked to be walkable (small props like trees aside), so a path
 -- is just a list of corners. Data is packed into base-64 strings and read in place.
 --
---   nodes: n records of 14 chars: x(3) y(3) z(3) flags(1: 1 indoor, 2 swim) firstEdge(4)
---   edges: e records of 4 chars:  neighbour(3) flags(1)
+--   nodes: n records of 14 chars: x(3) y(3) z(3) flags(1: 1 indoor, 2 swim, 4 where an NPC or object stands) firstEdge(4)
+--   edges: e records of 4 chars:  neighbour(3) flags(1: 1 swims, 2 crosses a narrow walkway)
 --   cells: c records of 10 chars: cellKey(4) firstNode(3) count(3)   (nodes are sorted by cell)
 -- Coordinates are HereBeDragons world coordinates (x west-positive, y north-positive), stored as
 -- (v + 17100) * 4; z as (z + 4000) * 4.
@@ -23,9 +23,11 @@ for i = 1, 64 do DEC[byte(ALPHA, i)] = i - 1 end
 
 local OFFSET_XY, OFFSET_Z, Q = 17100, 4000, 4
 local NODE_W, EDGE_W, CELL_W = 14, 4, 10
-local NODE_INDOOR = 1
--- edge cost multipliers by edge flag (low 3 bits): 0 walk, 1 swim, 2 steep/slow
-local MULT = { [0] = 1, [1] = 1.7, [2] = 1.25 }
+local NODE_INDOOR, NODE_SWIM, NODE_POI = 1, 2, 4
+-- edge cost multipliers by edge flag (low 3 bits), as navbuild's: 0 walk, 1 swim, 2 narrow walkway, 3 both
+local MULT = { [0] = 1, [1] = 2.5, [2] = 2.5, [3] = 2.5 }
+local POI_REACH = 5 -- yards from the target within which a quest giver's, quest object's or service's nodes are its goals
+local SWIM_GOAL = 15 -- yards a goal in the water counts as farther than one on land
 local HEURISTIC_WEIGHT = 1.15
 local LAYER_GAP = 8 -- yards of height between a node and the player before the node counts as another layer
 local FRAME_BUDGET_MS = 4
@@ -175,11 +177,36 @@ local function heapPop(hk, hv, n)
 	return topK, topV, n
 end
 
+local function flag(f, bit) return floor(f / bit) % 2 == 1 end
+
+-- Where a route may end near (tx, ty). A quest giver, quest object or town service has a node on every walkable
+-- layer where it stands (a pier's deck, the ground under it, an inn's upper floor): all of them are goals, on tz's
+-- layer if any is, and the search ends at the one it reaches cheapest. Anywhere else the nearest nodes, land
+-- before water: the nearest node to a spot on a pier can be in the sea beside it.
+local function goalNodes(g, tx, ty, tz)
+	local found = nearest(g, tx, ty, 12, nil, tz)
+	local poi, onLayer = {}, {}
+	for _, c in ipairs(found) do
+		if c[2] <= POI_REACH and flag(g.f[c[1]], NODE_POI) then
+			poi[#poi + 1] = c
+			if c[3] == c[2] then onLayer[#onLayer + 1] = c end
+		end
+	end
+	if #onLayer > 0 then return onLayer end
+	if #poi > 0 and not tz then return poi end
+	for _, c in ipairs(found) do
+		if flag(g.f[c[1]], NODE_SWIM) then c[3] = c[3] + SWIM_GOAL end
+	end
+	table.sort(found, function(a, b) return a[3] < b[3] end)
+	for i = 4, #found do found[i] = nil end
+	return found
+end
+
 local function search(g, sx, sy, tx, ty, indoors, sz, tz)
 	decodeNodes(g)
 	local gx, gy, gz = g.x, g.y, g.z
 	local starts = nearest(g, sx, sy, 4, indoors, sz)
-	local goals = nearest(g, tx, ty, 3, nil, tz)
+	local goals = goalNodes(g, tx, ty, tz)
 	if #starts == 0 or #goals == 0 then return end
 
 	local goalCost = {}
@@ -433,11 +460,15 @@ end
 
 -- Most likely ground height at (x, y) when nothing else is known (login, teleport): the layer most path nodes
 -- within 40 yards are on, nearer nodes counting more. Ironforge's halls win over the mountainside above them.
+-- The nodes where NPCs stand do not vote: each has one on every layer over its spot, the mountainside too.
 function Graph.LikelyZ(instance, x, y)
 	local g = graphs[instance]
 	if not g or (g.n or 0) == 0 then return end
 	decodeNodes(g)
-	local found = nearest(g, x, y, 12)
+	local found = {}
+	for _, a in ipairs(nearest(g, x, y, 36)) do
+		if #found < 12 and not flag(g.f[a[1]], NODE_POI) then found[#found + 1] = a end
+	end
 	local best, bestScore
 	for _, a in ipairs(found) do
 		if a[2] < 40 then
@@ -472,6 +503,23 @@ function Graph.Piece(instance, x, y, z)
 	if f and f[2] < 60 and (not z or abs(g.z[f[1]] - z) <= LAYER_GAP) then return v2(g.comps, (f[1] - 1) * 2 + 1) end
 end
 
+-- The pieces a route to (x, y) can end in: those of the nodes the search could end at (an NPC's spot can have
+-- a layer in another piece, such as a mesa's top and the hollow under it).
+local function goalPieces(instance, x, y, z)
+	local g = graphs[instance]
+	if not g or not g.comps or (g.n or 0) == 0 then return {} end
+	decodeNodes(g)
+	local out, seen = {}, {}
+	for _, c in ipairs(goalNodes(g, x, y, z)) do
+		local piece = v2(g.comps, (c[1] - 1) * 2 + 1)
+		if c[2] < 60 and (not z or abs(g.z[c[1]] - z) <= LAYER_GAP) and not seen[piece] then
+			seen[piece] = true
+			out[#out + 1] = piece
+		end
+	end
+	return out
+end
+
 -- the far end's piece of a ride to another continent: that continent's ride back starts there
 local function farPiece(r)
 	local g = graphs[r[6]]
@@ -503,8 +551,9 @@ function Graph.PlanTrip(s, t, opts)
 	if not S.piece then return end
 	local goals = {}
 	for i, g in ipairs(t[1] and t or { t }) do
-		local piece = Graph.Piece(g.instance, g.x, g.y, g.z)
-		if piece then goals[add(g.instance, g.x, g.y, g.z, piece, { kind = "goal", goal = i })] = true end
+		for _, piece in ipairs(goalPieces(g.instance, g.x, g.y, g.z)) do
+			goals[add(g.instance, g.x, g.y, g.z, piece, { kind = "goal", goal = i })] = true
+		end
 	end
 	if not next(goals) then return end
 	local known, air = opts.known or {}, {}

@@ -1,5 +1,20 @@
 # Guidelime Pathfinder
 
+## Unreleased
+
+- Routes no longer step off bridges and piers: every shortcut in the path data is checked to be a straight
+  walk, and narrow walkways and water cost more, so a route takes the bridge deck or the street instead of a
+  ledge you have to hit exactly or a swim.
+- Routes end where the NPC stands: the path data has a point on every walkable level at each quest giver,
+  quest object and town service (from Questie's data), so a route to someone on a pier or dock ends on it,
+  not in the water beside it, and a route from the water leads back to land.
+- Turn-ins and quest givers: Guidelime's spot is checked against Questie's data. A few yards off, the route
+  goes to the NPC's exact spot; far off (moved on Forever), it goes to the NPC and says so.
+- Questie fallback: a step's icons say what it does with each quest, so a turn-in goes to the turn-in (or the
+  quest's finisher while objectives are left), not to the quest giver of another quest with the same name
+  (Darkshore's beached sea turtles).
+- After a `/reload` the ground height under you is where it was, not a guess (under the Great Forge's walkway).
+
 ## 0.3.0 (beta)
 
 First public release.

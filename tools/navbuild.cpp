@@ -1,7 +1,9 @@
 // navbuild: Recast/Detour navmesh tiles from .geo files, then a sparse walkable-path graph.
 //
 //   navbuild tiles <geo_dir> <nav_dir> <threads>        one .nav per ADT tile (4x4 Detour tiles)
-//   navbuild graph <nav_dir> <out.graph> <threads>      graph over the whole map (NAV_DEBUG=1 for island and edge stats)
+//   navbuild graph <nav_dir> <out.graph> <threads> [pois.txt]  graph over the whole map, with nodes at the
+//                                                      points of interest (NAV_DEBUG=1 for island and edge stats)
+//   navbuild line <nav_dir> X1 Y1 Z1 X2 Y2 Z2            the edge checks between two world points
 //   navbuild heights <nav_dir> <out.hgt> <threads>      ground heights every 8 yards, all walkable layers (ground dots)
 //   navbuild probe <nav_dir> <worldX> <worldY> x       straight-walk checks between polygons around one point
 //
@@ -39,7 +41,11 @@ static const float CS = SUBTILE / SUBCELLS;  // ~0.501 yards
 static const float CH = 0.25f;
 static const float AGENT_HEIGHT = 2.0f, AGENT_CLIMB = 1.25f, AGENT_RADIUS = 0.5f, MAX_SLOPE = 52.0f;
 
-enum Area : unsigned char { A_NULL = 0, A_GROUND = 1, A_SWIM = 2, A_INDOOR = 3 };
+// A_NARROW: ground in a walkway at most NARROW_DIST wide (ledges, planks, gaps between rocks), set after erosion
+enum Area : unsigned char { A_NULL = 0, A_GROUND = 1, A_SWIM = 2, A_INDOOR = 3, A_NARROW = 4 };
+// Recast's distance field counts 2 per cell (0.5 yd) from the walkable edge, which is already the agent radius
+// in from the real edge: a walkway whose middle is at most 2 is up to 4 cells, about 3 yards of real ground.
+static const int NARROW_DIST = 2, NARROW_REACH = 3;
 
 struct Geo {
 	std::vector<float> v;   // recast coords
@@ -90,6 +96,34 @@ static void loadNeighbourhood(const std::string& dir, int col, int row, Geo& out
 }
 
 struct NavBlob { int tx, ty; std::vector<unsigned char> data; };
+
+// Ground whose widest point within NARROW_REACH cells (following walkable connections) is at most NARROW_DIST from
+// the edge becomes A_NARROW: the middle of a walkway that narrow, not just the rim of open ground. True if any.
+static bool markNarrow(rcCompactHeightfield& chf) {
+	const int w = chf.width, h = chf.height;
+	std::vector<unsigned short> m(chf.dist, chf.dist + chf.spanCount), next(chf.spanCount);
+	for (int it = 0; it < NARROW_REACH; it++) {
+		for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+			const rcCompactCell& c = chf.cells[x + y * w];
+			for (int i = (int)c.index, ni = (int)(c.index + c.count); i < ni; i++) {
+				unsigned short v = m[i];
+				for (int dir = 0; dir < 4; dir++) {
+					int con = rcGetCon(chf.spans[i], dir);
+					if (con == RC_NOT_CONNECTED) continue;
+					int ax = x + rcGetDirOffsetX(dir), ay = y + rcGetDirOffsetY(dir);
+					v = std::max(v, m[chf.cells[ax + ay * w].index + con]);
+				}
+				next[i] = v;
+			}
+		}
+		m.swap(next);
+	}
+	bool any = false;
+	for (int i = 0; i < chf.spanCount; i++) {
+		if ((chf.areas[i] == A_GROUND || chf.areas[i] == A_INDOOR) && m[i] <= NARROW_DIST) { chf.areas[i] = A_NARROW; any = true; }
+	}
+	return any;
+}
 
 // Build one Detour tile (tx, ty in Detour tile grid) from the merged geometry.
 static bool buildSubTile(const Geo& g, int tx, int ty, NavBlob& out, rcContext& ctx) {
@@ -150,6 +184,7 @@ static bool buildSubTile(const Geo& g, int tx, int ty, NavBlob& out, rcContext& 
 	rcFreeHeightField(hf);
 	ok = ok && rcErodeWalkableArea(&ctx, cfg.walkableRadius, *chf);
 	ok = ok && rcBuildDistanceField(&ctx, *chf);
+	if (ok && markNarrow(*chf)) ok = rcBuildDistanceField(&ctx, *chf); // regions split where the area changes
 	ok = ok && rcBuildRegions(&ctx, *chf, cfg.borderSize, cfg.minRegionArea, cfg.mergeRegionArea);
 	rcContourSet* cset = rcAllocContourSet();
 	ok = ok && rcBuildContours(&ctx, *chf, cfg.maxSimplificationError, cfg.maxEdgeLen, *cset);
@@ -249,7 +284,12 @@ static const int MAX_RAY_PATH = 512;
 static const float MIN_ISLAND = 400.0f;      // smaller walkable islands (roofs, tree tops, rocks) get no nodes
 static const float CLEAR = 8.0f;             // yards from walls that count as open ground when centring routes
 
-struct Node { float p[3]; dtPolyRef ref; int cx, cz; unsigned char area; };
+static const float SWIM_COST = 2.5f, NARROW_COST = 2.5f; // path cost per yard; the addon's MULT matches
+enum EdgeFlag : unsigned char { F_SWIM = 1, F_NARROW = 2 };
+static float costOf(unsigned char fl) { return (fl & F_SWIM) ? SWIM_COST : (fl & F_NARROW) ? NARROW_COST : 1.0f; }
+
+// poi: placed where a quest giver, quest object or town service stands (tools/pois.py), on every walkable layer
+struct Node { float p[3]; dtPolyRef ref; int cx, cz; unsigned char area; bool poi = false; };
 struct Edge { int a, b; unsigned char flags; };
 
 static dtNavMesh* loadNavMesh(const std::string& navDir) {
@@ -291,7 +331,8 @@ struct Builder {
 
 	Builder() {
 		filter.setIncludeFlags(0xffff);
-		filter.setAreaCost(A_SWIM, 1.7f);
+		filter.setAreaCost(A_SWIM, SWIM_COST);
+		filter.setAreaCost(A_NARROW, NARROW_COST);
 	}
 
 	// Walkable islands: every polygon gets the id of its linked component; compArea is its 2D area.
@@ -393,8 +434,15 @@ struct Builder {
 		return poly->getArea();
 	}
 
+	static unsigned char areaFlag(unsigned char area) { return area == A_SWIM ? F_SWIM : area == A_NARROW ? F_NARROW : 0; }
+	unsigned char pathFlags(const dtPolyRef* path, int n) {
+		unsigned char fl = 0;
+		for (int i = 0; i < n; i++) fl |= areaFlag(polyArea(path[i]));
+		return fl;
+	}
+
 	// Shortest navmesh walk from a to b: length, largest sideways deviation from the straight line,
-	// swim flag and the corner points. False when b is unreachable within the search budget.
+	// swim/narrow flags and the corner points. False when b is unreachable within the search budget.
 	bool walk(dtNavMeshQuery* q, dtPolyRef aRef, const float* a, dtPolyRef bRef, const float* b,
 		float& len, float& dev, unsigned char& flags, std::vector<std::array<float, 3>>* corners = nullptr,
 		std::vector<dtPolyRef>* cornerRefs = nullptr) {
@@ -413,12 +461,11 @@ struct Builder {
 			dev = std::max(dev, sqrtf(ex * ex + ez * ez));
 			if (corners) { corners->push_back({ sp[k * 3], sp[k * 3 + 1], sp[k * 3 + 2] }); cornerRefs->push_back(spr[k]); }
 		}
-		flags = 0;
-		for (int i = 0; i < np; i++) if (polyArea(path[i]) == A_SWIM) flags = 1;
+		flags = pathFlags(path, np);
 		return true;
 	}
 
-	// Straight walk check from a to b on the navmesh. flags: 1 if any swim polygon is crossed.
+	// Straight walk check from a to b on the navmesh. flags: F_SWIM / F_NARROW for the polygons crossed.
 	// Points on polygon edges make Detour's raycast stop at t=0, so start a hair toward b, on its polygon.
 	bool straight(dtNavMeshQuery* q, dtPolyRef aRef, const float* a, const float* b, dtPolyRef bRef, unsigned char& flags) {
 		float d = dtVdist2D(a, b);
@@ -438,8 +485,7 @@ struct Builder {
 			float cp[3]; bool over;
 			if (dtStatusFailed(q->closestPointOnPoly(last, b, cp, &over)) || dtVdist(cp, b) > 1.5f) return false;
 		}
-		flags = 0;
-		for (int i = 0; i < hit.pathCount; i++) if (polyArea(path[i]) == A_SWIM) flags = 1;
+		flags = pathFlags(path, hit.pathCount);
 		return true;
 	}
 
@@ -447,10 +493,10 @@ struct Builder {
 	// since the ground dots are drawn exactly along these lines.
 	bool nearlyStraight(dtNavMeshQuery* q, const Node& a, const Node& b, unsigned char& flags) {
 		if (straight(q, a.ref, a.p, b.p, b.ref, flags) || straight(q, b.ref, b.p, a.p, a.ref, flags)) return true;
-		float len, dev;
-		if (!walk(q, a.ref, a.p, b.ref, b.p, len, dev, flags)) return false;
-		float d = dtVdist(a.p, b.p);
-		return len <= d * 1.02f + 0.5f && dev <= 1.0f;
+		// both ways round: Detour's shortest path can differ by direction, and an edge is walked both ways
+		float len, dev, d = dtVdist(a.p, b.p);
+		if (walk(q, a.ref, a.p, b.ref, b.p, len, dev, flags) && len <= d * 1.02f + 0.5f && dev <= 1.0f) return true;
+		return walk(q, b.ref, b.p, a.ref, a.p, len, dev, flags) && len <= d * 1.02f + 0.5f && dev <= 1.0f;
 	}
 
 	// One node per walkable patch of every CELL x CELL square; points a short walk apart share a node.
@@ -536,9 +582,13 @@ struct Builder {
 			hit.t, hit.pathCount, tx - floorf(tx), tz - floorf(tz), hit.hitNormal[0], hit.hitNormal[2]);
 	}
 
+	// Flags a node's own ground gives every edge leaving it: a swimmer's edges swim.
+	static unsigned char nodeFlag(const Node& n) { return areaFlag(n.area); }
+
 	void connect() {
-		static const int OFF[16][2] = { {1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1},
-			{2,1},{2,-1},{-2,1},{-2,-1},{1,2},{1,-2},{-1,2},{-1,-2} };
+		// the last offset, the node's own cell, only for POI nodes (cell nodes in one cell were merged already)
+		static const int OFF[17][2] = { {1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1},
+			{2,1},{2,-1},{-2,1},{-2,-1},{1,2},{1,-2},{-1,2},{-1,-2},{0,0} };
 		size_t nCell = nodes.size();
 		std::atomic<size_t> next{ 0 };
 		std::vector<Edge> found;
@@ -552,17 +602,23 @@ struct Builder {
 				size_t i = next++;
 				if (i >= nCell) break;
 				const Node& a = nodes[i];
-				for (int o = 0; o < 16; o++) {
+				for (int o = 0; o < 17; o++) {
 					auto it = cells.find({ a.cx + OFF[o][0], a.cz + OFF[o][1] });
 					if (it == cells.end()) continue;
 					for (int j : it->second) {
 						if (j <= (int)i) continue; // each pair once
 						const Node& b = nodes[j];
+						if (o == 16 && !a.poi && !b.poi) continue;
 						if (fabsf(a.p[1] - b.p[1]) > 60 || compOf(a.ref) != compOf(b.ref)) continue;
 						unsigned char fl;
-						if (nearlyStraight(q, a, b, fl)) le.push_back({ (int)i, j, fl });
-						else {
-							if (o < 8) lm.push_back({ (int)i, j });
+						bool near = o < 8 || o == 16;
+						if (nearlyStraight(q, a, b, fl)) {
+							// a line through water or a narrow walkway that neither end is in: the navmesh path
+							// (which pays for those) may know a better way, over a bridge or round a ledge
+							if (fl & ~(nodeFlag(a) | nodeFlag(b))) { if (near) lm.push_back({ (int)i, j }); }
+							else le.push_back({ (int)i, j, fl });
+						} else {
+							if (near) lm.push_back({ (int)i, j });
 							if (debugLeft > 0 && --debugLeft >= 0) debugPair(q, a, b);
 						}
 					}
@@ -584,7 +640,8 @@ struct Builder {
 	// For neighbouring cells without a straight walk, follow the navmesh path and add its corners.
 	void repair(const std::vector<std::pair<int, int>>& pairs) {
 		std::atomic<size_t> next{ 0 };
-		struct Route { int a, b; float len; std::vector<std::array<float, 3>> pts; std::vector<dtPolyRef> refs; std::vector<unsigned char> fl; };
+		// fl: flags per segment; cost: length weighted by costOf, like the addon's search
+		struct Route { int a, b; float cost; std::vector<std::array<float, 3>> pts; std::vector<dtPolyRef> refs; std::vector<unsigned char> fl; };
 		std::vector<Route> routes;
 		auto worker = [&]() {
 			dtNavMeshQuery* q = dtAllocNavMeshQuery();
@@ -613,8 +670,17 @@ struct Builder {
 						r.refs[k] = cur.ref;
 					}
 				}
-				r.len = len;
-				r.fl.assign(r.pts.size(), fl);
+				size_t n = r.pts.size();
+				r.fl.assign(n - 1, fl);
+				r.cost = 0;
+				for (size_t k = 0; k + 1 < n; k++) {
+					Node u, v;
+					dtVcopy(u.p, r.pts[k].data()); u.ref = k == 0 ? a.ref : r.refs[k];
+					dtVcopy(v.p, r.pts[k + 1].data()); v.ref = k + 2 == n ? b.ref : r.refs[k + 1];
+					unsigned char f;
+					if (u.ref && v.ref && nearlyStraight(q, u, v, f)) r.fl[k] = f;
+					r.cost += dtVdist(u.p, v.p) * costOf(r.fl[k]);
+				}
 				lr.push_back(std::move(r));
 			}
 			std::lock_guard<std::mutex> l(m);
@@ -625,17 +691,21 @@ struct Builder {
 		for (int i = 0; i < threads; i++) pool.emplace_back(worker);
 		for (auto& t : pool) t.join();
 
-		// Shortest routes first; a route is only added when the graph has no path within 20% of it already
-		// (a greedy spanner), and its corners reuse any node within SNAP yards.
-		std::sort(routes.begin(), routes.end(), [](const Route& x, const Route& y) { return x.len < y.len; });
+		// Cheapest routes first; a route is only added when the graph has no path within 20% of its cost already
+		// (a greedy spanner), and its corners reuse any node within SNAP yards that still sees the route's
+		// corners on both sides (a corner snapped blindly turns a bridge into a line beside it).
+		std::sort(routes.begin(), routes.end(), [](const Route& x, const Route& y) { return x.cost < y.cost; });
 		const float SNAP = 6.0f;
 		std::vector<std::vector<std::pair<int, float>>> adj(nodes.size());
 		auto link = [&](int a, int b, unsigned char fl) {
 			edges.push_back({ a, b, fl });
-			float d = dtVdist(nodes[a].p, nodes[b].p);
+			float d = dtVdist(nodes[a].p, nodes[b].p) * costOf(fl);
 			adj[a].push_back({ b, d }); adj[b].push_back({ a, d });
 		};
-		for (auto& e : edges) { float d = dtVdist(nodes[e.a].p, nodes[e.b].p); adj[e.a].push_back({ e.b, d }); adj[e.b].push_back({ e.a, d }); }
+		for (auto& e : edges) {
+			float d = dtVdist(nodes[e.a].p, nodes[e.b].p) * costOf(e.flags);
+			adj[e.a].push_back({ e.b, d }); adj[e.b].push_back({ e.a, d });
+		}
 		std::vector<float> dist;
 		std::vector<int> touched;
 		auto within = [&](int s, int t, float limit) {
@@ -659,36 +729,146 @@ struct Builder {
 		std::map<std::tuple<int, int, int>, std::vector<int>> grid;
 		auto key = [&](const float* p) { return std::make_tuple((int)floorf(p[0] / SNAP), (int)floorf(p[1] / SNAP), (int)floorf(p[2] / SNAP)); };
 		for (size_t i = 0; i < nodes.size(); i++) grid[key(nodes[i].p)].push_back((int)i);
-		auto nodeFor = [&](const std::array<float, 3>& p, dtPolyRef ref) {
+		auto snapTo = [&](const std::array<float, 3>& p, std::vector<int>& out) {
+			out.clear();
 			auto k = key(p.data());
 			for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
 				auto it = grid.find({ std::get<0>(k) + dx, std::get<1>(k) + dy, std::get<2>(k) + dz });
 				if (it == grid.end()) continue;
-				for (int id : it->second) if (dtVdistSqr(nodes[id].p, p.data()) < SNAP * SNAP) return id;
+				for (int id : it->second) if (dtVdistSqr(nodes[id].p, p.data()) < SNAP * SNAP) out.push_back(id);
 			}
+			std::sort(out.begin(), out.end(), [&](int x, int y) { return dtVdistSqr(nodes[x].p, p.data()) < dtVdistSqr(nodes[y].p, p.data()); });
+		};
+		auto newNode = [&](const std::array<float, 3>& p, dtPolyRef ref) {
 			Node nd; nd.p[0] = p[0]; nd.p[1] = p[1]; nd.p[2] = p[2]; nd.ref = ref;
 			nd.cx = (int)floorf(p[0] / CELL); nd.cz = (int)floorf(p[2] / CELL); nd.area = polyArea(ref);
 			int id = (int)nodes.size();
 			nodes.push_back(nd);
 			adj.emplace_back();
-			grid[k].push_back(id);
+			grid[key(p.data())].push_back(id);
 			return id;
 		};
-		size_t before = nodes.size(), used = 0;
+		dtNavMeshQuery* q = dtAllocNavMeshQuery();
+		q->init(nav, 8192);
+		size_t before = nodes.size(), used = 0, unsnapped = 0, unchecked = 0;
+		std::vector<int> near;
 		for (auto& r : routes) {
-			if (within(r.a, r.b, r.len * 1.2f + 8.0f)) continue;
+			if (within(r.a, r.b, r.cost * 1.2f + 8.0f)) continue;
 			used++;
-			int prev = r.a;
-			for (size_t k = 1; k + 1 < r.pts.size(); k++) {
-				int id = nodeFor(r.pts[k], r.refs[k] ? r.refs[k] : nodes[prev].ref);
-				if (id != prev) link(prev, id, r.fl[k - 1]);
-				prev = id;
+			size_t n = r.pts.size();
+			std::vector<int> ids(n);
+			ids[0] = r.a; ids[n - 1] = r.b;
+			for (size_t k = 1; k + 1 < n; k++) {
+				dtPolyRef ref = r.refs[k] ? r.refs[k] : nodes[ids[k - 1]].ref;
+				Node exactNext;
+				dtVcopy(exactNext.p, r.pts[k + 1].data());
+				exactNext.ref = k + 2 == n ? nodes[r.b].ref : (r.refs[k + 1] ? r.refs[k + 1] : ref);
+				int id = -1;
+				snapTo(r.pts[k], near);
+				for (int c : near) {
+					unsigned char f;
+					bool fromPrev = c == ids[k - 1] || nearlyStraight(q, nodes[ids[k - 1]], nodes[c], f);
+					if (fromPrev && nearlyStraight(q, nodes[c], exactNext, f)) { id = c; break; }
+				}
+				if (id < 0) { id = newNode(r.pts[k], ref); if (!near.empty()) unsnapped++; }
+				ids[k] = id;
 			}
-			if (prev != r.b) link(prev, r.b, r.fl.back());
+			for (size_t k = 1; k < n; k++) {
+				if (ids[k] == ids[k - 1]) continue;
+				unsigned char f;
+				if (!nearlyStraight(q, nodes[ids[k - 1]], nodes[ids[k]], f)) { f = r.fl[k - 1]; unchecked++; }
+				link(ids[k - 1], ids[k], f);
+			}
 		}
-		printf("routes added: %zu of %zu\n", used, routes.size());
+		dtFreeNavMeshQuery(q);
+		printf("routes added: %zu of %zu; corners kept off a nearby node that could not see the route: %zu; "
+			"segments without a straight walk: %zu\n", used, routes.size(), unsnapped, unchecked);
 		printf("routed pairs: %zu, corner nodes added: %zu\n", routes.size(), nodes.size() - before);
 		dead.assign(nodes.size(), 0);
+	}
+
+	// Nodes where quest givers, quest objects and town services stand (tools/pois.py: "worldX worldY" per line),
+	// one on every walkable layer within POI_REACH yards that is not water. Without them a route ends at the
+	// nearest node in plan view, which can be the beach under the pier the NPC stands on.
+	void addPois(const std::string& path) {
+		static const float POI_REACH = 3.0f, POI_LAYER = 3.0f, POI_REUSE = 2.0f;
+		FILE* f = fopen(path.c_str(), "r");
+		if (!f) { fprintf(stderr, "cannot read %s\n", path.c_str()); return; }
+		std::vector<std::array<float, 2>> pts;
+		float X, Y;
+		while (fscanf(f, "%f %f", &X, &Y) == 2) pts.push_back({ X, Y });
+		fclose(f);
+		dtNavMeshQuery* q = dtAllocNavMeshQuery();
+		q->init(nav, 4096);
+		size_t added = 0, reused = 0, none = 0;
+		for (auto& w : pts) {
+			float c[3] = { w[1], 0, w[0] }, ext[3] = { POI_REACH, 5000, POI_REACH };
+			dtPolyRef refs[256]; int n = 0;
+			q->queryPolygons(c, ext, &filter, refs, &n, 256);
+			struct Spot { float d; float p[3]; dtPolyRef ref; };
+			std::vector<Spot> spots;
+			for (int i = 0; i < n; i++) {
+				if (polyArea(refs[i]) == A_SWIM) continue;
+				int ci = compOf(refs[i]);
+				if (ci < 0 || compArea[ci] < MIN_ISLAND) continue;
+				Spot s; bool over;
+				if (dtStatusFailed(q->closestPointOnPoly(refs[i], c, s.p, &over))) continue;
+				s.d = dtVdist2D(s.p, c); s.ref = refs[i];
+				if (s.d <= POI_REACH) spots.push_back(s);
+			}
+			std::sort(spots.begin(), spots.end(), [](const Spot& a, const Spot& b) { return a.p[1] < b.p[1]; });
+			for (size_t i = 0; i < spots.size();) { // per layer, the spot nearest the POI
+				size_t best = i, j = i;
+				for (; j < spots.size() && spots[j].p[1] - spots[i].p[1] <= POI_LAYER; j++) if (spots[j].d < spots[best].d) best = j;
+				Spot s = spots[best];
+				interior(q, s.ref, s.p);
+				int cx = (int)floorf(s.p[0] / CELL), cz = (int)floorf(s.p[2] / CELL), found = -1;
+				for (int dx = -1; dx <= 1 && found < 0; dx++) for (int dz = -1; dz <= 1 && found < 0; dz++) {
+					auto it = cells.find({ cx + dx, cz + dz });
+					if (it == cells.end()) continue;
+					for (int id : it->second) if (dtVdist(nodes[id].p, s.p) < POI_REUSE) { found = id; break; }
+				}
+				if (found >= 0) { nodes[found].poi = true; reused++; }
+				else {
+					Node nd;
+					dtVcopy(nd.p, s.p); nd.ref = s.ref; nd.cx = cx; nd.cz = cz; nd.area = polyArea(s.ref); nd.poi = true;
+					cells[{ cx, cz }].push_back((int)nodes.size());
+					nodes.push_back(nd);
+					added++;
+				}
+				i = j;
+			}
+			if (spots.empty()) none++;
+		}
+		dtFreeNavMeshQuery(q);
+		printf("points of interest: %zu, nodes added %zu, existing nodes used %zu, no walkable ground near %zu\n",
+			pts.size(), added, reused, none);
+	}
+
+	// Every edge must still be a (nearly) straight walk; reports the ones that are not.
+	void verify() {
+		std::atomic<size_t> next{ 0 }, bad{ 0 };
+		auto worker = [&]() {
+			dtNavMeshQuery* q = dtAllocNavMeshQuery();
+			q->init(nav, 4096);
+			for (;;) {
+				size_t i = next++;
+				if (i >= edges.size()) break;
+				const Edge& e = edges[i];
+				unsigned char fl;
+				if (dead[e.a] || dead[e.b] || nearlyStraight(q, nodes[e.a], nodes[e.b], fl)) continue;
+				if (bad++ < 10) {
+					std::lock_guard<std::mutex> l(m);
+					const float* a = nodes[e.a].p; const float* b = nodes[e.b].p;
+					printf("  edge without a straight walk: world (%.1f %.1f %.1f) - (%.1f %.1f %.1f)\n", a[2], a[0], a[1], b[2], b[0], b[1]);
+				}
+			}
+			dtFreeNavMeshQuery(q);
+		};
+		std::vector<std::thread> pool;
+		for (int i = 0; i < threads; i++) pool.emplace_back(worker);
+		for (auto& t : pool) t.join();
+		printf("edges without a straight walk: %zu of %zu\n", bad.load(), edges.size());
 	}
 
 	// Route corners with two neighbours that can see each other are dropped, joining the neighbours directly.
@@ -703,9 +883,9 @@ struct Builder {
 			for (size_t v = 0; v < nodes.size(); v++) {
 				if (adj[v].size() != 2) continue;
 				int a = adj[v].begin()->first, b = std::next(adj[v].begin())->first;
-				unsigned char fl;
-				if (!nearlyStraight(q, nodes[a], nodes[b], fl)) continue;
-				fl |= adj[v][a] | adj[v][b];
+				unsigned char fl, own = adj[v][a] | adj[v][b];
+				if (!nearlyStraight(q, nodes[a], nodes[b], fl) || (fl & ~own)) continue; // no shortcut through water or a ledge
+				fl |= own;
 				adj[a].erase((int)v); adj[b].erase((int)v); adj[v].clear();
 				adj[a][b] = fl; adj[b][a] = fl;
 				dead[v] = 1;
@@ -838,7 +1018,8 @@ struct Builder {
 			// back to world coords: X = rc z, Y = rc x, Z = rc y
 			float w[3] = { nd.p[2], nd.p[0], nd.p[1] };
 			fwrite(w, 4, 3, f);
-			fwrite(&nd.area, 1, 1, f);
+			unsigned char area = nd.area | (nd.poi ? 0x80 : 0); // high bit: a point of interest
+			fwrite(&area, 1, 1, f);
 		}
 		for (auto& e : uniq) { int32_t ab[2] = { e.a, e.b }; fwrite(ab, 4, 2, f); fwrite(&e.flags, 1, 1, f); }
 		fclose(f);
@@ -880,6 +1061,29 @@ int main(int argc, char** argv) {
 		}
 		return 0;
 	}
+	if (cmd == "line") { // navbuild line <nav_dir> <X1> <Y1> <Z1> <X2> <Y2> <Z2>: the edge checks between two world points
+		if (argc < 9) return 1;
+		Builder b;
+		b.nav = loadNavMesh(argv[2]);
+		b.threads = 1;
+		dtNavMeshQuery* q = dtAllocNavMeshQuery();
+		q->init(b.nav, 4096);
+		Node n[2];
+		for (int k = 0; k < 2; k++) {
+			float w[3] = { (float)atof(argv[3 + k * 3]), (float)atof(argv[4 + k * 3]), (float)atof(argv[5 + k * 3]) };
+			float c[3] = { w[1], w[2], w[0] }, ext[3] = { 2, 4, 2 };
+			q->findNearestPoly(c, ext, &b.filter, &n[k].ref, n[k].p);
+			printf("point %d: poly %llx area %d at (%.2f %.2f %.2f)\n", k, (unsigned long long)n[k].ref, b.polyArea(n[k].ref), n[k].p[2], n[k].p[0], n[k].p[1]);
+		}
+		unsigned char fl = 0; float len = 0, dev = 0;
+		bool s1 = b.straight(q, n[0].ref, n[0].p, n[1].p, n[1].ref, fl);
+		printf("straight a->b %d flags %d\n", s1, fl);
+		bool s2 = b.straight(q, n[1].ref, n[1].p, n[0].p, n[0].ref, fl);
+		printf("straight b->a %d flags %d\n", s2, fl);
+		bool w = b.walk(q, n[0].ref, n[0].p, n[1].ref, n[1].p, len, dev, fl);
+		printf("walk %d len %.1f direct %.1f dev %.1f flags %d\n", w, len, dtVdist(n[0].p, n[1].p), dev, fl);
+		return 0;
+	}
 	if (cmd == "heights") {
 		Builder b;
 		b.nav = loadNavMesh(argv[2]);
@@ -896,8 +1100,10 @@ int main(int argc, char** argv) {
 		b.threads = threads;
 		b.labelComponents();
 		b.sampleCells();
+		if (argc > 5) b.addPois(argv[5]);
 		b.connect();
 		b.simplify();
+		b.verify();
 		b.write(argv[3]);
 		return 0;
 	}
