@@ -33,7 +33,8 @@ SHIP_SPEED, SHIP_ACCEL = 30.0, 1.0  # boats and zeppelins: yards per second, and
 MIN_COMPONENT = 25  # pack.py drops smaller pieces of the graph
 
 # Ship routes that run, by TaxiPath id: kind, faction, and the stops' names in path order. The client also
-# holds routes from later content (Stormwind harbour, a stop at Southshore, a map 2991): those are left out.
+# holds routes that may not run on Forever (a stop at Southshore, routes to a map 2991): those are left out.
+# Stormwind's harbour is in this client's map (its docks and lighthouse are placed), so its boat counts.
 SHIPS = {
     241: ("boat", "", ["Ratchet", "Booty Bay"]),
     285: ("zeppelin", "H", ["Grom'gol", "Orgrimmar"]),
@@ -44,6 +45,7 @@ SHIPS = {
     302: ("zeppelin", "H", ["Orgrimmar", "Undercity"]),
     303: ("boat", "A", ["Feathermoon Stronghold", "the Feralas coast"]),
     11391: ("boat", "", ["Tanaris", ""]),  # to the new zone east of the Burning Steppes; named in game
+    11616: ("boat", "A", ["Auberdine", "Stormwind Harbor"]),
 }
 
 # Lifts: (continent, lower landing, upper landing) in world (X, Y, Z), found as the only places where Thunder
