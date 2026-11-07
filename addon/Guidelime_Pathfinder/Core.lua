@@ -134,8 +134,9 @@ function ns.QuestieTarget(px, py, instance)
 	return fallback.x, fallback.y, fallback.instance
 end
 
--- The current Guidelime arrow target, in HereBeDragons world coordinates, or the corpse while a ghost.
--- ns.targetSource says which: "guidelime", "questie" or "corpse".
+-- The current Guidelime arrow target, in HereBeDragons world coordinates, or the corpse while a ghost, or the
+-- town service from /gpath go (with its height). ns.targetSource says which: "guidelime", "questie", "corpse"
+-- or "service".
 function ns.GetTarget()
 	ns.targetSource = nil
 	if UnitIsGhost("player") then
@@ -146,6 +147,11 @@ function ns.GetTarget()
 			if x then ns.targetSource = "corpse"; return x, y, instance end
 		end
 		return
+	end
+	local sv = ns.service
+	if sv then
+		ns.targetSource = "service"
+		return sv.x, sv.y, sv.instance, sv.z
 	end
 	local arrow = _G.GuidelimeArrow
 	local el = arrow and arrow.element
@@ -400,11 +406,14 @@ local function hint(text)
 	if UIErrorsFrame then UIErrorsFrame:AddMessage(text, 0.62, 1, 0.25) end
 end
 
+local function tripOpts()
+	return { speed = ns.Speed(), faction = FACTION[UnitFactionGroup("player")], known = (ns.KnownTaxi()) }
+end
+
 local said
 function ns.PlanTrip(px, py)
 	local pl, g = ns.player, ns.goal
-	local trip, unreachable = ns.Graph.PlanTrip({ instance = pl.instance, x = px, y = py, z = pl.z }, { instance = g.instance, x = g.x, y = g.y },
-		{ speed = ns.Speed(), faction = FACTION[UnitFactionGroup("player")], known = (ns.KnownTaxi()) })
+	local trip, unreachable = ns.Graph.PlanTrip({ instance = pl.instance, x = px, y = py, z = pl.z }, { instance = g.instance, x = g.x, y = g.y, z = g.z }, tripOpts())
 	ns.trip, ns.riding = trip, nil
 	local nextLeg
 	for _, l in ipairs(trip and trip.legs or {}) do
@@ -422,7 +431,7 @@ function ns.PlanTrip(px, py)
 	else
 		said = nil
 		-- no walkable way there (no lift, boat or portal either): a straight line, without a hopeless search
-		ns.dest = g.instance == pl.instance and { instance = g.instance, x = g.x, y = g.y, straight = unreachable } or nil
+		ns.dest = g.instance == pl.instance and { instance = g.instance, x = g.x, y = g.y, z = g.z, straight = unreachable } or nil
 	end
 end
 
@@ -480,6 +489,107 @@ local function lightTaxi()
 	end
 end
 
+-- Town services (/gpath go bank): Questie knows where every banker, auctioneer, innkeeper, mailbox, trainer
+-- and vendor stands. Head for the one quickest to reach (walking, flights and rides) instead of Guidelime's
+-- step, until there.
+local SERVICE_ARRIVED = 10 -- yards from it that count as there
+local SERVICE_WORDS = { -- short words for Questie's names; any start of a name works too ("bank", "inn")
+	ah = "Auctioneer", auctionhouse = "Auctioneer", fm = "Flight Master", trainer = "Class Trainer",
+	bg = "Battlemaster", graveyard = "Spirit Healer",
+}
+
+local function squash(s) return (s:lower():gsub("[%s_'%-]", "")) end
+
+-- name -> NPC (or object) ids, as Questie's townsfolk menu has them
+local function serviceLists()
+	local T = QuestieLoader:ImportModule("Townsfolk")
+	local char = Questie and Questie.db and Questie.db.char
+	local lists = {}
+	for _, src in ipairs({ T and T.townsfolk, char and char.townsfolk, char and char.vendorList }) do
+		for name, ids in pairs(src or {}) do
+			if type(ids) == "table" and #ids > 0 and not lists[name] then lists[name] = ids end
+		end
+	end
+	local P = QuestieLoader:ImportModule("QuestieProfessions")
+	for key, prof in pairs(P and P.professionKeys or {}) do
+		local ids = T and T.professionTrainers and T.professionTrainers[prof]
+		if ids and #ids > 0 then lists[key:sub(1, 1) .. key:sub(2):lower():gsub("_", " ") .. " Trainer"] = ids end
+	end
+	return lists
+end
+
+-- every place one of them stands that the player's faction may use, in world coordinates
+local function serviceSpots(name, ids)
+	local DB, Z = QuestieLoader:ImportModule("QuestieDB"), QuestieLoader:ImportModule("ZoneDB")
+	local C = QuestieLoader:ImportModule("QuestieCorrections")
+	local blacklist = C and C.questNPCBlacklist or {}
+	local object = name == "Mailbox" or name == "Meeting Stones"
+	local query = object and DB.QueryObjectSingle or DB.QueryNPCSingle
+	local mine = FACTION[UnitFactionGroup("player")]
+	local spots = {}
+	for _, id in ipairs(ids) do
+		local friendly = not object and query(id, "friendlyToFaction")
+		if not blacklist[id] and (not friendly or friendly == "AH" or friendly == mine) then
+			for area, list in pairs(query(id, "spawns") or {}) do
+				local uiMap = not Z.IsDungeonZone(area) and Z:GetUiMapIdByAreaId(area)
+				for _, c in ipairs(uiMap and list or {}) do
+					local x, y, inst
+					if c[1] >= 0 then x, y, inst = HBD:GetWorldCoordinatesFromZone(c[1] / 100, c[2] / 100, uiMap) end
+					if x then
+						spots[#spots + 1] = { instance = inst, x = x, y = y, z = ns.Graph.LikelyZ(inst, x, y), name = query(id, "name"), uiMap = uiMap }
+					end
+				end
+			end
+		end
+	end
+	return spots
+end
+
+-- word: what the player typed after /gpath go; nil or "" stops
+function ns.GoService(word)
+	if not word or word == "" then
+		if ns.service then ns.Print("stopped heading for the " .. ns.service.what .. "; back to Guidelime's step") end
+		ns.service = nil
+		return
+	end
+	if not QuestieLoader then return ns.Print("the town services come from Questie, which is not loaded") end
+	local lists = serviceLists()
+	if not next(lists) then return ns.Print("Questie has not finished loading its town services; try again in a moment") end
+	local w = squash(SERVICE_WORDS[squash(word)] or word)
+	local name, matches = nil, {}
+	for n in pairs(lists) do
+		if squash(n) == w then name = n end
+		if squash(n):sub(1, #w) == w then matches[#matches + 1] = n:lower() end
+	end
+	if not name and #matches == 1 then
+		for n in pairs(lists) do if n:lower() == matches[1] then name = n end end
+	end
+	if not name then
+		local unknown = #matches == 0
+		if unknown then for n in pairs(lists) do matches[#matches + 1] = n:lower() end end
+		table.sort(matches)
+		return ns.Print(format("%s: %s", unknown and ("no " .. word .. " in Questie's town services; there are") or (word .. " could be"), table.concat(matches, ", ")))
+	end
+	local px, py, instance = HBD:GetPlayerWorldPosition()
+	if not px then return ns.Print("the game gives no position here") end
+	local spots = serviceSpots(name, lists[name])
+	local trip = ns.Graph.PlanTrip({ instance = instance, x = px, y = py, z = ns.player.z }, spots, tripOpts())
+	local pick = trip and spots[trip.goal]
+	if not pick then -- off the walkable graph: the nearest on this continent in a straight line
+		local best
+		for _, s in ipairs(spots) do
+			local d = s.instance == instance and dist(px, py, s.x, s.y)
+			if d and (not best or d < best) then pick, best = s, d end
+		end
+	end
+	if not pick then return ns.Print(format("no %s you can get to from here", name:lower())) end
+	pick.what = name:lower()
+	ns.service = pick
+	local zone = C_Map.GetMapInfo(pick.uiMap)
+	ns.Print(format("nearest %s: %s%s%s", pick.what, pick.name or "?", zone and zone.name and (" in " .. zone.name) or "",
+		not trip and "" or trip.cost < 60 and ", under a minute away" or format(", about %d min away", floor(trip.cost / 60 + 0.5))))
+end
+
 -- The game gives addons no player height, so follow the ground under the player on the height map from tick
 -- to tick: the layer that continues from the last height (a bridge, not the river below it), predicted along
 -- the route's straight line when on a walkable route (see SampleGround), jumping to the nearest layer only
@@ -524,7 +634,12 @@ local function tick()
 	if ns.flying then ns.flying, goalKey = nil, nil end -- landed: plan the rest from here
 	local px, py, instance = HBD:GetPlayerWorldPosition()
 	if px then ns.TrackGround(px, py, instance) end
-	local tx, ty, tinstance = ns.GetTarget()
+	local sv = ns.service
+	if sv and px and instance == sv.instance and dist(px, py, sv.x, sv.y) < SERVICE_ARRIVED then
+		ns.service = nil
+		hint(format("here: %s (%s)", sv.name or "?", sv.what))
+	end
+	local tx, ty, tinstance, tz = ns.GetTarget()
 	if not px or not tx then return ns.Stop() end
 	ns.player.x, ns.player.y, ns.player.instance = px, py, instance
 	ns.KnownTaxi()
@@ -534,7 +649,7 @@ local function tick()
 	local key = tinstance .. ":" .. floor(tx) .. ":" .. floor(ty)
 	if key ~= goalKey then
 		goalKey, planInstance = key, instance
-		ns.goal.x, ns.goal.y, ns.goal.instance = tx, ty, tinstance
+		ns.goal.x, ns.goal.y, ns.goal.instance, ns.goal.z = tx, ty, tinstance, tz
 		ns.Marker.ResetOverride()
 		ns.Plan(px, py)
 	end
@@ -626,6 +741,9 @@ local function status()
 			n and n > 0 and format("%d path nodes, %d links (built %s)", n, e, built or "?") or "no path data yet (straight line)"))
 	end
 	local p = ns.path
+	if ns.targetSource == "service" then
+		ns.Print(format("  heading for the nearest %s: %s (/gpath go stops)", ns.service.what, ns.service.name or "?"))
+	end
 	if ns.targetSource == "questie" then
 		ns.Print(format("  target from Questie (Guidelime's step has no map position): %s for %s",
 			({ available = "quest giver", complete = "turn-in" })[fallback.kind] or "objective", fallback.quest or "?")
@@ -678,9 +796,12 @@ SlashCmdList.GUIDELIMEPATHFINDER = function(msg)
 		status()
 	elseif cmd == "probe" then
 		ns.Dots.Probe()
+	elseif cmd == "go" then
+		ns.GoService(arg)
 	else
 		ns.Print("/gpath  - turn on/off")
 		ns.Print("/gpath marker | dots | minimap | worldmap | debug  - toggle a part")
+		ns.Print("/gpath go bank | ah | inn | mail | repair | flight | trainer | food | mining ...  - head for the nearest one; /gpath go stops")
 		ns.Print("/gpath status | replan | probe (measure the camera for the ground dots)")
 		ns.Print("/gpath spacing <yd> | range <yd> | size <yd> | height <yd> | fov <deg, 0 = auto>  - ground dot tuning")
 	end

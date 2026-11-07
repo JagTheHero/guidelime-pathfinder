@@ -389,6 +389,73 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 		check(ns.trip and not ns.trip.next and ns.path and ns.path.graph and ns.dest.instance == 0, "off the zeppelin: on to the goal")
 	end
 	M.faction, M.taxiNodes, M.taxiSlots = nil, nil, nil
+
+	-- town services: /gpath go bank heads for the quickest banker Questie knows (of the player's faction)
+	-- instead of Guidelime's step, until there
+	M.zones = {
+		[1432] = { left = -1993.750, top = -4487.500, w = 2758.333, h = 1839.583, instance = 0, name = "Loch Modan" },
+		[1453] = { left = 1722.920, top = -7995.830, w = 1737.504, h = 1158.340, instance = 0, name = "Stormwind City" },
+		[1455] = { left = -713.591, top = -4569.241, w = 790.625, h = 527.604, instance = 0, name = "Ironforge" },
+	}
+	local npcs = { -- Questie's name, friendlyToFaction and spawns ([areaId] = { { x, y } } in zone percent)
+		[2455] = { "Olivia Burnside", "A", { [1519] = { { 64.3, 80.8 } } } },
+		[2460] = { "Barnum Stonemantle", "A", { [1537] = { { 35.0, 58.4 } } } },
+		[9001] = { "Horde Teller", "H", { [38] = { { 36.0, 48.0 } } } }, -- made up: a Horde banker in Thelsamar
+		[8671] = { "Auctioneer Buckler", "A", { [1537] = { { 23.8, 71.8 } } } },
+		[6734] = { "Innkeeper Hearthstove", "A", { [38] = { { 35.5, 48.4 } } } },
+	}
+	local function npc(id, field)
+		local n = npcs[id]
+		return n and ({ name = n[1], friendlyToFaction = n[2], spawns = n[3] })[field]
+	end
+	local modules = {
+		QuestieDB = { QueryNPCSingle = npc, QueryObjectSingle = npc },
+		ZoneDB = { GetUiMapIdByAreaId = function(_, a) return ({ [1519] = 1453, [1537] = 1455, [38] = 1432 })[a] end, IsDungeonZone = function() return false end },
+		Townsfolk = { townsfolk = { Banker = { 2455, 2460, 9001 }, Auctioneer = { 8671 }, Innkeeper = { 6734 } }, professionTrainers = {} },
+	}
+	QuestieLoader = { ImportModule = function(_, name) return modules[name] end }
+	Questie = { db = { char = { townsfolk = {}, vendorList = { Bags = { 6734 } } } } }
+	local function said() return M.prints[#M.prints] or "" end
+	local go = SlashCmdList.GUIDELIMEPATHFINDER
+
+	M.faction = "Alliance"
+	goTo(0, -2985, -5390) -- Thelsamar, Loch Modan
+	GuidelimeArrow.element = { wx = -2950, wy = -5420, instance = 0 }
+	settle()
+	go("go bank")
+	local sv = ns.service
+	check(sv and sv.name == "Barnum Stonemantle" and said():find("nearest banker: Barnum Stonemantle in Ironforge, about %d+ min away"),
+		"Thelsamar: the nearest bank for the Alliance is Ironforge's (" .. said() .. ")")
+	for _ = 1, 2000 do -- a long search: about 2000 yards to the bank
+		M.Step(0.05)
+		if ns.path and ns.path.graph and not ns.planning and near(routeEnd(), sv, 15) then break end
+	end
+	local p = ns.path
+	check(ns.targetSource == "service" and p and p.graph and near(routeEnd(), sv, 15) and math.abs(p.z[p.n] - sv.z) < 10,
+		string.format("the route walks to the banker, in Ironforge's halls (ends at height %.0f, the bank's floor %.0f)", p and p.z and p.z[p.n] or -1, sv and sv.z or -1))
+	go("go auction house")
+	check(ns.service and ns.service.name == "Auctioneer Buckler", "go auction house: Ironforge's auctioneer (" .. said() .. ")")
+	go("go ah")
+	check(ns.service and ns.service.name == "Auctioneer Buckler", "go ah: the same")
+	go("go ba")
+	check(said():find("ba could be: bags, banker", 1, true), "a word that starts several names asks which (" .. said() .. ")")
+	go("go banana")
+	check(said():find("no banana in Questie's town services; there are: auctioneer, bags, banker, innkeeper", 1, true), "an unknown word lists them (" .. said() .. ")")
+	go("go")
+	check(not ns.service and said():find("back to Guidelime's step", 1, true), "go alone stops")
+	M.faction = "Horde"
+	go("go bank")
+	check(ns.service and ns.service.name == "Horde Teller", "the Horde gets the Horde banker")
+	M.faction = "Alliance"
+	go("go inn")
+	sv = ns.service
+	check(sv and sv.name == "Innkeeper Hearthstove" and said():find("under a minute away", 1, true), "go inn: Thelsamar's inn (" .. said() .. ")")
+	settle()
+	goTo(0, sv.x + 4, sv.y + 3, M.pz)
+	for _ = 1, 3 do M.Step(0.1) end
+	check(not ns.service and lastHint() == "here: Innkeeper Hearthstove (innkeeper)" and ns.targetSource == "guidelime",
+		"at the inn it says so and goes back to Guidelime's step (" .. lastHint() .. ")")
+	M.faction, M.zones, QuestieLoader, Questie = nil, nil, nil, nil
 end
 
 -- slash commands do not error

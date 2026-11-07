@@ -481,10 +481,11 @@ local function farPiece(r)
 	return Graph.Piece(r[6], r[7], r[8], r[9])
 end
 
--- s, t: { instance, x, y, z } (t.z may be nil). opts: speed (yards per second on foot), faction ("A" or "H"),
--- known ([node id] = name, the flight masters the player can fly from and to). Returns
--- { cost = seconds, legs = { { kind, from = place, to = place, ... } } }; nil off the graph, nil, true when the
--- goal is on the graph but out of reach.
+-- s, t: { instance, x, y, z } (t.z may be nil), or t a list of them: the trip goes to whichever is quickest to
+-- reach. opts: speed (yards per second on foot), faction ("A" or "H"), known ([node id] = name, the flight
+-- masters the player can fly from and to). Returns { cost = seconds, legs = { { kind, from = place, to = place,
+-- ... } }, goal = index in the list }; nil off the graph, nil, true when the goal is on the graph but out of
+-- reach.
 -- A leg's kind is "walk", "flight" (to.node, to.name; hops) or the ride's kind (name, ride, wait).
 function Graph.PlanTrip(s, t, opts)
 	local places, out = {}, {}
@@ -499,8 +500,13 @@ function Graph.PlanTrip(s, t, opts)
 		e[#e + 1] = { b, cost, kind, ride }
 	end
 	local S = add(s.instance, s.x, s.y, s.z, Graph.Piece(s.instance, s.x, s.y, s.z), { kind = "start" })
-	local T = add(t.instance, t.x, t.y, t.z, Graph.Piece(t.instance, t.x, t.y, t.z), { kind = "goal" })
-	if not S.piece or not T.piece then return end
+	if not S.piece then return end
+	local goals = {}
+	for i, g in ipairs(t[1] and t or { t }) do
+		local piece = Graph.Piece(g.instance, g.x, g.y, g.z)
+		if piece then goals[add(g.instance, g.x, g.y, g.z, piece, { kind = "goal", goal = i })] = true end
+	end
+	if not next(goals) then return end
 	local known, air = opts.known or {}, {}
 	for inst, g in pairs(graphs) do
 		for id, pos in pairs(g.links and g.links.taxi or {}) do
@@ -536,13 +542,15 @@ function Graph.PlanTrip(s, t, opts)
 	-- Dijkstra over the places; walking edges are worked out as needed
 	local speed = opts.speed or 7
 	local cost, prev, how, done = { [S] = 0 }, {}, {}, {}
+	local T
 	while true do
 		local u, cu
 		for _, pl in ipairs(places) do
 			local c = cost[pl]
 			if c and not done[pl] and (not cu or c < cu) then u, cu = pl, c end
 		end
-		if not u or u == T then break end
+		if not u then break end
+		if goals[u] then T = u break end
 		done[u] = true
 		local function relax(v, c, kind, ride)
 			if not cost[v] or cu + c < cost[v] then cost[v], prev[v], how[v] = cu + c, u, { kind, ride } end
@@ -557,7 +565,7 @@ function Graph.PlanTrip(s, t, opts)
 		end
 		for _, e in ipairs(out[u]) do relax(e[1], e[2], e[3], e[4]) end
 	end
-	if not cost[T] then return nil, true end
+	if not T then return nil, true end
 
 	-- steps back from the goal, then legs: walks joined, a flight from boarding to landing
 	local steps = {}
@@ -584,7 +592,7 @@ function Graph.PlanTrip(s, t, opts)
 			legs[#legs + 1] = { kind = st.kind, from = st.from, to = st.to, name = r[2], ride = r[10], wait = r[11] }
 		end
 	end
-	return { cost = cost[T], legs = legs }
+	return { cost = cost[T], legs = legs, goal = T.goal }
 end
 
 function Graph.Stats(instance)
