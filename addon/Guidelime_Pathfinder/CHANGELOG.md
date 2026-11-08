@@ -7,7 +7,7 @@
   ledge you have to hit exactly or a swim.
 - Every line in the path data is also walked yard by yard along the ground. Lines that leave it (off the side of a
   bridge, over a ledge or a steep rock) are left out where there is another way, or replaced by the walk around:
-  about 60% fewer such lines than before, and about 70% fewer that cross a drop midway.
+  less than half as many such lines as before, and a third as many that cross a drop midway.
 - Routes end where the NPC stands: the path data has a point on every walkable level at each quest giver,
   quest object and town service (from Questie's data), so a route to someone on a pier or dock ends on it,
   not in the water beside it, and a route from the water leads back to land.
@@ -21,6 +21,10 @@
 - Long straight runs: the path data has long straight edges where the shortest walk really runs straight
   (across the Barrens, down a valley), and the search counts a little for every leg, so of two routes about
   as long you get the one with fewer, longer legs: line yourself up and run.
+- Shorter, straighter routes: more long straight lines in the path data, direct lines between nearby corners
+  that can see each other (no zigzag over a third corner), and no turning back at the start or just past the
+  goal. Against the shortest possible walk, the extra walking is about halved (about 1.5% on average). The
+  path data is about a fifth bigger.
 - Routes go around hostile mobs near your level like around a traffic jam: every yard inside a mob's aggro
   range costs more (more for orange and red mobs, elites and patrols, less for green ones, nothing for gray),
   so a route skirts a camp when the way around is not much longer and still goes through when it is. Mobs,

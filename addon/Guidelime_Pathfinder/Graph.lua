@@ -6,8 +6,9 @@ local ADDON, ns = ...
 -- is just a list of corners. Data is packed into base-64 strings and read in place.
 --
 --   nodes: n records of 14 chars: x(3) y(3) z(3) flags(1: 1 indoor, 2 swim, 4 where an NPC or object stands) firstEdge(4)
---   edges: e records of 4 chars:  neighbour(3) flags(1: 1 swims, 2 crosses a narrow walkway)
---   cells: c records of 10 chars: cellKey(4) firstNode(3) count(3)   (nodes are sorted by cell)
+--   edges: e records of 4 chars:  neighbour(3: its low 18 bits) flags(1: 1 swims, 2 crosses a narrow walkway;
+--          above those 2 bits, the neighbour's bits above 18)
+--   cells: c records of 10 chars: cellKey(4) firstNode(4) count(2)   (nodes are sorted by cell)
 -- Coordinates are HereBeDragons world coordinates (x west-positive, y north-positive), stored as
 -- (v + 17100) * 4; z as (z + 4000) * 4.
 
@@ -32,6 +33,7 @@ local HEURISTIC_WEIGHT = 1.15
 -- yards every leg costs on top of its length (navbuild's LEG_COST): of two routes about as long, the one with
 -- fewer, longer straight legs, which is less to steer
 local LEG_COST = 10
+local BACK_COST = 4 -- per yard a route walks back over its first or last leg (behind the start, past the goal)
 local LAYER_GAP = 8 -- yards of height between a node and the player before the node counts as another layer
 local FRAME_BUDGET_MS = 4
 
@@ -86,7 +88,9 @@ end
 
 local function edgeAt(g, j)
 	local p = j * EDGE_W + 1
-	return v3(g.edges, p) + 1, DEC[byte(g.edges, p + 3)]
+	local c = DEC[byte(g.edges, p + 3)] -- 2 flag bits, then the neighbour's bits above its 18 in 3 chars
+	local fl = c % 4
+	return v3(g.edges, p) + 1 + (c - fl) * 65536, fl
 end
 
 local function edgeFlag(g, a, b)
@@ -104,7 +108,7 @@ local function cellNodes(g, cx, cy)
 		local mid = floor((lo + hi) / 2)
 		local p = mid * CELL_W + 1
 		local k = v4(s, p)
-		if k == key then return v3(s, p + 4) + 1, v3(s, p + 7) end
+		if k == key then return v4(s, p + 4) + 1, v2(s, p + 8) end
 		if k < key then lo = mid + 1 else hi = mid - 1 end
 	end
 end
@@ -347,6 +351,15 @@ function Graph.PathJam(instance, p)
 	return sum
 end
 
+-- Yards of a -> b that b -> c walks back over, times BACK_COST: a U-turn at the first or the last corner.
+local function back(ax, ay, bx, by, cx, cy)
+	local ux, uy, vx, vy = bx - ax, by - ay, cx - bx, cy - by
+	local lv = sqrt(vx * vx + vy * vy)
+	if lv < 0.5 then return 0 end
+	local d = -(ux * vx + uy * vy) / lv
+	return d > 0 and min(d, lv) * BACK_COST or 0
+end
+
 local function search(g, sx, sy, tx, ty, indoors, sz, tz)
 	decodeNodes(g)
 	local gx, gy, gz = g.x, g.y, g.z
@@ -377,14 +390,20 @@ local function search(g, sx, sy, tx, ty, indoors, sz, tz)
 		if not closed[u] then
 			closed[u] = true
 			local gu = gs[u]
-			if goalCost[u] and gu + goalCost[u] < best then best, bestId = gu + goalCost[u], u end
-			local first, last = edgeRange(g, u)
 			local ux, uy, uz = gx[u], gy[u], gz[u]
+			local from = came[u]
+			local fx, fy = from and gx[from] or sx, from and gy[from] or sy
+			if goalCost[u] then
+				local c = gu + goalCost[u] + back(fx, fy, ux, uy, tx, ty)
+				if c < best then best, bestId = c, u end
+			end
+			local first, last = edgeRange(g, u)
 			for j = first, last - 1 do
 				local v, fl = edgeAt(g, j)
 				if not closed[v] then
 					local dx, dy, dz = gx[v] - ux, gy[v] - uy, gz[v] - uz
 					local c = gu + sqrt(dx * dx + dy * dy + dz * dz) * (MULT[fl % 8] or 1) + LEG_COST + edgeJam(g, j, u, v)
+					if not from then c = c + back(sx, sy, ux, uy, gx[v], gy[v]) end
 					local old = gs[v]
 					if not old or c < old then
 						gs[v], came[v] = c, u

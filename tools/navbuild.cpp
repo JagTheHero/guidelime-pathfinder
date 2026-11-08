@@ -649,7 +649,7 @@ struct Builder {
 	// apart show where real routes run straight; one is added (its legs as edges, its corners as nodes) when
 	// the graph has nothing within LONG_SPAN of it, counting LEG_COST yards per leg as the add-on's search does.
 	static constexpr float LONG_MIN = 150, LONG_MAX = 600, LONG_SPAN = 1.03f, LEG_COST = 10;
-	static const int LONG_PAIRS = 6; // per cell node, in as many directions
+	static const int LONG_PAIRS = 16; // per cell node, in as many directions
 	void longRuns() {
 		std::mt19937 rng(1);
 		std::uniform_real_distribution<float> u01(0, 1);
@@ -1045,6 +1045,88 @@ struct Builder {
 			"kept (no other way): %zu\n", order.size(), (OFF_STRETCH - 1) * 100, dropped, replaced, kept);
 	}
 
+	// Shortcuts: corners of different routes that see each other often have no edge between them, and a route
+	// from one to the other zigzags over a third node. Node pairs up to SHORT_R yards apart whose way over the
+	// graph is more than SHORT_SPAN times as long as a direct edge get one, if it is a straight walk that walks
+	// level; shortest first, each only if the ones before have not made it a short way.
+	static constexpr float SHORT_R = 40, SHORT_SPAN = 1.2f;
+	void shortcuts() {
+		auto cost = [&](int a, int b, unsigned char fl) { return dtVdist(nodes[a].p, nodes[b].p) * costOf(fl); };
+		std::vector<std::vector<std::pair<int, float>>> adj(nodes.size());
+		for (auto& e : edges) {
+			if (dead[e.a] || dead[e.b]) continue;
+			float c = cost(e.a, e.b, e.flags);
+			adj[e.a].push_back({ e.b, c }); adj[e.b].push_back({ e.a, c });
+		}
+		std::map<std::pair<int, int>, std::vector<int>> grid;
+		for (size_t i = 0; i < nodes.size(); i++)
+			if (!dead[i]) grid[{ (int)floorf(nodes[i].p[0] / SHORT_R), (int)floorf(nodes[i].p[2] / SHORT_R) }].push_back((int)i);
+		struct Cand { int a, b; float d; unsigned char fl; };
+		std::vector<Cand> cands;
+		std::atomic<size_t> next{ 0 };
+		auto worker = [&]() {
+			dtNavMeshQuery* q = dtAllocNavMeshQuery();
+			q->init(nav, 4096);
+			std::vector<float> dist(nodes.size(), FLT_MAX);
+			std::vector<int> touched;
+			std::priority_queue<std::pair<float, int>, std::vector<std::pair<float, int>>, std::greater<>> pq;
+			auto near = [&](int s, int t, float limit) { // within(), with this thread's own buffers
+				dist[s] = 0; touched.push_back(s); pq.push({ 0.0f, s });
+				bool found = false;
+				while (!pq.empty()) {
+					auto [d, u] = pq.top(); pq.pop();
+					if (d > dist[u]) continue;
+					if (u == t) { found = true; break; }
+					for (auto& [v, w] : adj[u]) {
+						float nd = d + w;
+						if (nd <= limit && nd < dist[v]) { if (dist[v] == FLT_MAX) touched.push_back(v); dist[v] = nd; pq.push({ nd, v }); }
+					}
+				}
+				while (!pq.empty()) pq.pop();
+				for (int x : touched) dist[x] = FLT_MAX;
+				touched.clear();
+				return found;
+			};
+			std::vector<Cand> local;
+			for (;;) {
+				size_t a = next++;
+				if (a >= nodes.size()) break;
+				if (dead[a]) continue;
+				const Node& na = nodes[a];
+				int gx = (int)floorf(na.p[0] / SHORT_R), gz = (int)floorf(na.p[2] / SHORT_R);
+				for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
+					auto it = grid.find({ gx + dx, gz + dz });
+					if (it == grid.end()) continue;
+					for (int b : it->second) {
+						if (b <= (int)a) continue;
+						const Node& nb = nodes[b];
+						float d = dtVdist(na.p, nb.p);
+						if (d > SHORT_R || d < 1 || near((int)a, b, d * SHORT_SPAN)) continue;
+						unsigned char fl; float at[3]; bool drop = false;
+						if (!nearlyStraight(q, na, nb, fl) || (fl & ~(nodeFlag(na) | nodeFlag(nb))) || !walksLevel(q, na.p, nb.p, at, drop)) continue;
+						local.push_back({ (int)a, b, d, fl });
+					}
+				}
+			}
+			dtFreeNavMeshQuery(q);
+			std::lock_guard<std::mutex> l(m);
+			cands.insert(cands.end(), local.begin(), local.end());
+		};
+		std::vector<std::thread> pool;
+		for (int i = 0; i < threads; i++) pool.emplace_back(worker);
+		for (auto& t : pool) t.join();
+		std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) { return x.d != y.d ? x.d < y.d : x.a != y.a ? x.a < y.a : x.b < y.b; });
+		size_t added = 0;
+		for (auto& c : cands) {
+			float w = cost(c.a, c.b, c.fl);
+			if (within(adj, c.a, c.b, w * SHORT_SPAN)) continue;
+			edges.push_back({ c.a, c.b, c.fl });
+			adj[c.a].push_back({ c.b, w }); adj[c.b].push_back({ c.a, w });
+			added++;
+		}
+		printf("shortcuts: %zu candidates, %zu added\n", cands.size(), added);
+	}
+
 	// Every edge must still be a (nearly) straight walk; reports the ones that are not.
 	void verify() {
 		std::atomic<size_t> next{ 0 }, bad{ 0 };
@@ -1419,6 +1501,7 @@ int main(int argc, char** argv) {
 		b.longRuns();
 		b.simplify();
 		b.dropOffLevel();
+		b.shortcuts();
 		b.verify();
 		b.write(argv[3]);
 		return 0;

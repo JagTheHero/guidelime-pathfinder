@@ -248,8 +248,9 @@ def main():
     first = np.searchsorted(src, np.arange(len(old)))
 
     n = len(old)
-    if n > 64 ** 3:
-        raise SystemExit("%d nodes: an edge's neighbour has only 3 base-64 chars (at most %d nodes)" % (n, 64 ** 3))
+    # an edge's neighbour: 18 bits in 3 chars, the rest in its flag char above the 2 flag bits
+    if n > 64 ** 3 * 16:
+        raise SystemExit("%d nodes: an edge's neighbour has 22 bits (at most %d nodes)" % (n, 64 ** 3 * 16))
     flags = (np.where(area[old] == AREA_INDOOR, NODE_INDOOR, 0) | np.where(area[old] == AREA_SWIM, NODE_SWIM, 0)
              | np.where(poi[old] > 0, NODE_POI, 0))
     qx = np.round((hx[old] + OFFSET_XY) * Q).astype(np.int64)
@@ -257,7 +258,7 @@ def main():
     qz = np.round((np.clip(hz[old], -OFFSET_Z, 60000) + OFFSET_Z) * Q).astype(np.int64)
     rec = [b64(qx, 3), b64(qy, 3), b64(qz, 3), b64(flags, 1), b64(first, 4)]
     node_str = "".join("".join(r[i * w:(i + 1) * w] for r, w in zip(rec, (3, 3, 3, 1, 4))) for i in range(n))
-    edge_rec = [b64(dst, 3), b64(fl, 1)]
+    edge_rec = [b64(dst & (64 ** 3 - 1), 3), b64(fl | (dst >> 18) << 2, 1)]
     edge_str = "".join(edge_rec[0][i * 3:i * 3 + 3] + edge_rec[1][i] for i in range(len(dst)))
 
     # walkable pieces: 0 for the biggest, then by size; links tell which piece a dock or landing is on
@@ -268,8 +269,8 @@ def main():
     comp_str = b64(rank[inv], 2)
 
     ukeys, ufirst, ucount = np.unique(key, return_index=True, return_counts=True)
-    c0, c1, c2 = b64(ukeys, 4), b64(ufirst, 3), b64(ucount, 3)
-    cell_str = "".join(c0[i * 4:i * 4 + 4] + c1[i * 3:i * 3 + 3] + c2[i * 3:i * 3 + 3] for i in range(len(ukeys)))
+    c0, c1, c2 = b64(ukeys, 4), b64(ufirst, 4), b64(ucount, 2)
+    cell_str = "".join(c0[i * 4:i * 4 + 4] + c1[i * 4:i * 4 + 4] + c2[i * 2:i * 2 + 2] for i in range(len(ukeys)))
 
     hindex = hdata = ""
     hcount = 0
