@@ -244,6 +244,10 @@ if ns.Graph.Has(0) then
 	if p and p.graph then
 		wx, wy = M.WaypointWorld()
 		check(math.abs(wx - p.x[p.k]) < 1 and math.abs(wy - p.y[p.k]) < 1, "marker on the next corner, not the target")
+		local function mapDots() local n = 0 for _ in pairs(M.pins.map) do n = n + 1 end return n end
+		local dotsBefore = mapDots()
+		WorldMapFrame = M.NewFrame()
+		WorldMapFrame:Show()
 		local onCorner = true
 		for i = 2, p.n - 1 do
 			M.px, M.py = p.x[i], p.y[i]
@@ -254,6 +258,11 @@ if ns.Graph.Has(0) then
 		check(onCorner, "marker steps to each next corner as the player walks")
 		wx, wy = M.WaypointWorld()
 		check(math.abs(wx - 62) < 1 and math.abs(wy + 9465) < 1, "last corner is the Guidelime target")
+		for _ = 1, 11 do M.Step(0.1) end
+		local last = p.len[p.n] - p.len[p.n - 1]
+		check(mapDots() < dotsBefore and mapDots() <= math.ceil(last / 12) + 1, string.format(
+			"world map trail: %d dots for the whole way, %d once at the last corner (%.0f yd to go)", dotsBefore, mapDots(), last))
+		WorldMapFrame = nil
 
 		-- dots on a slope: the corners ahead are higher or lower than the player, the marker is not
 		local q = ns.path

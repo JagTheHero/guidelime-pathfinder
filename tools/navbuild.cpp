@@ -557,13 +557,16 @@ struct Builder {
 					local.insert(local.end(), reps.begin(), reps.end());
 				}
 				std::lock_guard<std::mutex> l(m);
-				for (auto& nd : local) { cells[{ nd.cx, nd.cz }].push_back((int)nodes.size()); nodes.push_back(nd); }
+				nodes.insert(nodes.end(), local.begin(), local.end());
 			}
 			dtFreeNavMeshQuery(q);
 		};
 		std::vector<std::thread> pool;
 		for (int i = 0; i < threads; i++) pool.emplace_back(worker);
 		for (auto& t : pool) t.join();
+		// rows in order, whichever thread did them: the same graph every build
+		std::stable_sort(nodes.begin(), nodes.end(), [](const Node& a, const Node& b) { return a.cz < b.cz; });
+		for (size_t i = 0; i < nodes.size(); i++) cells[{ nodes[i].cx, nodes[i].cz }].push_back((int)i);
 		std::map<size_t, int> hist;
 		for (auto& kv : cells) hist[kv.second.size()]++;
 		printf("cell nodes: %zu in %zu cells; nodes per cell:", nodes.size(), cells.size());
@@ -634,6 +637,8 @@ struct Builder {
 		std::vector<std::thread> pool;
 		for (int i = 0; i < threads; i++) pool.emplace_back(worker);
 		for (auto& t : pool) t.join();
+		std::sort(found.begin(), found.end(), [](const Edge& x, const Edge& y) { return x.a != y.a ? x.a < y.a : x.b < y.b; });
+		std::sort(missing.begin(), missing.end());
 		edges = found;
 		printf("direct edges: %zu, pairs to route around obstacles: %zu\n", edges.size(), missing.size());
 		repair(missing, 1.2f, 8.0f, 0, false);
@@ -735,7 +740,9 @@ struct Builder {
 		// Cheapest routes first; a route is only added when the graph has no path within stretch of its cost
 		// already (a greedy spanner), and its corners reuse any node within SNAP yards that still sees the route's
 		// corners on both sides (a corner snapped blindly turns a bridge into a line beside it).
-		std::sort(routes.begin(), routes.end(), [](const Route& x, const Route& y) { return x.cost < y.cost; });
+		std::sort(routes.begin(), routes.end(), [](const Route& x, const Route& y) {
+			return x.cost != y.cost ? x.cost < y.cost : x.a != y.a ? x.a < y.a : x.b < y.b;
+		});
 		const float SNAP = 6.0f;
 		std::vector<std::vector<std::pair<int, float>>> adj(nodes.size());
 		auto link = [&](int a, int b, unsigned char fl) {
@@ -748,26 +755,6 @@ struct Builder {
 			float d = dtVdist(nodes[e.a].p, nodes[e.b].p) * costOf(e.flags) + legCost;
 			adj[e.a].push_back({ e.b, d }); adj[e.b].push_back({ e.a, d });
 		}
-		std::vector<float> dist;
-		std::vector<int> touched;
-		auto within = [&](int s, int t, float limit) {
-			dist.resize(nodes.size(), FLT_MAX);
-			std::priority_queue<std::pair<float, int>, std::vector<std::pair<float, int>>, std::greater<>> pq;
-			dist[s] = 0; touched.push_back(s); pq.push({ 0.0f, s });
-			bool found = false;
-			while (!pq.empty()) {
-				auto [d, u] = pq.top(); pq.pop();
-				if (d > dist[u]) continue;
-				if (u == t) { found = true; break; }
-				for (auto& [v, w] : adj[u]) {
-					float nd = d + w;
-					if (nd <= limit && nd < dist[v]) { if (dist[v] == FLT_MAX) touched.push_back(v); dist[v] = nd; pq.push({ nd, v }); }
-				}
-			}
-			for (int x : touched) dist[x] = FLT_MAX;
-			touched.clear();
-			return found;
-		};
 		std::map<std::tuple<int, int, int>, std::vector<int>> grid;
 		auto key = [&](const float* p) { return std::make_tuple((int)floorf(p[0] / SNAP), (int)floorf(p[1] / SNAP), (int)floorf(p[2] / SNAP)); };
 		for (size_t i = 0; i < nodes.size(); i++) grid[key(nodes[i].p)].push_back((int)i);
@@ -796,7 +783,7 @@ struct Builder {
 		std::vector<int> near;
 		std::vector<int> orphans;
 		for (auto& r : routes) {
-			if (within(r.a, r.b, r.cost * stretch + slack)) continue;
+			if (within(adj, r.a, r.b, r.cost * stretch + slack)) continue;
 			size_t n = r.pts.size(), first = nodes.size();
 			std::vector<int> ids(n);
 			ids[0] = r.a; ids[n - 1] = r.b;
@@ -911,6 +898,151 @@ struct Builder {
 		dtFreeNavMeshQuery(q);
 		printf("points of interest: %zu (%zu on the level of their height), nodes added %zu, existing nodes used %zu, no walkable ground near %zu\n",
 			pts.size(), onLevel, added, reused, none);
+	}
+
+	// Is there a way from s to t over adj (neighbour, cost) costing at most limit?
+	std::vector<float> wdist;
+	std::vector<int> wtouched;
+	bool within(const std::vector<std::vector<std::pair<int, float>>>& adj, int s, int t, float limit) {
+		wdist.resize(adj.size(), FLT_MAX);
+		std::priority_queue<std::pair<float, int>, std::vector<std::pair<float, int>>, std::greater<>> pq;
+		wdist[s] = 0; wtouched.push_back(s); pq.push({ 0.0f, s });
+		bool found = false;
+		while (!pq.empty()) {
+			auto [d, u] = pq.top(); pq.pop();
+			if (d > wdist[u]) continue;
+			if (u == t) { found = true; break; }
+			for (auto& [v, w] : adj[u]) {
+				float nd = d + w;
+				if (nd <= limit && nd < wdist[v]) { if (wdist[v] == FLT_MAX) wtouched.push_back(v); wdist[v] = nd; pq.push({ nd, v }); }
+			}
+		}
+		for (int x : wtouched) wdist[x] = FLT_MAX;
+		wtouched.clear();
+		return found;
+	}
+
+	// Walking a line as a player would, independent of the raycasts that check edges: from a, follow the ground
+	// the line is on (the layer within WALK_STEP of the last height: the deck, not the river under it), a yard at
+	// a time. Skimming a rock or a tree is fine (edges may bend up to a yard around something thin), so ground on
+	// the line's level within WALK_GRAZE yards counts. False where that ground is missing for more than WALK_GAP
+	// yards, or the line ends off b's level: it runs off a bridge, a pier or a ledge (drop: other ground under or
+	// over it there) or over a hole. at: where the ground was lost, at the line's height.
+	static constexpr float WALK_STEP = 2.0f, WALK_GAP = 3.0f, WALK_END = 3.0f, WALK_GRAZE = 1.2f;
+	// ground nearest height h within r yards of p (2D); any: whether any ground at all is within 0.3 yards
+	float groundNear(dtNavMeshQuery* q, const float* p, float h, float r, bool* any) {
+		float ext[3] = { r + 0.1f, 60, r + 0.1f }, best = FLT_MAX;
+		dtPolyRef refs[128]; int n = 0;
+		q->queryPolygons(p, ext, &filter, refs, &n, 128);
+		for (int i = 0; i < n; i++) {
+			float cp[3]; bool over;
+			if (dtStatusFailed(q->closestPointOnPoly(refs[i], p, cp, &over))) continue;
+			float d = dtVdist2D(cp, p);
+			if (any && d <= 0.3f) *any = true;
+			if (d <= r && fabsf(cp[1] - h) < fabsf(best - h)) best = cp[1];
+		}
+		return best;
+	}
+	bool walksLevelFrom(dtNavMeshQuery* q, const float* a, const float* e, float* at, bool& drop) {
+		float dx = e[0] - a[0], dz = e[2] - a[2], len = sqrtf(dx * dx + dz * dz), h = a[1], gap = 0;
+		bool otherLevel = false;
+		int n = std::max(1, (int)ceilf(len));
+		for (int k = 1; k <= n; k++) {
+			float t = (float)k / n, p[3] = { a[0] + dx * t, h, a[2] + dz * t };
+			float best = groundNear(q, p, h, 0.3f, nullptr);
+			if (fabsf(best - h) <= WALK_STEP + gap * 1.3f) { h = best; gap = 0; otherLevel = false; continue; }
+			bool any = false;
+			float graze = groundNear(q, p, h, WALK_GRAZE, &any);
+			if (fabsf(graze - h) <= WALK_STEP + gap * 1.3f) { h = graze; gap = 0; otherLevel = false; continue; } // skims something
+			otherLevel = otherLevel || any;
+			if ((gap += len / n) > WALK_GAP) { dtVcopy(at, p); at[1] = h; drop = otherLevel; return false; }
+		}
+		if (fabsf(h - e[1]) > WALK_END) { dtVcopy(at, e); at[1] = h; drop = true; return false; }
+		return true;
+	}
+	bool walksLevel(dtNavMeshQuery* q, const float* a, const float* b, float* at, bool& drop) {
+		return walksLevelFrom(q, a, b, at, drop) && walksLevelFrom(q, b, a, at, drop);
+	}
+
+	// Edges a player following the ground could not walk (walksLevel): left out where the graph has another way
+	// within OFF_STRETCH of them; else replaced by the navmesh path between their ends when every leg of it is a
+	// straight walk and walks level; else kept (the navmesh links the ends, and there is no other way).
+	void dropOffLevel() {
+		static constexpr float OFF_STRETCH = 1.3f, OFF_SLACK = 10.0f;
+		std::vector<char> bad(edges.size(), 0);
+		std::atomic<size_t> next{ 0 };
+		auto worker = [&]() {
+			dtNavMeshQuery* q = dtAllocNavMeshQuery();
+			q->init(nav, 4096);
+			for (;;) {
+				size_t i = next++;
+				if (i >= edges.size()) break;
+				const Edge& e = edges[i];
+				float at[3]; bool drop = false;
+				if (!dead[e.a] && !dead[e.b] && !walksLevel(q, nodes[e.a].p, nodes[e.b].p, at, drop)) bad[i] = 1;
+			}
+			dtFreeNavMeshQuery(q);
+		};
+		std::vector<std::thread> pool;
+		for (int i = 0; i < threads; i++) pool.emplace_back(worker);
+		for (auto& t : pool) t.join();
+		std::vector<std::vector<std::pair<int, float>>> adj(nodes.size());
+		auto cost = [&](const Edge& e) { return dtVdist(nodes[e.a].p, nodes[e.b].p) * costOf(e.flags); };
+		auto add = [&](const Edge& e) { float d = cost(e); adj[e.a].push_back({ e.b, d }); adj[e.b].push_back({ e.a, d }); };
+		std::vector<size_t> order;
+		for (size_t i = 0; i < edges.size(); i++) {
+			if (dead[edges[i].a] || dead[edges[i].b]) continue;
+			if (bad[i]) order.push_back(i); else add(edges[i]);
+		}
+		std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return cost(edges[x]) < cost(edges[y]); });
+		dtNavMeshQuery* q = dtAllocNavMeshQuery();
+		q->init(nav, 65535);
+		size_t dropped = 0, replaced = 0, kept = 0;
+		std::vector<Edge> extra;
+		for (size_t i : order) {
+			const Edge e = edges[i];
+			if (within(adj, e.a, e.b, cost(e) * OFF_STRETCH + OFF_SLACK)) { dropped++; continue; }
+			const Node& a = nodes[e.a]; const Node& b = nodes[e.b];
+			float len, dev; unsigned char fl;
+			std::vector<std::array<float, 3>> pts; std::vector<dtPolyRef> refs;
+			std::vector<Node> chain;
+			bool ok = walk(q, a.ref, a.p, b.ref, b.p, len, dev, fl, &pts, &refs) && pts.size() > 2;
+			if (ok) {
+				chain.push_back(a);
+				for (size_t k = 1; k + 1 < pts.size(); k++) {
+					Node c; dtVcopy(c.p, pts[k].data()); c.ref = refs[k];
+					if (!c.ref) { ok = false; break; }
+					interior(q, c.ref, c.p); // corners sit exactly on the wall
+					c.cx = (int)floorf(c.p[0] / CELL); c.cz = (int)floorf(c.p[2] / CELL); c.area = polyArea(c.ref);
+					chain.push_back(c);
+				}
+				chain.push_back(b);
+			}
+			std::vector<unsigned char> fs(chain.size(), 0);
+			for (size_t k = 1; ok && k < chain.size(); k++) {
+				float at[3]; bool drop = false;
+				ok = nearlyStraight(q, chain[k - 1], chain[k], fs[k]) && walksLevel(q, chain[k - 1].p, chain[k].p, at, drop);
+			}
+			if (!ok) { kept++; bad[i] = 0; add(e); continue; }
+			replaced++;
+			int prev = e.a;
+			for (size_t k = 1; k < chain.size(); k++) {
+				int id = k + 1 == chain.size() ? e.b : (int)nodes.size();
+				if (id != e.b) { nodes.push_back(chain[k]); adj.emplace_back(); }
+				Edge ne = { prev, id, fs[k] };
+				extra.push_back(ne);
+				add(ne);
+				prev = id;
+			}
+		}
+		dtFreeNavMeshQuery(q);
+		std::vector<Edge> keep;
+		for (size_t i = 0; i < edges.size(); i++) if (!bad[i]) keep.push_back(edges[i]);
+		keep.insert(keep.end(), extra.begin(), extra.end());
+		edges = keep;
+		dead.resize(nodes.size(), 0);
+		printf("edges that do not walk level: %zu; left out (another way within %.0f%%): %zu, replaced by the navmesh path: %zu, "
+			"kept (no other way): %zu\n", order.size(), (OFF_STRETCH - 1) * 100, dropped, replaced, kept);
 	}
 
 	// Every edge must still be a (nearly) straight walk; reports the ones that are not.
@@ -1169,13 +1301,7 @@ int main(int argc, char** argv) {
 		return 0;
 	}
 	if (cmd == "walkcheck") { // navbuild walkcheck <nav_dir> <graph> <threads> [failures.txt]: walks every edge on the navmesh a yard at a time
-		// A check independent of the raycasts that built the edges: from each end, follow the ground the line is on
-		// (the layer within MAX_STEP of the last height: the deck, not the river under it). Skimming a rock or a tree
-		// is fine: edges may bend up to a yard around something thin, so ground on the line's level within GRAZE
-		// yards counts. An edge fails where that ground is missing for more than MAX_GAP yards or the line ends off
-		// the other end's level: it runs off a bridge, a pier or a ledge ("drop": other ground under or over it
-		// there) or over a hole ("hole": none).
-		static const float STEP = 1.0f, MAX_STEP = 2.0f, MAX_GAP = 3.0f, END_LEVEL = 3.0f, GRAZE = 1.2f;
+		// (Builder::walksLevel) and list the edges that do not: a check of a .graph independent of its raycasts
 		Builder b;
 		b.nav = loadNavMesh(argv[2]);
 		if (!b.nav) return 1;
@@ -1199,45 +1325,6 @@ int main(int argc, char** argv) {
 		std::mutex m;
 		std::vector<std::string> shown;
 		FILE* out = argc > 5 ? fopen(argv[5], "w") : nullptr; // every failing edge: ends, flags, kind, where, line height, depth of the ground under it
-		// ground nearest height h within r yards of p (2D), and whether any ground at all is within 0.3 yards
-		auto groundNear = [&](dtNavMeshQuery* q, const float* p, float h, float r, bool* any) {
-			float ext[3] = { r + 0.1f, 60, r + 0.1f }, best = FLT_MAX;
-			dtPolyRef refs[128]; int m2 = 0;
-			q->queryPolygons(p, ext, &b.filter, refs, &m2, 128);
-			for (int i = 0; i < m2; i++) {
-				float cp[3]; bool over;
-				if (dtStatusFailed(q->closestPointOnPoly(refs[i], p, cp, &over))) continue;
-				float d = dtVdist2D(cp, p);
-				if (any && d <= 0.3f) *any = true;
-				if (d <= r && fabsf(cp[1] - h) < fabsf(best - h)) best = cp[1];
-			}
-			return best;
-		};
-		// at: where the walk lost its ground (at the line's height there)
-		auto walkOne = [&](dtNavMeshQuery* q, const float* a, const float* e, float* at, bool* drop) {
-			float dx = e[0] - a[0], dz = e[2] - a[2], len = sqrtf(dx * dx + dz * dz), h = a[1], gap = 0;
-			bool otherLevel = false;
-			int n = std::max(1, (int)ceilf(len / STEP));
-			for (int k = 1; k <= n; k++) {
-				float t = (float)k / n, p[3] = { a[0] + dx * t, h, a[2] + dz * t }, ext[3] = { 0.3f, 60, 0.3f };
-				dtPolyRef refs[64]; int m2 = 0;
-				q->queryPolygons(p, ext, &b.filter, refs, &m2, 64);
-				float best = FLT_MAX;
-				for (int i = 0; i < m2; i++) {
-					float cp[3]; bool over;
-					if (dtStatusFailed(q->closestPointOnPoly(refs[i], p, cp, &over)) || dtVdist2D(cp, p) > 0.3f) continue;
-					if (fabsf(cp[1] - h) < fabsf(best - h)) best = cp[1];
-				}
-				if (fabsf(best - h) <= MAX_STEP + gap * 1.3f) { h = best; gap = 0; otherLevel = false; continue; }
-				bool any = false;
-				float graze = groundNear(q, p, h, GRAZE, &any);
-				if (fabsf(graze - h) <= MAX_STEP + gap * 1.3f) { h = graze; gap = 0; otherLevel = false; continue; } // skims something
-				otherLevel = otherLevel || any;
-				if ((gap += len / n) > MAX_GAP) { dtVcopy(at, p); at[1] = h; *drop = otherLevel; return false; }
-			}
-			if (fabsf(h - e[1]) > END_LEVEL) { dtVcopy(at, e); at[1] = h; *drop = true; return false; }
-			return true;
-		};
 		auto worker = [&]() {
 			dtNavMeshQuery* q = dtAllocNavMeshQuery();
 			q->init(b.nav, 4096);
@@ -1248,13 +1335,13 @@ int main(int argc, char** argv) {
 				bool isLong = dtVdist2D(a, e) > 145;
 				if (isLong) longEdges++;
 				float at[3]; bool drop = false;
-				if (walkOne(q, a, e, at, &drop) && walkOne(q, e, a, at, &drop)) continue;
+				if (b.walksLevel(q, a, e, at, drop)) continue;
 				failed++;
 				if (isLong) failedLong++;
 				if (drop) drops++;
 				if (out) {
 					bool any;
-					float under = groundNear(q, at, -1e6f, 0.3f, &any); // the lowest ground there
+					float under = b.groundNear(q, at, -1e6f, 0.3f, &any); // the lowest ground there
 					float t = dtVdist2D(a, at) / std::max(0.01f, dtVdist2D(a, e));
 					std::lock_guard<std::mutex> l(m);
 					fprintf(out, "%.1f %.1f %.1f %.1f %.1f %.1f %d %s %.2f %.1f %.1f\n", a[2], a[0], a[1], e[2], e[0], e[1], es[i].flags,
@@ -1331,6 +1418,7 @@ int main(int argc, char** argv) {
 		b.connect();
 		b.longRuns();
 		b.simplify();
+		b.dropOffLevel();
 		b.verify();
 		b.write(argv[3]);
 		return 0;

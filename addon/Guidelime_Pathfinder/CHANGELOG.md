@@ -5,6 +5,9 @@
 - Routes no longer step off bridges and piers: every shortcut in the path data is checked to be a straight
   walk, and narrow walkways and water cost more, so a route takes the bridge deck or the street instead of a
   ledge you have to hit exactly or a swim.
+- Every line in the path data is also walked yard by yard along the ground. Lines that leave it (off the side of a
+  bridge, over a ledge or a steep rock) are left out where there is another way, or replaced by the walk around:
+  about 60% fewer such lines than before, and about 70% fewer that cross a drop midway.
 - Routes end where the NPC stands: the path data has a point on every walkable level at each quest giver,
   quest object and town service (from Questie's data), so a route to someone on a pier or dock ends on it,
   not in the water beside it, and a route from the water leads back to land.
@@ -24,6 +27,8 @@
   their levels, aggro ranges and patrol paths come from the CMaNGOS classic database.
 - NPCs and objects stand at their exact height (from the CMaNGOS classic database), so a route to a quest
   giver on a tower, a pier or an upper floor ends on that level.
+- The world map trail shows only the way still ahead of you, in outlined dots that stand out on any map;
+  the minimap trail uses them too. After updating, restart the game once (a `/reload` does not load new pictures).
 - License: GNU General Public License version 3 or later (the CMaNGOS data is GPL-3.0).
 
 ## 0.3.0 (beta)
