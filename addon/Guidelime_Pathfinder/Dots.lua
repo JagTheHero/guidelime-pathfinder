@@ -199,9 +199,9 @@ local function draw()
 
 	local n = 0
 	local range, size = db.dotRange, db.dotSize
-	ns.SampleGround(p, instance, px, py, ground and pz, db.dotSpacing, range, function(x, y, z, along, lineZ)
+	ns.SampleGround(p, instance, px, py, ground and pz, db.dotSpacing, range, function(x, y, z, along, lineZ, unsure)
 		if n >= MAX_DOTS then return false end
-		if along < 2 then return end
+		if along < 2 or unsure then return end -- no dot in the air where the ground is not known
 		local sx, sy, cf, dirz = project(-x, y, z + 0.05)
 		if not sx then return end
 		n = n + 1

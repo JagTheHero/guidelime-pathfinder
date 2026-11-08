@@ -15,10 +15,10 @@ local ns = M.LoadAddon(dir, "Guidelime_Pathfinder")
 print(string.format("     data loaded in %.0f ms, Lua memory %.0f MB", (os.clock() - t0) * 1000, collectgarbage("count") / 1024))
 M.Fire("ADDON_LOADED", "Guidelime_Pathfinder")
 
-local function route(instance, sx, sy, tx, ty)
+local function route(instance, sx, sy, tx, ty, sz)
 	local result, done = nil, false
 	local c0 = os.clock()
-	ns.Graph.FindPath(instance, sx, sy, tx, ty, false, function(p) result, done = p, true end)
+	ns.Graph.FindPath(instance, sx, sy, tx, ty, false, function(p) result, done = p, true end, sz)
 	local frames = 0
 	while not done and frames < 20000 do M.Step(1 / 60); frames = frames + 1 end
 	local ms = (os.clock() - c0) * 1000
@@ -85,6 +85,16 @@ do
 	end
 	check(p and longest >= 300 and long >= len * 0.6, string.format(
 		"Crossroads -> Ratchet runs straight: longest leg %.0f yd, %.0f%% of the way in legs of 100+ yd", longest, p and 100 * long / len or 0))
+end
+
+-- a dungeon's door down a pit: the Hall of Thanes (Questie: Ironforge 27.63, 47.83) has no height to go on; at
+-- that spot the ground is 100 yards under the hall floor, so the route winds down to it from the Great Forge
+do
+	local p = route(0, -1166.4, -4808.5, -932.0, -4821.6, 502.5) -- standing at the forge
+	local lowest = math.huge
+	for i = 1, p and p.n or 0 do lowest = math.min(lowest, p.z[i]) end
+	check(p and math.abs(p.z[p.n] - 399.5) < 5 and lowest > 395, string.format(
+		"Great Forge -> Hall of Thanes: ends at the door down the pit (%.1f, %d corners)", p and p.z[p.n] or -1, p and p.n or 0))
 end
 
 -- hostile mobs as traffic: west of Kharanos the troggs and wolves are level 5-9. A level 8 Alliance player goes

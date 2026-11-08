@@ -1,4 +1,4 @@
--- Checks the packed height map against navbuild's raw heights (tests/ground_points.tsv, from tools/ground_points.py).
+-- Checks the packed walk grid against navbuild's (tests/ground_points.tsv, from tools/ground_points.py).
 -- Usage: lua51 tests/test_ground.lua <addon dir>
 local print = function(...) io.write(table.concat({...}, " "), "\n") end
 package.path = arg[0]:gsub("[^/]+$", "") .. "?.lua;" .. package.path
@@ -15,7 +15,7 @@ for line in io.lines(arg[0]:gsub("[^/]+$", "") .. "ground_points.tsv") do
 		local f = {}
 		for v in line:gmatch("[^\t]+") do f[#f + 1] = tonumber(v) end
 		local instance, x, y = f[1], f[2], f[3]
-		-- only ground next to kept path nodes is packed (pack.py drops tiny islands and open sea)
+		-- only ground near kept path nodes is packed (pack.py drops tiny islands and open sea)
 		if not ns.Graph.NearestZ(instance, x, y) then
 			-- not packed
 		elseif not ns.Graph.GroundZ(instance, x, y) then
@@ -26,13 +26,14 @@ for line in io.lines(arg[0]:gsub("[^/]+$", "") .. "ground_points.tsv") do
 				layers = layers + 1
 				local z = ns.Graph.GroundZ(instance, x, y, f[i], 0)
 				local err = z and math.abs(z - f[i]) or math.huge
-				if err > 0.26 then wrong = wrong + 1 else worst = math.max(worst, err) end
+				-- quarter yards, and a smooth block's points within a quarter yard of the blend of its corners
+				if err > 0.4 then wrong = wrong + 1 else worst = math.max(worst, err) end
 			end
 		end
 	end
 end
 check(points > 1000 and missing <= points * 0.05, string.format("height map covers the ground next to path nodes (%d of %d points missing)", missing, points))
-check(wrong <= layers * 0.01, string.format("every layer decodes to within a quarter yard (%d of %d layers off, worst of the rest %.2f yd)", wrong, layers, worst))
+check(wrong == 0, string.format("every layer decodes to within 0.4 yd (%d of %d layers off, worst of the rest %.2f yd)", wrong, layers, worst))
 
 -- between grid points: the layer continuing from a nearby height, not the one under or over it
 local bridge = 0

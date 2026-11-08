@@ -1,5 +1,23 @@
 # Guidelime Pathfinder
 
+## 0.5.0 (beta)
+
+- Ground dots stay on the ground: the path data now has the ground height every 2 yards on every level you can
+  walk on (floors, bridges, decks, ramps, the water's surface where you swim), taken from the game's own collision
+  surfaces. The dots follow it yard by yard from where you stand: up and down stairs, along a bridge and not the
+  river under it, off a ledge where the way drops.
+- Your own way to the next corner: the dots start at you and run to the corner you are heading for, around what is
+  in the way (a drop, a wall, the other side of a house), instead of along the route line beside you.
+- Down into dungeons: a route to a dungeon door under a city, like the Hall of Thanes under Ironforge's Great
+  Forge, ends on the level the door is on and winds down the stairs and ramps to it.
+- Where the ground under the way is not known (a slope too steep to walk, the last stretch to a spot off the
+  paths), no dots are drawn rather than dots in the air.
+- The dots are drawn where the game's camera really looks (the exact field of view, not its mirror image) and
+  for the waypoint the game is showing.
+- Checked on simulated walks against the game's collision surfaces (over two million dots): on the route, 99% of
+  the dots are within a yard of the true ground along the way, half of them within 6 cm. The path data is about
+  34 MB for the Eastern Kingdoms and 44 MB for Kalimdor.
+
 ## 0.4.0 (beta)
 
 - Routes no longer step off bridges and piers: every shortcut in the path data is checked to be a straight

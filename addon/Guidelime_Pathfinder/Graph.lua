@@ -38,6 +38,7 @@ local LAYER_GAP = 8 -- yards of height between a node and the player before the 
 local FRAME_BUDGET_MS = 4
 
 local graphs = {}
+local layersAt -- every walkable layer's height at a spot, from the walk grid (below)
 
 local function v3(s, p)
 	local a, b, c = byte(s, p, p + 2)
@@ -189,9 +190,11 @@ local function flag(f, bit) return floor(f / bit) % 2 == 1 end
 -- Where a route may end near (tx, ty). A quest giver, quest object or town service has a node on every walkable
 -- layer where it stands (a pier's deck, the ground under it, an inn's upper floor): all of them are goals, on tz's
 -- layer if any is, and the search ends at the one it reaches cheapest. Anywhere else the nearest nodes, land
--- before water: the nearest node to a spot on a pier can be in the sea beside it.
+-- before water: the nearest node to a spot on a pier can be in the sea beside it. Without tz, nodes on a level the
+-- ground at the spot itself has come first: a dungeon's door down a pit, not the hall floor at the pit's edge.
+local OFF_SPOT = 30 -- yards a goal node on no level of the spot counts as farther
 local function goalNodes(g, tx, ty, tz)
-	local found = nearest(g, tx, ty, 12, nil, tz)
+	local found = nearest(g, tx, ty, 24, nil, tz)
 	local poi, onLayer = {}, {}
 	for _, c in ipairs(found) do
 		if c[2] <= POI_REACH and flag(g.f[c[1]], NODE_POI) then
@@ -201,8 +204,14 @@ local function goalNodes(g, tx, ty, tz)
 	end
 	if #onLayer > 0 then return onLayer end
 	if #poi > 0 then return poi end -- on the level of the NPC's height where known (tools/pois.py), so over a guessed tz
+	local here = not tz and layersAt(g, tx, ty)
 	for _, c in ipairs(found) do
 		if flag(g.f[c[1]], NODE_SWIM) then c[3] = c[3] + SWIM_GOAL end
+		if here and #here > 0 then
+			local onOne = false
+			for _, z in ipairs(here) do onOne = onOne or abs(g.z[c[1]] - z) <= LAYER_GAP end
+			if not onOne then c[3] = c[3] + OFF_SPOT end
+		end
 	end
 	table.sort(found, function(a, b) return a[3] < b[3] end)
 	for i = 4, #found do found[i] = nil end
@@ -520,115 +529,342 @@ function Graph.NearestZ(instance, x, y, indoors)
 	if found[1] and found[1][2] < 30 then return g.z[found[1][1]] end
 end
 
--- Ground heights for the ground dots (tools/pack.py, pack_heights): a block per 64-yard cell with heights every
--- g.hs yards, every walkable layer where several stack (bridges, caves, floors).
---   hcells:  hc records of 8 chars: cellKey(4) offset(4) into heights, sorted by key
---   heights: per cell base(3), then 64 codes in serpentine row order: c < 62 is the previous height
---            + (c - 31) / 2 yards, 62 is no ground, 63 is followed by an absolute height(2); then the number
---            of extra layers(2) and per extra layer sampleIndex(1) height(2). Absolute heights are
---            quarter yards above the base, which is (lowest height + 4000) * 4.
-local HPER = 8
-local SCAN = {}
-for j = 0, HPER - 1 do
-	for i = 0, HPER - 1 do SCAN[#SCAN + 1] = j * HPER + (j % 2 == 0 and i or HPER - 1 - i) end
+-- The walk grid (navbuild walkgrid, tools/walkpack.py): ground points every 2 yards, every walkable layer (bridges,
+-- caves, floors, the surface of deep water), at the height of the surface the feet are on, by 64-yard cell. A smooth
+-- 8-yard block keeps only its corner point: its other points are the blend of its four corners. Heights are in
+-- quarter yards above -4000.
+--   wcells: wc records of 9 chars: cellKey(4) offset(5) into walk, sorted by key
+--   walk, per cell:
+--     the 64 block corners (points 0, 4, ..., 28 of rows 0, 4, ..., 28) in serpentine order, as a chain
+--     which blocks are kept in full: 11 chars of 6 bits, block j * 8 + i the (j * 8 + i)-th bit from the top
+--     each full block in order: its 15 other points, serpentine over its 4 x 4 after the corner, as a chain
+--       going on from the corner's height
+--     extra layers: count(3), then per extra layer the point's index as a step from the last one's (1 char below
+--       63, else 63 and the index(2)), and its height above the point's first + 2048 (2; 4095 then an absolute
+--       height(3) when over 511 yards away)
+--   A chain codes each point as a step from the one before: 0-48 two points' steps a, b in -3..3 as
+--   (a + 3) * 7 + b + 3; 49-55 one step of c - 52; 56-59 one step of -5, -4, 4 or 5; 60 no ground; 61 four points
+--   without ground; 62 a step of the next char - 32; 63 an absolute height in the next 3 chars.
+local WP, WB, WN, WS, WQ = 32, 4, 8, 2, 4
+local MIDS = { [56] = -5, [57] = -4, [58] = 4, [59] = 5 }
+local CORNERS, BLOCK_PTS = {}, {}
+for bj = 0, WN - 1 do
+	for k = 0, WN - 1 do CORNERS[#CORNERS + 1] = bj * WB * WP + (bj % 2 == 0 and k or WN - 1 - k) * WB end
+end
+for b = 0, WN * WN - 1 do
+	local bj, bi, list = floor(b / WN), b % WN, {}
+	for oj = 0, WB - 1 do
+		for k = 0, WB - 1 do
+			local oi = oj % 2 == 0 and k or WB - 1 - k
+			if oj > 0 or oi > 0 then list[#list + 1] = (bj * WB + oj) * WP + bi * WB + oi end
+		end
+	end
+	BLOCK_PTS[b] = list
 end
 local CACHE_CELLS = 256
--- a grid corner fits the reference height when within STEP_ALLOW + SLOPE_ALLOW x its distance + REACH_ALLOW x
--- how far back the reference was measured (tuned on real routes against a 4-yard height map)
-local STEP_ALLOW, SLOPE_ALLOW, REACH_ALLOW = 1.5, 0.8, 0.4
+-- a grid point fits a reference height within CLIMB + SLOPE x its distance + REACH x how far back the reference
+-- was measured (52-degree slopes, the steepest walkable)
+local CLIMB, SLOPE, REACH = 1.3, 1.3, 0.4
+local WALK_STEP = 1 -- yards between the points Graph.Walk tries
 
-local function heightCell(g, key)
-	local cache = g.hcache
-	if not cache then cache = {}; g.hcache, g.hcached = cache, 0 end
+local function v5(s, p)
+	return v4(s, p) * 64 + DEC[byte(s, p + 4)]
+end
+
+-- decodes a chain of points into z (quarter-yard heights by point index) going on from height prev
+local function chain(s, p, pts, z, prev)
+	local k, n = 1, #pts
+	while k <= n do
+		local c = DEC[byte(s, p)]
+		p = p + 1
+		if c < 49 then
+			prev = prev + floor(c / 7) - 3
+			z[pts[k]] = prev
+			prev = prev + c % 7 - 3
+			z[pts[k + 1]] = prev
+			k = k + 2
+		elseif c < 60 then
+			prev = prev + (c < 56 and c - 52 or MIDS[c])
+			z[pts[k]] = prev
+			k = k + 1
+		elseif c == 60 then
+			k = k + 1
+		elseif c == 61 then
+			k = k + 4
+		elseif c == 62 then
+			prev = prev + DEC[byte(s, p)] - 32
+			z[pts[k]] = prev
+			p, k = p + 1, k + 1
+		else
+			prev = v3(s, p)
+			z[pts[k]] = prev
+			p, k = p + 3, k + 1
+		end
+	end
+	return p
+end
+
+local function walkCell(g, key)
+	local cache = g.wcache
+	if not cache then cache = {}; g.wcache, g.wcached = cache, 0 end
 	local cell = cache[key]
 	if cell ~= nil then return cell end
-	local s, lo, hi, off = g.hcells, 1, g.hc, nil
+	local s, lo, hi, off = g.wcells, 1, g.wc, nil
 	while lo <= hi do
 		local mid = floor((lo + hi) / 2)
-		local k = v4(s, (mid - 1) * 8 + 1)
-		if k == key then off = v4(s, (mid - 1) * 8 + 5) break end
+		local k = v4(s, (mid - 1) * 9 + 1)
+		if k == key then off = v5(s, (mid - 1) * 9 + 5) break end
 		if k < key then lo = mid + 1 else hi = mid - 1 end
 	end
 	cell = false
 	if off then
-		s = g.heights
-		local p = off + 1
-		local base = v3(s, p)
-		p = p + 3
-		local first, extra = {}, {}
-		local last = base / Q - OFFSET_Z
-		for n = 1, HPER * HPER do
-			local c = DEC[byte(s, p)]
-			p = p + 1
-			if c == 63 then
-				last = (base + DEC[byte(s, p)] * 64 + DEC[byte(s, p + 1)]) / Q - OFFSET_Z
-				p = p + 2
-				first[SCAN[n]] = last
-			elseif c < 62 then
-				last = last + (c - 31) / 2
-				first[SCAN[n]] = last
+		s = g.walk
+		local z, full, more = {}, {}, {}
+		local p = chain(s, off + 1, CORNERS, z, nil)
+		for c = 0, 10 do
+			local v = DEC[byte(s, p + c)]
+			for b = 0, 5 do
+				if floor(v / 2 ^ (5 - b)) % 2 == 1 then full[c * 6 + b] = true end
 			end
 		end
-		for _ = 1, DEC[byte(s, p)] * 64 + DEC[byte(s, p + 1)] do
-			local idx = DEC[byte(s, p + 2)]
-			local list = extra[idx] or {}
-			extra[idx] = list
-			list[#list + 1] = (base + DEC[byte(s, p + 3)] * 64 + DEC[byte(s, p + 4)]) / Q - OFFSET_Z
-			p = p + 3
+		p = p + 11
+		for b = 0, WN * WN - 1 do
+			if full[b] then p = chain(s, p, BLOCK_PTS[b], z, z[floor(b / WN) * WB * WP + b % WN * WB]) end
 		end
-		cell = { first = first, extra = extra }
+		local idx, extras = -1, v3(s, p)
+		p = p + 3
+		for _ = 1, extras do
+			local gap = DEC[byte(s, p)]
+			if gap < 63 then
+				idx, p = idx + gap, p + 1
+			else
+				idx, p = v2(s, p + 1), p + 3
+			end
+			local list = more[idx] or {}
+			more[idx] = list
+			local dq = v2(s, p)
+			if dq == 4095 then
+				list[#list + 1] = v3(s, p + 2)
+				p = p + 5
+			else
+				list[#list + 1] = z[idx] + dq - 2048
+				p = p + 2
+			end
+		end
+		cell = { z = z, full = full, more = more }
 	end
-	if g.hcached >= CACHE_CELLS then wipe(cache); g.hcached = 0 end
-	cache[key], g.hcached = cell, g.hcached + 1
+	if g.wcached >= CACHE_CELLS then wipe(cache); g.wcached = 0 end
+	cache[key], g.wcached = cell, g.wcached + 1
 	return cell
 end
 
--- Height of grid point (sx, sy) on the layer nearest ref (any layer without ref).
-local function groundSample(g, sx, sy, ref)
-	local cell = heightCell(g, floor(sx / HPER) + floor(sy / HPER) * 1024)
+-- The layers at walk grid point (sx, sy) (global 2-yard indices) in quarter yards: the first, and a list of the
+-- others or nil. A point in a smooth block is the blend of its corners.
+local function walkPoint(g, sx, sy)
+	local cx, cy = floor(sx / WP), floor(sy / WP)
+	local cell = walkCell(g, cx + cy * 1024)
 	if not cell then return end
-	local idx = (sy % HPER) * HPER + sx % HPER
-	local h = cell.first[idx]
-	local more = cell.extra[idx]
+	local i, j = sx - cx * WP, sy - cy * WP
+	local oi, oj = i % WB, j % WB
+	local z = cell.z
+	if (oi == 0 and oj == 0) or cell.full[floor(j / WB) * WN + floor(i / WB)] then return z[j * WP + i], cell.more[j * WP + i] end
+	local c00 = z[(j - oj) * WP + i - oi]
+	if not c00 then return end
+	local c10 = walkPoint(g, sx - oi + WB, sy - oj) or c00
+	local c01 = walkPoint(g, sx - oi, sy - oj + WB) or c00
+	local c11 = walkPoint(g, sx - oi + WB, sy - oj + WB) or c00
+	local fx, fy = oi / WB, oj / WB
+	return c00 * (1 - fx) * (1 - fy) + c10 * fx * (1 - fy) + c01 * (1 - fx) * fy + c11 * fx * fy
+end
+
+-- of a point's layers, the one nearest ref (yards; the first without ref), or with below the highest at most ref
+local function layer(first, more, ref, below)
+	local h = first / WQ - OFFSET_Z
+	if below and h > ref then h = nil end
 	if more and ref then
-		for _, z in ipairs(more) do
-			if not h or abs(z - ref) < abs(h - ref) then h = z end
+		for _, q in ipairs(more) do
+			local z = q / WQ - OFFSET_Z
+			if below then
+				if z <= ref and (not h or z > h) then h = z end
+			elseif abs(z - ref) < abs(h - ref) then
+				h = z
+			end
 		end
 	end
 	return h
 end
 
-function Graph.HasGround(instance)
-	local g = graphs[instance]
-	return g ~= nil and (g.hc or 0) > 0
+layersAt = function(g, x, y)
+	if not g.wc then return {} end
+	local first, more = walkPoint(g, floor((x + OFFSET_XY) / WS + 0.5), floor((y + OFFSET_XY) / WS + 0.5))
+	local out = {}
+	if first then out[1] = first / WQ - OFFSET_Z end
+	for _, q in ipairs(more or {}) do out[#out + 1] = q / WQ - OFFSET_Z end
+	table.sort(out)
+	return out
 end
 
--- Ground height at (x, y), on the layer that continues from height `ref` measured `reach` yards away.
--- Grid corners that are on another layer (farther from ref than a walkable slope allows, like the water
--- under a bridge) are left out. Returns nil, guess when no corner fits ref (guess: the plain nearest
--- layers), and nil when there is no ground data here.
-function Graph.GroundZ(instance, x, y, ref, reach)
+-- Every layer's height at the walk grid point nearest (x, y), lowest first.
+function Graph.Layers(instance, x, y)
 	local g = graphs[instance]
-	if not g or not g.hc then return end
-	local hs = g.hs
-	local gx, gy = (x + OFFSET_XY) / hs, (y + OFFSET_XY) / hs
+	return g and layersAt(g, x, y) or {}
+end
+
+function Graph.HasGround(instance)
+	local g = graphs[instance]
+	return g ~= nil and (g.wc or 0) > 0
+end
+
+-- Ground height at (x, y), on the layer that continues from height `ref` measured `reach` yards away: the blend of
+-- the four grid points around, each on its layer nearest ref, of those that fit ref (not the water under a bridge).
+-- Returns nil, guess when none fits ref (guess: the blend of the layers nearest ref), and nil without ground here.
+-- With below, the highest layer at most ref at each point instead (where a fall lands).
+function Graph.GroundZ(instance, x, y, ref, reach, below)
+	local g = graphs[instance]
+	if not g or not g.wc then return end
+	local gx, gy = (x + OFFSET_XY) / WS, (y + OFFSET_XY) / WS
 	local ix, iy = floor(gx), floor(gy)
 	local fx, fy = gx - ix, gy - iy
 	local sum, wsum, any, anyW = 0, 0, 0, 0
 	for c = 0, 3 do
 		local dx, dy = c % 2, floor(c / 2)
 		local w = (dx == 1 and fx or 1 - fx) * (dy == 1 and fy or 1 - fy)
-		local h = w > 0 and groundSample(g, ix + dx, iy + dy, ref)
-		if h then
-			any, anyW = any + w * h, anyW + w
-			local d = hs * sqrt((dx - fx) ^ 2 + (dy - fy) ^ 2)
-			if not ref or abs(h - ref) <= STEP_ALLOW + SLOPE_ALLOW * d + REACH_ALLOW * (reach or 0) then
-				sum, wsum = sum + w * h, wsum + w
+		if w > 0 then
+			local first, more = walkPoint(g, ix + dx, iy + dy)
+			local h = first and layer(first, more, ref, below)
+			if h then
+				any, anyW = any + w * h, anyW + w
+				local d = WS * sqrt((dx - fx) ^ 2 + (dy - fy) ^ 2)
+				if below or not ref or abs(h - ref) <= CLIMB + SLOPE * d + REACH * (reach or 0) then
+					sum, wsum = sum + w * h, wsum + w
+				end
 			end
 		end
 	end
 	if wsum > 1e-3 then return sum / wsum end
 	if anyW > 1e-3 then return nil, any / anyW end
+end
+
+-- The layer continuing from height z at the nearest of the walk grid points a step further out than the four around
+-- (x, y): a deck, ramp or walkway the four around miss, at about the same height (not the ledge beside it). nil if
+-- none of the 16 has one.
+local BRIDGE_SLOPE = 0.4
+local function layerNearby(g, x, y, z)
+	local gx, gy = (x + OFFSET_XY) / WS, (y + OFFSET_XY) / WS
+	local ix, iy = floor(gx), floor(gy)
+	local best, bestD
+	for sy = iy - 1, iy + 2 do
+		for sx = ix - 1, ix + 2 do
+			local d = WS * sqrt((sx - gx) ^ 2 + (sy - gy) ^ 2)
+			if not bestD or d < bestD then
+				local first, more = walkPoint(g, sx, sy)
+				local h = first and layer(first, more, z)
+				if h and abs(h - z) <= CLIMB + BRIDGE_SLOPE * d then best, bestD = h, d end
+			end
+		end
+	end
+	return best
+end
+
+-- Walks from (x0, y0) at height z0 to (x1, y1) a yard at a time like a player: up and down the ground the feet are
+-- on (stairs, a bridge, not the river under it), falling where it drops away (no ground on its layer within a grid
+-- step and a half), keeping the height over a hole. fn(x, y, z, yards, overHole) at each step, if given, can stop
+-- the walk by returning false. Returns the last height, whether the walk fell somewhere, and whether it crossed a hole or ran
+-- into ground too high to climb (a wall, a cliff).
+function Graph.Walk(instance, x0, y0, z0, x1, y1, fn)
+	local g = graphs[instance]
+	local dx, dy = x1 - x0, y1 - y0
+	local len = sqrt(dx * dx + dy * dy)
+	local n = max(1, floor(len / WALK_STEP + 0.999))
+	local z, fell, lost = z0, false, false
+	for k = 1, n do
+		local t = k / n
+		local x, y = x0 + dx * t, y0 + dy * t
+		local nz = Graph.GroundZ(instance, x, y, z, 0) or (g and g.wc and layerNearby(g, x, y, z))
+		local hole = false
+		if not nz then
+			nz = Graph.GroundZ(instance, x, y, z + CLIMB, 0, true)
+			if nz then fell = true else nz, lost, hole = z, true, true end
+		end
+		z = nz
+		if fn and fn(x, y, z, len * t, hole) == false then break end
+	end
+	return z, fell, lost
+end
+
+-- A walkable way on the walk grid from (x0, y0) at height z0 to (x1, y1) at height z1 when the straight line is not
+-- (it falls off something or runs into a wall): grid points joined to their 8 neighbours where the ground steps at
+-- most CLIMB + SLOPE x the step (stairs, slopes up to 52 degrees), searched within LOCAL_MARGIN yards around the
+-- two ends, then straightened to a corner wherever the straight walk on would fall or run out of ground.
+-- Returns the corners after the start, the last one (x1, y1), or nil when there is no such way nearby.
+local LOCAL_MARGIN, LOCAL_MAX = 16, 3000 -- yards around the ends; most points searched
+local DIRS = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }
+function Graph.LocalPath(instance, x0, y0, z0, x1, y1, z1)
+	local g = graphs[instance]
+	if not g or not g.wc then return end
+	local sx0, sy0 = floor((x0 + OFFSET_XY) / WS + 0.5), floor((y0 + OFFSET_XY) / WS + 0.5)
+	local sx1, sy1 = floor((x1 + OFFSET_XY) / WS + 0.5), floor((y1 + OFFSET_XY) / WS + 0.5)
+	local m = LOCAL_MARGIN / WS
+	local lox, hix, loy, hiy = min(sx0, sx1) - m, max(sx0, sx1) + m, min(sy0, sy1) - m, max(sy0, sy1) + m
+	-- a node is a grid point on one layer: its key keeps layers 4 yards apart apart
+	local function key(sx, sy, h) return (sx * 20000 + sy) * 2048 + floor(h / 4) % 2048 end
+	local function hdist(sx, sy) return WS * sqrt((sx - sx1) ^ 2 + (sy - sy1) ^ 2) end
+	local first, more = walkPoint(g, sx0, sy0)
+	local h0 = first and layer(first, more, z0) or z0
+	if abs(h0 - z0) > CLIMB + SLOPE * WS then h0 = z0 end
+	local k0 = key(sx0, sy0, h0)
+	local gs, came, hs, px, py = { [k0] = 0 }, {}, { [k0] = h0 }, { [k0] = sx0 }, { [k0] = sy0 }
+	local hk, hv, hn = {}, {}, 0
+	hn = heapPush(hk, hv, hn, hdist(sx0, sy0), k0)
+	local closed, found, searched = {}, nil, 0
+	while hn > 0 and searched < LOCAL_MAX do
+		local _, u
+		_, u, hn = heapPop(hk, hv, hn)
+		if not closed[u] then
+			closed[u] = true
+			searched = searched + 1
+			local ux, uy, uh = px[u], py[u], hs[u]
+			if ux == sx1 and uy == sy1 and abs(uh - z1) <= CLIMB + SLOPE * WS then found = u break end
+			for _, d in ipairs(DIRS) do
+				local nx, ny = ux + d[1], uy + d[2]
+				if nx >= lox and nx <= hix and ny >= loy and ny <= hiy then
+					local step = (d[1] ~= 0 and d[2] ~= 0) and WS * 1.4142 or WS
+					local f, mo = walkPoint(g, nx, ny)
+					local h = f and layer(f, mo, uh)
+					if h and abs(h - uh) <= CLIMB + SLOPE * step then
+						local v = key(nx, ny, h)
+						local c = gs[u] + step
+						if not closed[v] and (not gs[v] or c < gs[v]) then
+							gs[v], came[v], hs[v], px[v], py[v] = c, u, h, nx, ny
+							hn = heapPush(hk, hv, hn, c + hdist(nx, ny), v)
+						end
+					end
+				end
+			end
+		end
+	end
+	if not found then return end
+	local pts = {}
+	local v = found
+	while v do
+		table.insert(pts, 1, { px[v] * WS - OFFSET_XY, py[v] * WS - OFFSET_XY, hs[v] })
+		v = came[v]
+	end
+	pts[#pts] = { x1, y1, z1 }
+	-- straighten: from each corner on to the farthest point the straight walk reaches without falling or getting lost
+	local corners, ax, ay, az, i = {}, x0, y0, z0, 1
+	while i <= #pts do
+		local j = #pts
+		while j > i do
+			local z, fell, lost = Graph.Walk(instance, ax, ay, az, pts[j][1], pts[j][2])
+			if not fell and not lost and abs(z - pts[j][3]) <= CLIMB then break end
+			j = j - 1
+		end
+		corners[#corners + 1] = { pts[j][1], pts[j][2] }
+		ax, ay, az = pts[j][1], pts[j][2], pts[j][3]
+		i = j + 1
+	end
+	return corners
 end
 
 -- Most likely ground height at (x, y) when nothing else is known (login, teleport): the layer most path nodes

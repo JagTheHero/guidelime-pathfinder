@@ -23,7 +23,6 @@ local DEFAULTS = {
 local OFF_PATH = 25   -- yards away from the path before replanning
 local OFF_LAYER = 30  -- yards above or below the path's line before replanning (the route is on another layer)
 local ADVANCE = 7     -- yards from a corner before the marker moves to the next one
-local GROUND_LOST = 1 -- seconds without ground that continues the tracked height before it jumps (a fall)
 -- trips (flight paths, boats, zeppelins, lifts, the tram, portals): yards from where a ride starts that count as
 -- being there, and from where it ends that count as arrived (a ship stops off its dock); seconds past a ride's
 -- wait and ride before it counts as missed
@@ -343,12 +342,13 @@ function ns.PointOnSeg(p, i, t)
 end
 
 -- Calls fn(x, y, z, distanceAlong) every `spacing` yards along the path ahead of the player: from the player's
--- spot on the path, or from (x0, y0, z0) straight to the next corner (p.k), then corner to corner.
+-- spot on the path, or from (x0, y0, z0) straight to the end of the player's leg, then corner to corner (through
+-- the corner the marker has already moved past: in a tight spot cutting it can cross a drop).
 function ns.SamplePath(p, spacing, maxDist, fn, x0, y0, z0)
 	if not p or not p.seg then return end
 	local i
 	if x0 then
-		i = p.k - 1
+		i = p.seg
 	else
 		i = p.seg
 		x0, y0, z0 = ns.PointOnSeg(p, i, p.segT or 0)
@@ -368,32 +368,84 @@ function ns.SamplePath(p, spacing, maxDist, fn, x0, y0, z0)
 	end
 end
 
-local OFFSET_EASE = 0.7 -- where no ground fits, the offset from the route's line shrinks by this each point
+local CORNER_SNAP = 3 -- yards from a corner's layer the walked height may be before it goes back on it
+local UNSURE_HOLE = 2 -- yards over no known ground after which a dot's height is a guess
+local LOCAL_EVERY, LOCAL_MOVE = 0.5, 2 -- seconds, yards: how often the way to the end of the leg is looked at again
 
--- SamplePath from the player at (x0, y0) straight to the next corner and on, with the ground height under each
--- point from the height map, starting from the player's ground height z0.
--- On a walkable route each height is predicted as the route's straight line between corners plus the offset
--- the ground had from that line at the point before. Following the offset rather than the height keeps the
--- route's layer where layers part slowly (a ramp down into a tunnel under the hillside, a bridge ramp); where
--- no ground fits (a narrow bridge between samples) it eases back to the line, which is on the route's layer
--- at every corner. A straight-line path (no corner heights) just continues the last height.
--- Without height data (or z0) the heights are the path's own. fn also gets the straight-line height.
+-- The player's own way to the end of the leg they are on: straight when that walks (the usual: on or near the
+-- route line), else around what is in the way (Graph.LocalPath: a drop, a wall, the other side of a house).
+-- Corners after the player's spot, or nil for straight.
+local localLeg = {}
+function ns.LocalLeg(p, instance, x0, y0, z0)
+	local i = p.seg + 1
+	local bx, by, bz = p.x[i], p.y[i], p.z and p.z[i]
+	if not bz or not p.graph or not z0 then return end
+	local c = localLeg
+	if c.pathId == p.id and c.seg == p.seg and (dist(c.x0, c.y0, x0, y0) < LOCAL_MOVE or GetTime() - c.t < LOCAL_EVERY) then
+		return c.corners
+	end
+	local z, fell, lost = ns.Graph.Walk(instance, x0, y0, z0, bx, by)
+	local corners
+	if fell or lost or abs(z - bz) > CORNER_SNAP then corners = ns.Graph.LocalPath(instance, x0, y0, z0, bx, by, bz) end
+	c.pathId, c.seg, c.x0, c.y0, c.t, c.corners = p.id, p.seg, x0, y0, GetTime(), corners
+	return corners
+end
+
+-- SamplePath from the player at (x0, y0) to the end of the leg (around what is in the way: ns.LocalLeg) and on, with
+-- the ground height under each point walked on the walk grid from the player's height z0 (Graph.Walk: up stairs,
+-- along a bridge and not the river under it), back on each corner's own layer at the corner (a graph route's corners
+-- are on its layers). Without ground data (or z0) the heights are the path's own. fn(x, y, z, along, lineZ, unsure)
+-- as SamplePath's, lineZ the height on the straight line between corners, unsure where the walk has gone more than
+-- UNSURE_HOLE yards over no known ground (a slope too steep for the navmesh, the way off the graph to a target):
+-- the height kept from before it, not the ground's.
 function ns.SampleGround(p, instance, x0, y0, z0, spacing, maxDist, fn)
 	if not z0 or not ns.Graph.HasGround(instance) then
 		local _, _, lineZ0 = ns.PointOnSeg(p, p.seg, p.segT or 0)
 		return ns.SamplePath(p, spacing, maxDist, function(x, y, z, along) return fn(x, y, z, along, z) end, x0, y0, z0 or lineZ0)
 	end
+	if not p or not p.seg then return end
 	local anchored = p.graph and p.z
-	local offset, rx, ry = 0, x0, y0
-	ns.SamplePath(p, spacing, maxDist, function(x, y, lineZ, along)
-		local z, guess = ns.Graph.GroundZ(instance, x, y, lineZ + offset, dist(rx, ry, x, y))
-		if not z then
-			if anchored then offset = offset * OFFSET_EASE end
-			z = not anchored and guess or lineZ + offset
+	-- the dots' line: the player's own way to the end of the leg, then the route's corners
+	local xs, ys, zs = {}, {}, {}
+	for _, c in ipairs(ns.LocalLeg(p, instance, x0, y0, z0) or {}) do
+		xs[#xs + 1], ys[#ys + 1] = c[1], c[2]
+	end
+	if #xs > 0 then xs[#xs], ys[#ys] = nil, nil end -- the last is the leg's end, from the route below
+	for i = p.seg + 1, p.n do
+		xs[#xs + 1], ys[#ys + 1], zs[#xs + 1] = p.x[i], p.y[i], anchored and p.z[i] or false
+	end
+	local along, nextS, z, lineA = 0, spacing, z0, z0
+	local ax, ay = x0, y0
+	local done, hole = false, 0
+	for i = 1, #xs do
+		local bx, by = xs[i], ys[i]
+		local L = dist(ax, ay, bx, by)
+		local lineB = zs[i] or lineA
+		local prevD, prevZ = 0, z
+		z = ns.Graph.Walk(instance, ax, ay, z, bx, by, function(_, _, wz, d, overHole)
+			hole = overHole and hole + d - prevD or 0
+			while nextS <= along + d + 1e-6 do
+				if nextS > maxDist then done = true return false end
+				local u = (nextS - along - prevD) / max(d - prevD, 1e-6)
+				local t = (nextS - along) / max(L, 1e-6)
+				if fn(ax + (bx - ax) * t, ay + (by - ay) * t, prevZ + (wz - prevZ) * u, nextS, lineA + (lineB - lineA) * t,
+						hole > UNSURE_HOLE) == false then
+					done = true
+					return false
+				end
+				nextS = nextS + spacing
+			end
+			prevD, prevZ = d, wz
+		end)
+		along = along + L
+		if done or along >= maxDist then return end
+		if zs[i] then -- after a way over no known ground, the corner's layer wherever it is
+			local cz = ns.Graph.GroundZ(instance, bx, by, zs[i], 0)
+			if cz and (abs(cz - z) <= CORNER_SNAP or hole > 0) then z = cz elseif hole > 0 then z = zs[i] end
+			hole = 0
 		end
-		offset, rx, ry = z - lineZ, x, y
-		return fn(x, y, z, along, lineZ)
-	end, x0, y0, z0)
+		ax, ay, lineA = bx, by, lineB
+	end
 end
 
 function ns.SetPath(p, fromGraph)
@@ -719,40 +771,32 @@ function ns.GoService(word)
 		not trip and "" or trip.cost < 60 and ", under a minute away" or format(", about %d min away", floor(trip.cost / 60 + 0.5))))
 end
 
--- The game gives addons no player height, so follow the ground under the player on the height map from tick
--- to tick: the layer that continues from the last height (a bridge, not the river below it), predicted along
--- the route's straight line when on a walkable route (see SampleGround), jumping to the nearest layer only
--- after a moment without one (a fall, a teleport).
+-- The game gives addons no player height, so walk the ground under the player on the walk grid from tick to tick
+-- (Graph.Walk: up and down the ground the feet are on, falling where it drops away, onto the nearest level where
+-- it has none). After a /reload or a login
+-- it starts where the player stood at the logout; after a teleport, on the layer most path nodes around are on
+-- (the floor of a building, the halls under a mountain).
 function ns.TrackGround(px, py, instance)
 	local pl = ns.player
-	local moved = pl.gx and pl.ginstance == instance and sqrt((px - pl.gx) ^ 2 + (py - pl.gy) ^ 2)
-	local ref = moved and moved < 40 and pl.z or nil
-	local p = ns.path
-	local onRoute = p and p.graph and p.seg and (p.off or huge) < 10
-	local lineZ = onRoute and select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))
-	local pred, reach = ref, moved
+	local moved = pl.gx and pl.ginstance == instance and pl.z and sqrt((px - pl.gx) ^ 2 + (py - pl.gy) ^ 2)
 	local saved = not pl.gx and ns.db.ground
-	if saved and saved[1] == instance and sqrt((px - saved[2]) ^ 2 + (py - saved[3]) ^ 2) < 3 then
-		pred, reach = saved[4], 0 -- after a /reload or a login: where the player stood at the logout
-	elseif not ref then
-		-- first height (a teleport, or no saved one): the layer most path nodes around are on, which picks the
-		-- floor of a building or the halls under a mountain, then the ground under the player within a few
-		-- yards of it. Not the route's: a route can start on another layer (it is planned from this height).
-		pred, reach = ns.Graph.LikelyZ(instance, px, py), 6
-	elseif lineZ and pl.linePath == p.id then
-		pred = lineZ + ref - pl.lineZ
+	local z
+	if moved and moved < 40 then
+		local lost
+		z, _, lost = ns.Graph.Walk(instance, pl.gx, pl.gy, pl.z, px, py)
+		-- no ground on the tracked level and none under it: the level was wrong (a jump onto something, a swim the
+		-- grid has no water for), so the nearest level there
+		if lost then z = select(2, ns.Graph.GroundZ(instance, px, py, z, 0)) or z end
+	elseif saved and saved[1] == instance and sqrt((px - saved[2]) ^ 2 + (py - saved[3]) ^ 2) < 3 then
+		z = ns.Graph.GroundZ(instance, px, py, saved[4], 0) or saved[4]
+	else
+		local likely = ns.Graph.LikelyZ(instance, px, py)
+		z = likely and (ns.Graph.GroundZ(instance, px, py, likely, 6) or likely)
 	end
-	local z, guess = ns.Graph.GroundZ(instance, px, py, pred, reach or 0)
-	if z then
-		pl.lost = nil
-	elseif guess then
-		pl.lost = pl.lost or GetTime()
-		if GetTime() - pl.lost > GROUND_LOST then z, pl.lost = guess, nil end
-	end
-	pl.z = z or ref or pred
-	pl.lineZ, pl.linePath = lineZ, lineZ and p.id
+	if not ns.Graph.HasGround(instance) then z = nil end
+	pl.z = z
 	pl.gx, pl.gy, pl.ginstance = px, py, instance
-	return pl.z
+	return z
 end
 
 local planInstance

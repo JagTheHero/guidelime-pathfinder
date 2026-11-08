@@ -1,11 +1,11 @@
 """Pack a navbuild .graph into the addon's Lua data file (format documented in Graph.lua).
 
-usage: pack.py <graph> <instance id> <map name> <out.lua> [min component nodes] [--heights <file.hgt>] [--links <links.json>]
+usage: pack.py <graph> <instance id> <map name> <out.lua> [min component nodes] [--walk <file.hgt2>] [--links <links.json>]
                [--mobs <file.mobs>]
 
 Coordinates go to HereBeDragons world space (x = world Y, y = world X). Small disconnected pieces
-(mountain ledges, roofs) and swim nodes far out at sea are dropped. With --heights, the ground heights
-(navbuild heights) of the cells near the kept nodes are packed too, for the ground dots. With --links, this
+(mountain ledges, roofs) and swim nodes far out at sea are dropped. With --walk, the walk grid (navbuild walkgrid:
+ground every 2 yards, every layer, tools/walkpack.py) of the cells near the kept nodes is packed too. With --links, this
 continent's flight paths, boats, lifts and portals (tools/links.py) are written as a plain table. With --mobs,
 the hostile mobs and patrol points (tools/mobs.py) in the kept cells and around them, by cell.
 """
@@ -16,7 +16,7 @@ import sys
 import numpy as np
 
 from graphio import read_graph
-from hgtio import read_hgt, PER
+from walkpack import pack_walk
 
 ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 OFFSET_XY, OFFSET_Z, Q = 17100, 4000, 4
@@ -84,62 +84,15 @@ def keep_mask(hx, hy, area, a, b, min_comp):
     return keep
 
 
-def pack_heights(cells, node_keys):
-    """Per cell: base(3), 64 first-layer codes in serpentine order, extra-layer count(2), extras (index(1) height(2)).
-    A code c < 62 is the previous value + (c - 31) / 2 yards, 62 is no ground, 63 is followed by an absolute
-    height(2). Absolute heights are quarter yards above the base, which is (lowest height + 4000) * 4.
-    Returns the index string (key(4) offset(4), sorted by key) and the data string."""
+def near_cells(node_keys):
+    """The cells within HEIGHT_REACH of a cell with kept nodes."""
     near = set()
     for k in node_keys:
         cx, cy = k % 1024, k // 1024
         for dx in range(-HEIGHT_REACH, HEIGHT_REACH + 1):
             for dy in range(-HEIGHT_REACH, HEIGHT_REACH + 1):
                 near.add((cx + dx) + (cy + dy) * 1024)
-    blocks = []
-    for cx, cy, n, h in cells:
-        key = cx + cy * 1024
-        if key not in near:
-            continue
-        layers, k = [], 0
-        for idx in range(PER * PER):
-            layers.append([float(v) for v in h[k:k + int(n[idx])]])
-            k += int(n[idx])
-        base = int(np.floor((min(h) + OFFSET_Z) * Q))
-        def rel(z):
-            return int(min(4094, max(0, round((z + OFFSET_Z) * Q) - base)))
-        def absz(r):
-            return (base + r) / Q - OFFSET_Z
-        codes, extras = [], []
-        last = absz(0)
-        for j in range(PER):
-            for ii in range(PER):
-                idx = j * PER + (ii if j % 2 == 0 else PER - 1 - ii)
-                ls = layers[idx]
-                if not ls:
-                    codes.append(62)
-                    continue
-                first = min(ls, key=lambda z: abs(z - last))
-                c = int(round((first - last) * 2)) + 31
-                if 0 <= c <= 61:
-                    codes.append(c)
-                    last = last + (c - 31) / 2
-                else:
-                    r = rel(first)
-                    codes += [63, r >> 6, r & 63]
-                    last = absz(r)
-                for z in ls:
-                    if z is not first:
-                        r = rel(z)
-                        extras += [idx, r >> 6, r & 63]
-        block = b64([base], 3) + b64(codes, 1) + b64([len(extras) // 3], 2) + b64(extras, 1)
-        blocks.append((key, block))
-    blocks.sort()
-    index, data, offset = [], [], 0
-    for key, block in blocks:
-        index.append(b64([key], 4) + b64([offset], 4))
-        data.append(block)
-        offset += len(block)
-    return "".join(index), "".join(data), len(blocks)
+    return near
 
 
 def pack_mobs(path, node_keys):
@@ -199,10 +152,10 @@ def lua_links(d, instance, piece_at):
 
 def main():
     args = sys.argv[1:]
-    heights = links = None
-    if "--heights" in args:
-        i = args.index("--heights")
-        heights = args[i + 1]
+    walk = links = None
+    if "--walk" in args:
+        i = args.index("--walk")
+        walk = args[i + 1]
         del args[i:i + 2]
     if "--links" in args:
         i = args.index("--links")
@@ -272,11 +225,11 @@ def main():
     c0, c1, c2 = b64(ukeys, 4), b64(ufirst, 4), b64(ucount, 2)
     cell_str = "".join(c0[i * 4:i * 4 + 4] + c1[i * 4:i * 4 + 4] + c2[i * 2:i * 2 + 2] for i in range(len(ukeys)))
 
-    hindex = hdata = ""
-    hcount = 0
-    if heights:
-        hindex, hdata, hcount = pack_heights(read_hgt(heights), set(ukeys.tolist()))
-        print("heights: %d cells, %.1f MB" % (hcount, (len(hindex) + len(hdata)) / 1e6))
+    windex = wdata = ""
+    wcount = 0
+    if walk:
+        windex, wdata, wcount, share = pack_walk(walk, near_cells(set(ukeys.tolist())))
+        print("walk grid: %d cells, %.0f%% of 8-yard blocks in full, %.1f MB" % (wcount, 100 * share, (len(windex) + len(wdata)) / 1e6))
 
     built = datetime.date.today().isoformat()
     with open(out, "w") as f:
@@ -287,10 +240,10 @@ def main():
         f.write('\tnodes = "%s",\n' % node_str)
         f.write('\tedges = "%s",\n' % edge_str)
         f.write('\tcells = "%s",\n' % cell_str)
-        if hcount:
-            f.write('\thc = %d, hs = 8,\n' % hcount)
-            f.write('\thcells = "%s",\n' % hindex)
-            f.write('\theights = "%s",\n' % hdata)
+        if wcount:
+            f.write('\twc = %d,\n' % wcount)
+            f.write('\twcells = "%s",\n' % windex)
+            f.write('\twalk = "%s",\n' % wdata)
         f.write('\tcomps = "%s",\n' % comp_str)
         if mobs:
             m, mob_str, mcell_str = pack_mobs(mobs, set(ukeys.tolist()))

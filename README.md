@@ -37,8 +37,8 @@ ext/lua51/lua51 tests/test_ground.lua addon/Guidelime_Pathfinder
 ## Rebuilding the path data
 
 The paths come from the game's own collision geometry: every map tile's terrain, buildings and doodads go
-through a Recast/Detour navmesh, which becomes a sparse walkable graph plus an 8-yard ground-height map, packed
-into the Lua data files. You need Linux, a WoW: Forever install, `cmake`, `ninja`, `g++`, and Python 3 with
+through a Recast/Detour navmesh, which becomes a sparse walkable graph plus a 2-yard walk grid (every walkable
+layer's ground height, snapped to the collision surfaces), packed into the Lua data files. You need Linux, a WoW: Forever install, `cmake`, `ninja`, `g++`, and Python 3 with
 `numpy` and `Pillow` (`scipy` for `tools/probe_fit.py`). The full extract is about 5 GB.
 
 1. Dependencies, in `ext/`:
@@ -77,18 +77,35 @@ into the Lua data files. You need Linux, a WoW: Forever install, `cmake`, `ninja
    python3 tools/mobs.py data/graph                 # hostile mobs: levels, aggro ranges, patrols
    for m in Azeroth Kalimdor; do
      build/navbuild graph data/nav/$m data/graph/$m.graph 12 data/graph/$m.pois
-     build/navbuild heights data/nav/$m data/graph/$m.hgt 12
+     build/navbuild walkgrid data/nav/$m data/graph/$m.hgt2 12 data/geo/$m
    done
    python3 tools/links.py data/graph/links.json     # flight paths, boats, zeppelins, lifts, tram, portal
    python3 tools/pack.py data/graph/Azeroth.graph 0 Azeroth addon/Guidelime_Pathfinder/Data/Azeroth.lua \
-     --heights data/graph/Azeroth.hgt --links data/graph/links.json --mobs data/graph/Azeroth.mobs
+     --walk data/graph/Azeroth.hgt2 --links data/graph/links.json --mobs data/graph/Azeroth.mobs
    python3 tools/pack.py data/graph/Kalimdor.graph 1 Kalimdor addon/Guidelime_Pathfinder/Data/Kalimdor.lua \
-     --heights data/graph/Kalimdor.hgt --links data/graph/links.json --mobs data/graph/Kalimdor.mobs
+     --walk data/graph/Kalimdor.hgt2 --links data/graph/links.json --mobs data/graph/Kalimdor.mobs
    ```
 
    `tools/build_tiles.sh` runs `navbuild` in a memory-capped systemd scope (16 GB); drop the `systemd-run`
    prefix if you have no user systemd. `tools/pois.py` reads the installed QuestieDB add-on and the CMaNGOS
    database: routes end on a graph node on the level where an NPC stands (a pier's deck, not the sea beside it).
+
+## Checking the ground dots
+
+The world's ground and how a player walks on it are both known, so the dots can be checked on simulated walks:
+`tools/simroutes.py` picks routes (random ones, half of them indoors or on stacked floors, plus fixed ones such as
+Ironforge's Great Forge down to the Hall of Thanes), `tools/simdots.lua` walks them through the add-on's own code
+(on the route line, or a few yards beside it) and writes the player's height and every dot, `navbuild simtruth`
+walks the same lines on the collision surfaces, and `tools/simreport.py` says how far off the add-on is:
+
+```sh
+python3 tools/simroutes.py build/routes.txt 100
+ext/lua51/lua51 tools/simdots.lua addon/Guidelime_Pathfinder build/routes.txt build/sim.tsv      # add 6: 6 yd beside
+build/navbuild simtruth data/geo/Azeroth build/sim.tsv 12 build/truth.tsv                         # one map at a time
+python3 tools/simreport.py build/sim.tsv build/truth.tsv 20 data/graph/Azeroth.hgt2
+```
+
+`tools/render_walk.py` draws the walk grid around a route from above.
 
 ## License
 

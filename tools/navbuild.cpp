@@ -24,6 +24,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <random>
@@ -95,6 +96,120 @@ static void loadNeighbourhood(const std::string& dir, int col, int row, Geo& out
 		seen.insert(mine.begin(), mine.end());
 	}
 }
+
+// The collision surfaces of one ADT tile, for exact ground heights: the triangles of its 3x3 neighbourhood
+// (each object once) that overlap the tile and are not walls, bucketed on a GEO_BUCKET-yard grid. Recast coords.
+static const float GEO_BUCKET = 4.0f;
+static void tileOf(float rx, float rz, int& col, int& row) { col = (int)floorf(32 - rx / TILE); row = (int)floorf(32 - rz / TILE); }
+
+struct GeoTile {
+	float x0 = 0, z0 = 0;
+	int nb = 0;
+	std::vector<float> v;
+	std::vector<int> t, start, items;
+	std::vector<unsigned char> liquid; // per kept triangle: a water (or other liquid) surface
+	bool load(const std::string& dir, int col, int row) {
+		Geo g;
+		loadNeighbourhood(dir, col, row, g);
+		x0 = (31 - col) * TILE; z0 = (31 - row) * TILE;
+		nb = (int)ceilf(TILE / GEO_BUCKET);
+		start.assign(nb * nb + 1, 0);
+		if (g.a.empty()) return false;
+		v = std::move(g.v);
+		std::vector<std::vector<int>> bucket(nb * nb);
+		size_t nt = g.a.size();
+		for (size_t i = 0; i < nt; i++) {
+			const float* a = &v[g.t[i * 3] * 3]; const float* b = &v[g.t[i * 3 + 1] * 3]; const float* c = &v[g.t[i * 3 + 2] * 3];
+			float e0[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e1[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+			float ny = e0[2] * e1[0] - e0[0] * e1[2];
+			float nx = e0[1] * e1[2] - e0[2] * e1[1], nz = e0[0] * e1[1] - e0[1] * e1[0];
+			float len = sqrtf(nx * nx + ny * ny + nz * nz);
+			if (len < 1e-8f || fabsf(ny) / len < 0.2f) continue; // a wall
+			float mnx = std::min({ a[0], b[0], c[0] }), mxx = std::max({ a[0], b[0], c[0] });
+			float mnz = std::min({ a[2], b[2], c[2] }), mxz = std::max({ a[2], b[2], c[2] });
+			if (mxx < x0 || mnx > x0 + TILE || mxz < z0 || mnz > z0 + TILE) continue;
+			int ti = (int)(t.size() / 3);
+			t.push_back(g.t[i * 3]); t.push_back(g.t[i * 3 + 1]); t.push_back(g.t[i * 3 + 2]);
+			liquid.push_back(g.a[i] == A_SWIM);
+			int bx0 = std::max(0, (int)floorf((mnx - x0) / GEO_BUCKET)), bx1 = std::min(nb - 1, (int)floorf((mxx - x0) / GEO_BUCKET));
+			int bz0 = std::max(0, (int)floorf((mnz - z0) / GEO_BUCKET)), bz1 = std::min(nb - 1, (int)floorf((mxz - z0) / GEO_BUCKET));
+			for (int bz = bz0; bz <= bz1; bz++) for (int bx = bx0; bx <= bx1; bx++) bucket[bz * nb + bx].push_back(ti);
+		}
+		for (int i = 0; i < nb * nb; i++) { start[i + 1] = start[i] + (int)bucket[i].size(); items.insert(items.end(), bucket[i].begin(), bucket[i].end()); }
+		return true;
+	}
+	// heights of the surfaces over recast (x, z); wet: whether each is a liquid's
+	void heightsAt(float x, float z, std::vector<float>& out, std::vector<unsigned char>* wet = nullptr) const {
+		out.clear();
+		if (wet) wet->clear();
+		int bx = (int)floorf((x - x0) / GEO_BUCKET), bz = (int)floorf((z - z0) / GEO_BUCKET);
+		if (bx < 0 || bz < 0 || bx >= nb || bz >= nb) return;
+		for (int k = start[bz * nb + bx], e = start[bz * nb + bx + 1]; k < e; k++) {
+			int ti = items[k];
+			const float* a = &v[t[ti * 3] * 3]; const float* b = &v[t[ti * 3 + 1] * 3]; const float* c = &v[t[ti * 3 + 2] * 3];
+			float v0x = b[0] - a[0], v0z = b[2] - a[2], v1x = c[0] - a[0], v1z = c[2] - a[2], px = x - a[0], pz = z - a[2];
+			float den = v0x * v1z - v1x * v0z;
+			if (fabsf(den) < 1e-9f) continue;
+			float u = (px * v1z - v1x * pz) / den, w = (v0x * pz - px * v0z) / den;
+			if (u < -1e-4f || w < -1e-4f || u + w > 1 + 1e-4f) continue;
+			out.push_back(a[1] + u * (b[1] - a[1]) + w * (c[1] - a[1]));
+			if (wet) wet->push_back(liquid[ti]);
+		}
+	}
+};
+
+static const float Builder_WALK_STEP = 2.0f; // Builder::WALK_STEP (Builder comes later)
+
+// Per-thread cache of loaded GeoTiles (a few at a time: city tiles are big).
+struct GeoCache {
+	std::string dir;
+	std::vector<std::pair<std::pair<int, int>, std::unique_ptr<GeoTile>>> tiles;
+	std::vector<float> hs;
+	const GeoTile* at(float rx, float rz) {
+		int col, row; tileOf(rx, rz, col, row);
+		for (size_t i = 0; i < tiles.size(); i++) if (tiles[i].first == std::make_pair(col, row)) {
+			if (i) std::swap(tiles[i], tiles[0]);
+			return tiles[0].second.get();
+		}
+		auto g = std::make_unique<GeoTile>();
+		g->load(dir, col, row);
+		tiles.insert(tiles.begin(), std::make_pair(std::make_pair(col, row), std::move(g)));
+		if (tiles.size() > 4) tiles.pop_back();
+		return tiles[0].second.get();
+	}
+	// the surface nearest height h within [h - below, h + above] (the higher one of two as near), or NAN
+	float near(float rx, float rz, float h, float below, float above) {
+		at(rx, rz)->heightsAt(rx, rz, hs);
+		float best = NAN;
+		for (float z : hs) if (z >= h - below && z <= h + above && (best != best || fabsf(z - h) < fabsf(best - h) - 1e-3f || (fabsf(fabsf(z - h) - fabsf(best - h)) <= 1e-3f && z > best))) best = z;
+		return best;
+	}
+	std::vector<unsigned char> wet;
+	// walking on from height h: where the feet land at (rx, rz): the highest ground at most CLIMB above h
+	// (stairs, kerbs, a rock), else falling to the highest below; swimming on the water over it where that is over
+	// SWIM_DEPTH deep;
+	// h itself over a hole
+	float step(float rx, float rz, float h) {
+		static const float SWIM_DEPTH = 1.5f;
+		at(rx, rz)->heightsAt(rx, rz, hs, &wet);
+		float ground = -FLT_MAX, water = FLT_MAX;
+		for (size_t i = 0; i < hs.size(); i++) if (!wet[i] && hs[i] <= h + AGENT_CLIMB) ground = std::max(ground, hs[i]);
+		for (size_t i = 0; i < hs.size(); i++) if (wet[i] && hs[i] > ground) water = std::min(water, hs[i]); // a swimmer floats up
+		if (water < FLT_MAX && water > ground + SWIM_DEPTH) return water;
+		if (ground < h - Builder_WALK_STEP) { // a crack between two floor pieces or bridge planks is no hole: a body is
+			// CRACK yards across
+			static const float CRACK = 1.0f;
+			float best = -FLT_MAX;
+			for (int k = 0; k < 8; k++) {
+				float a = k * (float)M_PI / 4, x = rx + CRACK * cosf(a), z = rz + CRACK * sinf(a);
+				at(x, z)->heightsAt(x, z, hs, &wet);
+				for (size_t i = 0; i < hs.size(); i++) if (hs[i] <= h + AGENT_CLIMB && hs[i] >= h - Builder_WALK_STEP) best = std::max(best, hs[i]);
+			}
+			if (best > -FLT_MAX) return best;
+		}
+		return ground == -FLT_MAX ? h : ground;
+	}
+};
 
 struct NavBlob { int tx, ty; std::vector<unsigned char> data; };
 
@@ -1365,6 +1480,10 @@ int main(int argc, char** argv) {
 		printf("straight b->a %d flags %d\n", s2, fl);
 		bool w = b.walk(q, n[0].ref, n[0].p, n[1].ref, n[1].p, len, dev, fl);
 		printf("walk %d len %.1f direct %.1f dev %.1f flags %d\n", w, len, dtVdist(n[0].p, n[1].p), dev, fl);
+		float at[3]; bool drop = false;
+		bool level = b.walksLevel(q, n[0].p, n[1].p, at, drop);
+		printf("walks level %d%s\n", level, level ? "" : drop ? " (drop)" : " (hole)");
+		if (!level) printf("  lost at (%.1f %.1f %.1f)\n", at[2], at[0], at[1]);
 		if (getenv("LINE_PROFILE")) { // every walkable layer under the line, every yard: "profile <yards> <height>..."
 			float d = dtVdist2D(n[0].p, n[1].p);
 			for (int k = 0; k <= (int)d; k++) {
@@ -1478,6 +1597,303 @@ int main(int argc, char** argv) {
 			printf("\n");
 		}
 		fclose(f);
+		return 0;
+	}
+	if (cmd == "walkgrid") { // navbuild walkgrid <nav_dir> <out.hgt2> <threads> <geo_dir>: the addon's walk grid
+		// Every WG_HS yards on a grid aligned with the addon's 64-yard cells (HereBeDragons coords + 17100): every
+		// walkable layer there or within REACH_POLY yards (a ramp or walkway narrower than the grid), from the navmesh, at the height of the collision surface
+		// it lies on (the navmesh is within half a yard of it, but up to two over rough ground). Points next to walkable ones that the navmesh
+		// misses (it keeps half a yard off walls and edges, and narrow walkways may fall between points) get the
+		// surface continuing a neighbour's layer. Under water only the surface counts (a swimmer stays on it). HGT2 file: cell count, then per cell: cx, cy (int32),
+		// WG_PER x WG_PER layer counts (uint8, rows of x), the heights (float32).
+		static const float WG_HS = 2.0f, OFF = 17100.0f, MERGE = 1.5f, SNAP = 1.0f, SNAP_BELOW = 2.5f, GROW = 1.25f, UNDER_WATER = 40.0f, REACH_POLY = 1.0f, SWIM_DEPTH = 1.5f;
+		static const int WG_PER = 32, MAX_LAYERS = 6, B = WG_PER + 2;
+		Builder b;
+		b.nav = loadNavMesh(argv[2]);
+		if (!b.nav) return 1;
+		b.labelComponents();
+		std::string geoDir = argv[5];
+		int minx = INT32_MAX, maxx = INT32_MIN, minz = INT32_MAX, maxz = INT32_MIN;
+		for (int i = 0; i < b.nav->getMaxTiles(); i++) {
+			const dtMeshTile* t = ((const dtNavMesh*)b.nav)->getTile(i);
+			if (!t || !t->header) continue;
+			minx = std::min(minx, (int)floorf((t->header->bmin[0] + OFF) / CELL)); maxx = std::max(maxx, (int)floorf((t->header->bmax[0] + OFF) / CELL));
+			minz = std::min(minz, (int)floorf((t->header->bmin[2] + OFF) / CELL)); maxz = std::max(maxz, (int)floorf((t->header->bmax[2] + OFF) / CELL));
+		}
+		struct Cell { int cx, cy; unsigned char n[WG_PER * WG_PER]; std::vector<float> h; };
+		std::vector<Cell> out;
+		std::mutex om;
+		std::atomic<int> nextBand{ minz };
+		std::atomic<long> samples{ 0 }, grown{ 0 }, snapped{ 0 }, layered{ 0 };
+		static const int BAND = 8;
+		auto worker = [&]() {
+			dtNavMeshQuery* q = dtAllocNavMeshQuery();
+			q->init(b.nav, 4096);
+			std::vector<dtPolyRef> refs(8192);
+			GeoCache gc{ geoDir };
+			std::vector<float> ghs;
+			std::vector<unsigned char> gwet;
+			std::vector<std::vector<float>> grid(B * B);
+			for (;;) {
+				int y0 = nextBand.fetch_add(BAND);
+				if (y0 > maxz) break;
+				std::vector<Cell> local;
+				for (int cy = y0; cy < y0 + BAND && cy <= maxz; cy++) for (int cx = minx; cx <= maxx; cx++) {
+					float c[3] = { (cx + 0.5f) * CELL - OFF, 0, (cy + 0.5f) * CELL - OFF };
+					float ext[3] = { CELL / 2 + 2, 5000, CELL / 2 + 2 };
+					int n = 0;
+					q->queryPolygons(c, ext, &b.filter, refs.data(), &n, (int)refs.size());
+					bool any = false;
+					for (int i = 0; i < n && !any; i++) { int ci = b.compOf(refs[i]); any = ci >= 0 && b.compArea[ci] >= MIN_ISLAND; }
+					if (!any) continue;
+					// navmesh layers on the cell's points and a one-point border, snapped to the surfaces
+					for (int j = -1; j <= WG_PER; j++) for (int i = -1; i <= WG_PER; i++) {
+						auto& L = grid[(j + 1) * B + (i + 1)];
+						L.clear();
+						float p[3] = { cx * CELL - OFF + i * WG_HS, 0, cy * CELL - OFF + j * WG_HS };
+						float e[3] = { REACH_POLY, 5000, REACH_POLY };
+						int m = 0;
+						dtPolyRef r[128];
+						q->queryPolygons(p, e, &b.filter, r, &m, 128);
+						std::vector<std::pair<float, bool>> hs; // height, on water
+						for (int k = 0; k < m; k++) {
+							int ci = b.compOf(r[k]);
+							float h, cp[3];
+							bool over;
+							if (ci < 0 || b.compArea[ci] < MIN_ISLAND) continue;
+							if (dtStatusFailed(q->getPolyHeight(r[k], p, &h))) { // within REACH_POLY of a polygon: its nearest point's height
+								float pp[3] = { p[0], 0, p[2] };
+								if (dtStatusFailed(q->closestPointOnPoly(r[k], pp, cp, &over)) || dtVdist2D(cp, pp) > REACH_POLY) continue;
+								h = cp[1];
+							}
+							hs.push_back({ h, b.polyArea(r[k]) == A_SWIM });
+						}
+						std::sort(hs.begin(), hs.end());
+						// a swimmer stays at the surface: no ground under water within UNDER_WATER yards of it
+						float water = -FLT_MAX;
+						for (auto& hw : hs) if (hw.second) water = std::max(water, hw.first);
+						gc.at(p[0], p[2])->heightsAt(p[0], p[2], ghs, &gwet);
+						for (auto& hw : hs) {
+							float h = hw.first;
+							if (!hw.second && h < water && h > water - UNDER_WATER) continue;
+							if (!L.empty() && h - L.back() <= MERGE) continue;
+							float s = gc.near(p[0], p[2], h, SNAP_BELOW, SNAP);
+							if (s == s) { h = s; if (i >= 0 && j >= 0 && i < WG_PER && j < WG_PER) snapped++; }
+							// ground under water deeper than SWIM_DEPTH: the swimmer is at the surface (the liquid the
+							// geometry has over it, which the navmesh may not)
+							float surface = FLT_MAX;
+							for (size_t k = 0; k < ghs.size(); k++) if (gwet[k] && ghs[k] > h && ghs[k] < h + UNDER_WATER) surface = std::min(surface, ghs[k]);
+							if (surface < FLT_MAX && surface - h > SWIM_DEPTH) h = surface;
+							bool dup = false;
+							for (float o : L) dup = dup || fabsf(o - h) <= MERGE;
+							if (!dup) L.push_back(h);
+						}
+						std::sort(L.begin(), L.end());
+					}
+					Cell cell{ cx, cy, {}, {} };
+					bool hit = false;
+					for (int j = 0; j < WG_PER; j++) for (int i = 0; i < WG_PER; i++) {
+						std::vector<float> L = grid[(j + 1) * B + (i + 1)];
+						if (L.empty()) { // grow from walkable neighbours onto the surfaces continuing their layers
+							float p[3] = { cx * CELL - OFF + i * WG_HS, 0, cy * CELL - OFF + j * WG_HS };
+							for (int dj = -1; dj <= 1; dj++) for (int di = -1; di <= 1; di++) {
+								for (float hn : grid[(j + 1 + dj) * B + (i + 1 + di)]) {
+									float s = gc.near(p[0], p[2], hn, GROW, GROW);
+									if (s != s) continue;
+									bool dup = false;
+									for (float h : L) dup = dup || fabsf(h - s) <= MERGE;
+									if (!dup) L.push_back(s);
+								}
+							}
+							std::sort(L.begin(), L.end());
+							if (!L.empty()) grown++;
+						}
+						if ((int)L.size() > MAX_LAYERS) L.resize(MAX_LAYERS);
+						cell.n[j * WG_PER + i] = (unsigned char)L.size();
+						cell.h.insert(cell.h.end(), L.begin(), L.end());
+						if (!L.empty()) { hit = true; samples++; }
+						if (L.size() > 1) layered++;
+					}
+					if (hit) local.push_back(std::move(cell));
+				}
+				std::lock_guard<std::mutex> l(om);
+				for (auto& cl : local) out.push_back(std::move(cl));
+			}
+			dtFreeNavMeshQuery(q);
+		};
+		std::vector<std::thread> pool;
+		for (int i = 0; i < std::max(1, threads); i++) pool.emplace_back(worker);
+		for (auto& t : pool) t.join();
+		std::sort(out.begin(), out.end(), [](const Cell& a, const Cell& c) { return a.cy != c.cy ? a.cy < c.cy : a.cx < c.cx; });
+		FILE* f = fopen(argv[3], "wb");
+		uint32_t nc = (uint32_t)out.size();
+		fwrite("HGT2", 1, 4, f);
+		fwrite(&nc, 4, 1, f);
+		for (auto& cl : out) {
+			int32_t xy[2] = { cl.cx, cl.cy };
+			fwrite(xy, 4, 2, f);
+			fwrite(cl.n, 1, WG_PER * WG_PER, f);
+			fwrite(cl.h.data(), 4, cl.h.size(), f);
+		}
+		fclose(f);
+		printf("walk grid: %u cells, %ld points with ground (%ld snapped to a surface, %ld grown from a neighbour), %ld with more than one layer\n",
+			nc, samples.load(), snapped.load(), grown.load(), layered.load());
+		return 0;
+	}
+	if (cmd == "geoat") { // navbuild geoat <geo_dir> <hbdX> <hbdY>: the collision surfaces over a point
+		GeoCache gc{ argv[2] };
+		float rx = (float)atof(argv[3]), rz = (float)atof(argv[4]);
+		int col, row; tileOf(rx, rz, col, row);
+		const GeoTile* t = gc.at(rx, rz);
+		std::vector<float> hs;
+		std::vector<unsigned char> wet;
+		t->heightsAt(rx, rz, hs, &wet);
+		printf("tile %d_%d (%zu triangles):", col, row, t->t.size() / 3);
+		for (size_t i = 0; i < hs.size(); i++) printf(" %.2f%s", hs[i], wet[i] ? "(water)" : "");
+		printf("\n");
+		return 0;
+	}
+	if (cmd == "geoats") { // navbuild geoats <geo_dir> < points: geoat for each "hbdX hbdY" line, "x y h h ..." out
+		GeoCache gc{ argv[2] };
+		float rx, rz;
+		std::vector<float> hs;
+		while (scanf("%f %f", &rx, &rz) == 2) {
+			hs.clear();
+			const GeoTile* t = gc.at(rx, rz);
+			if (t) t->heightsAt(rx, rz, hs, nullptr);
+			printf("%.2f %.2f", rx, rz);
+			for (float h : hs) printf(" %.2f", h);
+			printf("\n");
+		}
+		return 0;
+	}
+	if (cmd == "simtruth") { // navbuild simtruth <geo_dir> <sim.tsv> <threads> <out.tsv>: true ground for tools/simdots.lua
+		// Walks the collision surfaces half a yard at a time (GeoCache::step: up stairs and kerbs, down ledges)
+		// along each route from its first corner (back on each corner's height at the corner), and along each
+		// step's dot line from the player's true height, and writes "P route step x y along addonZ trueZ localCorners
+		// offLevel" (offLevel: a spot beside the route nobody stands on at the route's level) and
+		// "D route step along x y addonZ trueZ nearestZ" (nearestZ: the surface nearest the addon's height there).
+		if (argc < 6) return 1;
+		struct Step { int step; float x, y, along, pz; int k; float ax, ay; std::vector<std::array<float, 2>> lc; std::vector<std::array<float, 4>> dots; std::vector<std::array<float, 2>> truth; float pTrue; bool offLevel = false; };
+		struct Route { int id; std::vector<std::array<float, 3>> c; std::vector<Step> steps; };
+		std::vector<Route> routes;
+		std::unordered_map<int, size_t> byId;
+		FILE* f = fopen(argv[3], "r");
+		if (!f) return 1;
+		static char line[1 << 16];
+		while (fgets(line, sizeof line, f)) {
+			if (line[0] == 'R') {
+				Route r; char* p = line + 2; int inst, used;
+				if (sscanf(p, "%d %d %*s%n", &r.id, &inst, &used) < 2) continue;
+				p += used;
+				float x, y, z;
+				while (sscanf(p, "%f %f %f%n", &x, &y, &z, &used) == 3) { r.c.push_back({ x, y, z }); p += used; }
+				byId[r.id] = routes.size();
+				routes.push_back(std::move(r));
+			} else if (line[0] == 'P') {
+				Step s; int id, nlc = 0, used = 0;
+				if (sscanf(line + 2, "%d %d %f %f %f %f %d %f %f %d%n", &id, &s.step, &s.x, &s.y, &s.along, &s.pz, &s.k, &s.ax, &s.ay, &nlc, &used) == 10) {
+					char* q = line + 2 + used;
+					for (int k = 0; k < nlc; k++) { float cx, cy; int u2; if (sscanf(q, "%f %f%n", &cx, &cy, &u2) != 2) break; s.lc.push_back({ cx, cy }); q += u2; }
+					routes[byId[id]].steps.push_back(std::move(s));
+				}
+			} else if (line[0] == 'D') {
+				int id, step; float a, x, y, z;
+				if (sscanf(line + 2, "%d %d %f %f %f %f", &id, &step, &a, &x, &y, &z) == 6) {
+					Route& r = routes[byId[id]];
+					if (!r.steps.empty() && r.steps.back().step == step) r.steps.back().dots.push_back({ a, x, y, z });
+				}
+			}
+		}
+		fclose(f);
+		// HBD (x = world Y, y = world X) to recast (world Y, Z, world X)
+		auto rc = [](float x, float y, float z, float* o) { o[0] = x; o[1] = z; o[2] = y; };
+		// walk a polyline (recast points) from height h, calling at(alongYards, height) every half yard; at each
+		// corner back on the corner's own surface when within reach
+		auto follow = [&](GeoCache& gc, const std::vector<std::array<float, 3>>& pts, float h, float maxAlong, const std::function<void(float, float)>& at) {
+			float along = 0;
+			at(0, h);
+			for (size_t i = 0; i + 1 < pts.size() && along < maxAlong; i++) {
+				const float* a = pts[i].data(); const float* e = pts[i + 1].data();
+				float len = dtVdist2D(a, e);
+				int n = std::max(1, (int)ceilf(len / 0.5f));
+				for (int k = 1; k <= n; k++) {
+					float t = (float)k / n;
+					h = gc.step(a[0] + (e[0] - a[0]) * t, a[2] + (e[2] - a[2]) * t, h);
+					at(along + len * t, h);
+				}
+				along += len;
+				float ce = gc.near(e[0], e[2], e[1], 6.0f, 6.0f); // a corner's navmesh height is only near the surface
+				if (ce == ce && fabsf(ce - h) <= Builder::WALK_END * 2) h = ce;
+			}
+		};
+		std::atomic<size_t> next{ 0 };
+		auto worker = [&]() {
+			GeoCache gc{ argv[2] };
+			for (;;) {
+				size_t ri = next++;
+				if (ri >= routes.size()) break;
+				Route& r = routes[ri];
+				std::vector<std::array<float, 3>> pts;
+				for (auto& c : r.c) { float o[3]; rc(c[0], c[1], c[2], o); pts.push_back({ o[0], o[1], o[2] }); }
+				float h0 = gc.near(pts[0][0], pts[0][2], pts[0][1], 6.0f, 6.0f);
+				std::vector<std::pair<float, float>> prof;
+				follow(gc, pts, h0 == h0 ? h0 : pts[0][1], 1e9f, [&](float a, float h) { prof.push_back({ a, h }); });
+				auto profileAt = [&](float a) {
+					auto it = std::lower_bound(prof.begin(), prof.end(), std::make_pair(a, -FLT_MAX));
+					if (it == prof.end()) return prof.back().second;
+					return it->second;
+				};
+				for (auto& s : r.steps) {
+					// the player: on the route line's height at their spot along it, then over to beside it
+					float lineZ = profileAt(s.along);
+					std::vector<std::array<float, 3>> side;
+					float o[3];
+					rc(s.ax, s.ay, lineZ, o); side.push_back({ o[0], o[1], o[2] });
+					rc(s.x, s.y, lineZ, o); side.push_back({ o[0], o[1], o[2] });
+					s.pTrue = lineZ;
+					float lastH = lineZ, drop = 0;
+					follow(gc, side, lineZ, 1e9f, [&](float, float h) { drop = std::max(drop, fabsf(h - lastH)); lastH = h; s.pTrue = h; });
+					s.offLevel = drop > Builder::WALK_STEP; // nobody stands there on the route's level (a ledge, a canal)
+					// the dots' line: the player's own way to the end of the leg (the corner after the one they passed), then on
+					std::vector<std::array<float, 3>> line;
+					rc(s.x, s.y, s.pTrue, o); line.push_back({ o[0], o[1], o[2] });
+					for (auto& c : s.lc) { rc(c[0], c[1], s.pTrue, o); line.push_back({ o[0], o[1], o[2] }); }
+					if (!s.lc.empty()) line.pop_back(); // the last is the leg's end
+					int first = 1;
+					{ // the end of the player's leg: the route corner after their spot along it
+						float acc = 0;
+						for (size_t k = 1; k < r.c.size(); k++) {
+							acc += dtVdist2D(pts[k - 1].data(), pts[k].data());
+							if (acc >= s.along - 1e-3f) { first = (int)k + 1; break; }
+							first = (int)k + 1;
+						}
+					}
+					for (int k = first; k <= (int)r.c.size(); k++) line.push_back(pts[k - 1]);
+					float maxA = 0;
+					for (auto& d : s.dots) maxA = std::max(maxA, d[0]);
+					std::vector<std::pair<float, float>> dp;
+					follow(gc, line, s.pTrue, maxA + 1, [&](float a, float h) { dp.push_back({ a, h }); });
+					for (auto& d : s.dots) {
+						auto it = std::lower_bound(dp.begin(), dp.end(), std::make_pair(d[0] - 0.26f, -FLT_MAX));
+						float zt = it == dp.end() ? NAN : it->second;
+						float p[3]; rc(d[1], d[2], d[3], p);
+						s.truth.push_back({ zt, gc.near(p[0], p[2], d[3], 50, 50) });
+					}
+				}
+			}
+		};
+		std::vector<std::thread> pool;
+		for (int i = 0; i < std::max(1, threads); i++) pool.emplace_back(worker);
+		for (auto& t : pool) t.join();
+		FILE* out = fopen(argv[5], "w");
+		for (auto& r : routes) for (auto& s : r.steps) {
+			fprintf(out, "P %d %d %.2f %.2f %.2f %.2f %.2f %d %d\n", r.id, s.step, s.x, s.y, s.along, s.pz, s.pTrue, (int)s.lc.size(), (int)s.offLevel);
+			for (size_t i = 0; i < s.dots.size(); i++)
+				fprintf(out, "D %d %d %.2f %.2f %.2f %.2f %.2f %.2f\n", r.id, s.step, s.dots[i][0], s.dots[i][1], s.dots[i][2], s.dots[i][3], s.truth[i][0], s.truth[i][1]);
+		}
+		fclose(out);
+		printf("simtruth: %zu routes\n", routes.size());
 		return 0;
 	}
 	if (cmd == "heights") {
