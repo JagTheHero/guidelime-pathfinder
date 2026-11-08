@@ -50,26 +50,53 @@ for _ = 1, 10 do worst, count = dotError() end
 check(count > 5, "dots drawn (" .. count .. ")")
 check(worst < 1.5, string.format("dots match the true projection with the right fov (worst %.2f px)", worst))
 
--- wrong fov: dots still pinned near the marker but off elsewhere; calibration must fix it
-M.trueFov = 100
-worst = dotError()
-print(string.format("     with fov 100 but assuming 90: worst %.1f px", worst))
-M.mouselook = true
-for i = 1, 40 do
-	M.facing = 0.25 + 0.02 * math.sin(i)
-	M.trueYaw = M.facing
-	M.truePitch = 0.35 + 0.1 * math.cos(i * 0.7)
-	M.Step(1 / 60)
+-- the field of view follows the cameraFov CVar
+M.cvarFov, M.truePitch = 75, 0.25
+for _ = 1, 3 do worst, count = dotError() end
+check(count > 5 and worst < 1.5, string.format("dots match with cameraFov 75 (worst %.2f px)", worst))
+M.cvarFov = 90
+
+-- A marker nearer than the camera: two cameras put it on the same spot, the real one and its mirror looking
+-- back from the far side of the player. The real one wins, also right after the camera looked the other way.
+local function ahead(dist, ang) -- a straight-line path (no path data on instance 5)
+	local a = M.facing + math.rad(ang)
+	GuidelimeArrow.element = { wx = M.px + dist * math.sin(a), wy = M.py + dist * math.cos(a), instance = 5 }
+	for _ = 1, 3 do M.Step(0.1) end
 end
-M.mouselook = false
-check(ns.db.calibF ~= nil, "field of view learned while mouse-steering")
-if ns.db.calibF then
-	local learned = math.deg(2 * math.atan(0.5 / ns.db.calibF))
-	check(math.abs(learned - 100) < 1, string.format("learned fov %.2f (true 100)", learned))
+M.instance, M.pz = 5, 0
+M.facing, M.trueYaw, M.truePitch, M.zoom = 3.79, 3.79, 0.28, 15
+ahead(11.6, 3)
+for _ = 1, 3 do worst, count = dotError() end
+check(count > 0 and worst < 1.5, string.format("marker 11.6 yd ahead, camera 15 yd behind: the real camera (worst %.2f px)", worst))
+M.trueYaw, M.truePitch = M.facing + math.pi - 0.2, 0.35 -- the camera swung round to the front
+for _ = 1, 3 do dotError() end
+M.trueYaw, M.truePitch = M.facing + 0.1, 0.28 -- and back behind
+for _ = 1, 2 do worst, count = dotError() end
+check(count > 0 and worst < 1.5, string.format("after looking at the character from the front: the real camera again (worst %.2f px)", worst))
+local cases, bad, sweepWorst = 0, 0, 0
+for _, zoom in ipairs({ 5, 12, 25 }) do
+	for _, pitch in ipairs({ -0.1, 0.15, 0.35, 0.7, 1.1 }) do
+		for _, off in ipairs({ -50, -20, 0, 20, 50 }) do
+			for _, mk in ipairs({ { 7, 0 }, { 12, 30 }, { 20, -35 }, { 40, 10 } }) do
+				if 1.9 + zoom * math.sin(pitch) > -0.5 then -- the game keeps the camera over the floor
+					M.zoom, M.truePitch, M.trueYaw = zoom, pitch, M.facing + math.rad(off)
+					ahead(mk[1], off + mk[2])
+					worst, count = dotError()
+					worst, count = dotError()
+					if count > 0 then
+						cases = cases + 1
+						sweepWorst = math.max(sweepWorst, worst)
+						if worst > 2 then bad = bad + 1 end
+					end
+				end
+			end
+		end
+	end
 end
-M.trueYaw, M.truePitch = -0.2, 0.5
-for _ = 1, 5 do worst, count = dotError() end
-check(worst < 1.5, string.format("dots match after calibration (worst %.2f px, %d dots)", worst, count))
+check(cases > 150 and bad == 0, string.format("cameras turned up to 50 degrees from the facing, at any pitch and zoom: %d of %d off (worst %.1f px)", bad, cases, sweepWorst))
+M.instance, M.trueYaw, M.truePitch, M.facing, M.zoom = 1, -0.2, 0.3, 0.4, 12
+GuidelimeArrow.element = { wx = -150, wy = 300, instance = 1 }
+for _ = 1, 3 do M.Step(0.1) end
 
 -- zoomed in to first person
 M.zoom = 0
@@ -244,6 +271,7 @@ if ns.Graph.Has(0) then
 	if p and p.graph then
 		wx, wy = M.WaypointWorld()
 		check(math.abs(wx - p.x[p.k]) < 1 and math.abs(wy - p.y[p.k]) < 1, "marker on the next corner, not the target")
+
 		local function mapDots() local n = 0 for _ in pairs(M.pins.map) do n = n + 1 end return n end
 		local dotsBefore = mapDots()
 		WorldMapFrame = M.NewFrame()
@@ -321,6 +349,47 @@ if ns.Graph.Has(0) then
 		pr = ns.db.probes[#ns.db.probes]
 		check(pr.result == "done" and pr.player.graphZ and math.abs(pr.points[1].w[3] - M.pz) < 5 and M.waypoint == nil,
 			string.format("probe works without a guide target (height %.1f vs %.1f) and clears the marker after", pr.player.graphZ or -1, M.pz))
+	end
+
+	-- running a freshly planned route, the camera swinging round behind at each corner, and the game showing the
+	-- marker at the last corner for a frame after it moves on: every frame's dots on the true projection
+	GuidelimeArrow.element = nil
+	for _ = 1, 3 do M.Step(0.1) end
+	M.px, M.py = -133, -8914
+	GuidelimeArrow.element = { wx = 62, wy = -9465, instance = 0 }
+	for _ = 1, 200 do
+		M.Step(0.05)
+		if ns.path and ns.path.graph then break end
+	end
+	local r = ns.path
+	M.navLag, M.zoom, M.truePitch, M.trueYaw = true, 15, 0.35, nil
+	local s, frames, shown, walkWorst, walkOff, i0 = 0, 0, 0, 0, 0, 1
+	local function turn(a) return (a + math.pi) % (2 * math.pi) - math.pi end
+	while r and s < math.min(r.len[r.n] - 5, 300) do
+		s = s + 7 / 60
+		while r.len[i0 + 1] < s do i0 = i0 + 1 end
+		local u = (s - r.len[i0]) / (r.len[i0 + 1] - r.len[i0])
+		M.px, M.py = r.x[i0] + (r.x[i0 + 1] - r.x[i0]) * u, r.y[i0] + (r.y[i0 + 1] - r.y[i0]) * u
+		M.facing = math.atan2(r.x[i0 + 1] - r.x[i0], r.y[i0 + 1] - r.y[i0])
+		M.trueYaw = M.trueYaw or M.facing
+		M.trueYaw = M.trueYaw + math.max(-0.06, math.min(0.06, turn(M.facing - M.trueYaw) * 0.1))
+		-- the camera alone (heights are tools/simdots.lua's to check): the player stands where the dots think
+		M.ground = function(x, y) local z = ns.player.z return z and (ns.Graph.GroundZ(M.instance, x, y, z, 1) or z) end
+		local w, c = dotError()
+		frames = frames + 1
+		if c > 0 and s > 3 then
+			shown = shown + 1
+			if w > 2 then walkOff = walkOff + 1 end
+			walkWorst = math.max(walkWorst, w)
+			if w > 2 and os.getenv("WALK_DEBUG") then print(string.format("  s %.1f err %.1f dots %d k %d pz %.2f est %.2f camera %.0f deg off the facing", s, w, c, ns.path.k, M.pz, ns.player.z or -1, math.deg(turn(M.trueYaw - M.facing)))) end
+		end
+	end
+	-- (a frame where the tracked height jumps is off by that jump: tools/simdots.lua checks heights)
+	check(r and shown > frames * 0.8 and walkOff <= shown * 0.01, string.format("running the route: dots on the true projection in %d of %d frames, %d frames over 2 px (worst %.1f px)", shown, frames, walkOff, walkWorst))
+	M.navLag, M.zoom = false, 12
+	M.ground = function(x, y)
+		local z, guess = ns.Graph.GroundZ(M.instance, x, y, M.pz, 1)
+		return z or guess
 	end
 end
 

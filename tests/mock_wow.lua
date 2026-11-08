@@ -86,7 +86,7 @@ function UnitPosition() return M.py, M.px, 0, M.instance end
 function UnitRace() return "Human", "Human", 1 end
 function UnitSex() return 2 end
 function Screenshot() M.screenshots = (M.screenshots or 0) + 1; M.pendingShot = true end
-C_CVar = { GetCVar = function(k) if k == "cameraFov" then return tostring(M.cvarFov or 90) end end }
+C_CVar = { GetCVar = function(k) if k == "cameraFov" then return tostring(M.cvarFov) end end }
 function UnitFactionGroup() return M.faction or "Alliance" end
 function UnitLevel() return M.level or 60 end
 function UnitOnTaxi() return M.onTaxi end
@@ -102,7 +102,8 @@ UIErrorsFrame = { AddMessage = function(_, text) M.hints = M.hints or {}; table.
 -- player + camera truth -------------------------------------------------------------------------
 M.px, M.py, M.pz, M.instance = 0, 0, 0, 1
 M.facing, M.zoom = 0, 12
-M.trueYaw, M.truePitch, M.trueFov, M.trueHeight = 0, 0.35, 90, 1.9
+M.trueYaw, M.truePitch, M.trueHeight = 0, 0.35, 1.9
+M.cvarFov = 90 -- the game's vertical field of view is 0.6 x cameraFov
 
 -- true projection of a world point (HBD coords x west+, y north+) using the mock camera
 function M.TrueProject(x, y, z)
@@ -112,11 +113,12 @@ function M.TrueProject(x, y, z)
 	local rx, ry = math.cos(yaw), math.sin(yaw)
 	local ux, uy, uz = ry * fz, -rx * fz, rx * fy - ry * fx
 	local Fx, Fy, Fz = -M.px, M.py, M.pz + M.trueHeight
-	local Cx, Cy, Cz = Fx - M.zoom * fx, Fy - M.zoom * fy, Fz - M.zoom * fz
+	local d = M.trueDist or M.zoom -- nearer than the zoom when something is in the way
+	local Cx, Cy, Cz = Fx - d * fx, Fy - d * fy, Fz - d * fz
 	local vx, vy, vz = E - Cx, N - Cy, U - Cz
 	local cf = vx * fx + vy * fy + vz * fz
 	if cf < 0.3 then return end
-	local f = (M.W / 2) / math.tan(math.rad(M.trueFov) / 2)
+	local f = (M.H / 2) / math.tan(math.rad(M.cvarFov * 0.6) / 2)
 	return M.W / 2 + f * (vx * rx + vy * ry) / cf, M.H / 2 + f * (vx * ux + vy * uy + vz * uz) / cf
 end
 
@@ -170,10 +172,17 @@ C_Navigation = {
 	GetFrame = function() return M.navFrame end,
 	HasValidScreenPosition = function() return M.navValid end,
 	WasClampedToScreen = function() return M.navClamped end,
-	GetDistance = function() local x, y = M.WaypointWorld(); return x and math.sqrt((x - M.px) ^ 2 + (y - M.py) ^ 2) or 0 end,
+	GetDistance = function() local x, y = M.navX, M.navY; return x and math.sqrt((x - M.px) ^ 2 + (y - M.py) ^ 2) or 0 end,
 }
+-- M.navLag: like the game may, the frame after the waypoint moves still shows (and measures) the last one
 function M.UpdateNav()
 	local x, y = M.WaypointWorld()
+	if M.navLag then
+		local nx, ny = M.nextNavX, M.nextNavY
+		M.nextNavX, M.nextNavY = x, y
+		if nx then x, y = nx, ny end
+	end
+	M.navX, M.navY = x, y
 	M.navValid, M.navClamped = false, false
 	if not x or not M.superTracking then return end
 	local sx, sy = M.TrueProject(x, y, M.pz) -- like the game: drawn at the player's height, not the waypoint's

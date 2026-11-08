@@ -37,6 +37,7 @@ function Marker.Place(x, y, z)
 	local m, mx, my = mapPointFor(x, y)
 	if not m then return false end
 	own = { m = m, x = mx, y = my }
+	Marker.before, Marker.at = Marker.at, { x, y } -- world spots, for the ground dots
 	C_Map.SetUserWaypoint(UiMapPoint.CreateFromCoordinates(m, mx, my, z))
 	C_SuperTrack.SetSuperTrackedUserWaypoint(true)
 	return true

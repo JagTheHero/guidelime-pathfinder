@@ -16,7 +16,7 @@ local DEFAULTS = {
 	dotRange = 60,   -- yards of path ahead drawn as ground dots
 	dotSize = 0.8,   -- dot diameter in yards
 	focusHeight = 1.9, -- camera pivot height above the feet, yards
-	fov = 0,         -- horizontal field of view in degrees; 0 = from the cameraFov CVar + calibration
+	fov = 0,         -- horizontal field of view in degrees; 0 = from the cameraFov CVar
 	debug = false,
 }
 
@@ -342,11 +342,17 @@ function ns.PointOnSeg(p, i, t)
 	return p.x[i] + (p.x[j] - p.x[i]) * t, p.y[i] + (p.y[j] - p.y[i]) * t, z0 + (z1 - z0) * t
 end
 
--- Calls fn(x, y, z, distanceAlong) every `spacing` yards along the path ahead of the player.
-function ns.SamplePath(p, spacing, maxDist, fn)
+-- Calls fn(x, y, z, distanceAlong) every `spacing` yards along the path ahead of the player: from the player's
+-- spot on the path, or from (x0, y0, z0) straight to the next corner (p.k), then corner to corner.
+function ns.SamplePath(p, spacing, maxDist, fn, x0, y0, z0)
 	if not p or not p.seg then return end
-	local i = p.seg
-	local x0, y0, z0 = ns.PointOnSeg(p, i, p.segT or 0)
+	local i
+	if x0 then
+		i = p.k - 1
+	else
+		i = p.seg
+		x0, y0, z0 = ns.PointOnSeg(p, i, p.segT or 0)
+	end
 	local travelled, nextS = 0, spacing
 	while i < p.n and travelled < maxDist do
 		local x1, y1, z1 = p.x[i + 1], p.y[i + 1], p.z and p.z[i + 1] or 0
@@ -364,7 +370,8 @@ end
 
 local OFFSET_EASE = 0.7 -- where no ground fits, the offset from the route's line shrinks by this each point
 
--- SamplePath with the ground height under each point from the height map, starting from height z0 at (x0, y0).
+-- SamplePath from the player at (x0, y0) straight to the next corner and on, with the ground height under each
+-- point from the height map, starting from the player's ground height z0.
 -- On a walkable route each height is predicted as the route's straight line between corners plus the offset
 -- the ground had from that line at the point before. Following the offset rather than the height keeps the
 -- route's layer where layers part slowly (a ramp down into a tunnel under the hillside, a bridge ramp); where
@@ -373,11 +380,11 @@ local OFFSET_EASE = 0.7 -- where no ground fits, the offset from the route's lin
 -- Without height data (or z0) the heights are the path's own. fn also gets the straight-line height.
 function ns.SampleGround(p, instance, x0, y0, z0, spacing, maxDist, fn)
 	if not z0 or not ns.Graph.HasGround(instance) then
-		return ns.SamplePath(p, spacing, maxDist, function(x, y, z, along) return fn(x, y, z, along, z) end)
+		local _, _, lineZ0 = ns.PointOnSeg(p, p.seg, p.segT or 0)
+		return ns.SamplePath(p, spacing, maxDist, function(x, y, z, along) return fn(x, y, z, along, z) end, x0, y0, z0 or lineZ0)
 	end
 	local anchored = p.graph and p.z
-	local _, _, lineZ0 = ns.PointOnSeg(p, p.seg, p.segT or 0)
-	local offset, rx, ry = z0 - lineZ0, x0, y0
+	local offset, rx, ry = 0, x0, y0
 	ns.SamplePath(p, spacing, maxDist, function(x, y, lineZ, along)
 		local z, guess = ns.Graph.GroundZ(instance, x, y, lineZ + offset, dist(rx, ry, x, y))
 		if not z then
@@ -386,7 +393,7 @@ function ns.SampleGround(p, instance, x0, y0, z0, spacing, maxDist, fn)
 		end
 		offset, rx, ry = z - lineZ, x, y
 		return fn(x, y, z, along, lineZ)
-	end)
+	end, x0, y0, z0)
 end
 
 function ns.SetPath(p, fromGraph)
@@ -920,7 +927,6 @@ SlashCmdList.GUIDELIMEPATHFINDER = function(msg)
 	elseif (cmd == "spacing" or cmd == "range" or cmd == "size" or cmd == "height" or cmd == "fov") and tonumber(arg) then
 		local field = ({ spacing = "dotSpacing", range = "dotRange", size = "dotSize", height = "focusHeight", fov = "fov" })[cmd]
 		db[field] = tonumber(arg)
-		if cmd == "fov" then ns.Dots.ResetCalibration() end
 		ns.Print(cmd .. " = " .. db[field])
 	elseif cmd == "status" then
 		status()

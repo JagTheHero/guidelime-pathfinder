@@ -4,24 +4,30 @@ local ADDON, ns = ...
 -- point for us: the in-world navigation marker. Knowing where that point is in the world, where the
 -- player stands and how far the camera is zoomed out, we solve the camera's yaw and pitch so that our
 -- own projection lands exactly on the marker, then project the path ahead with the same camera.
--- The field of view is learned while mouse-steering, when camera yaw equals the character's facing.
+-- The field of view follows the cameraFov CVar: the game's vertical field of view is 0.6 x cameraFov
+-- (fitted to /gpath probe data: within a pixel at every zoom and pitch measured).
 
 local Dots = {}
 ns.Dots = Dots
 
-local sin, cos, tan, sqrt, abs, min, max, rad, deg, atan = math.sin, math.cos, math.tan, math.sqrt, math.abs, math.min, math.max, math.rad, math.deg, math.atan
+local sin, cos, tan, sqrt, abs, min, max, rad, pi = math.sin, math.cos, math.tan, math.sqrt, math.abs, math.min, math.max, math.rad, math.pi
 local DOT = "Interface\\AddOns\\" .. ADDON .. "\\Media\\dot"
 local COLOR = { 0.62, 1, 0.25 }
 local MAX_DOTS = 48
-local CALIB_SAMPLES = 15
+local VFOV_PER_FOV = 0.6
+-- A marker nearer than the camera's distance has two cameras that put it on the same spot: the real one
+-- and its mirror on the far side of the player looking back (often under the floor). Of the cameras that fit,
+-- the one nearest the way the character faces wins (the game swings the camera behind a moving character);
+-- one under the player's floor counts BELOW_COST per yard under it.
+local BELOW_COST, FLOOR_SLACK = 4, 0.5
+local KEEP_CAMERA = 0.25 -- seconds the last solved camera is used while the marker's spot is not ours yet
 
 local layer = CreateFrame("Frame", nil, UIParent)
 layer:SetAllPoints()
 layer:SetFrameStrata("BACKGROUND")
 local pool = {}
 
-local cam = { yaw = nil, pitch = 0.3 }
-local calib = { samples = {} }
+local cam = { yaw = nil, pitch = 0.3, t = nil }
 
 -- camera basis and position (world axes: E = east, N = north, U = up), focal length and screen centre
 local fx, fy, fz, rx, ry, ux, uy, uz, Cx, Cy, Cz, focal, scx, scy
@@ -76,47 +82,39 @@ local function cvarFov()
 	return tonumber(v) or 90
 end
 
-local function focalFor(W)
+-- W, H: the world view's size in UI units. /gpath fov (degrees across) overrides the CVar.
+local function focalFor(W, H)
 	local fov = ns.db.fov
 	if fov and fov > 0 then return (W / 2) / tan(rad(fov) / 2) end
-	if ns.db.calibF then return ns.db.calibF * W end
-	return (W / 2) / tan(rad(cvarFov()) / 2)
+	return (H / 2) / tan(rad(cvarFov() * VFOV_PER_FOV) / 2)
 end
 
 function Dots.FovText()
-	if ns.db.calibF then return format("auto (learned %.0f°)", deg(2 * atan(0.5 / ns.db.calibF))) end
-	return format("auto (cameraFov %d°, steer with the right mouse button to calibrate)", cvarFov())
+	return format("auto (from cameraFov %d)", cvarFov())
 end
 
-function Dots.ResetCalibration()
-	ns.db.calibF = nil
-	calib.samples = {}
+local function wrap(a)
+	return (a + pi) % (2 * pi) - pi
 end
 
--- While mouse-steering the camera yaw equals the facing; solve pitch and focal length instead.
-local function calibrate(facing, F, d, ox, oy, m, W)
-	if ns.db.fov and ns.db.fov > 0 then return end
-	if abs(ox - scx) < 0.15 * W then return end
-	local logf0 = math.log(focal)
-	local pitch, logf = solve2(cam.pitch, logf0, function(p, lf)
-		focal = math.exp(lf)
-		setCamera(facing, p, F[1], F[2], F[3], d)
-	end, ox, oy, m[1], m[2], m[3])
-	focal = math.exp(logf0)
-	if not pitch then return end
-	local ratio = math.exp(logf) / W
-	if ratio < 0.2 or ratio > 2.5 then return end
-	local s = calib.samples
-	if ns.db.calibF then
-		if abs(ratio - ns.db.calibF) < 0.25 * ns.db.calibF then ns.db.calibF = ns.db.calibF * 0.97 + ratio * 0.03 end
-	else
-		s[#s + 1] = ratio
-		if #s >= CALIB_SAMPLES then
-			table.sort(s)
-			ns.db.calibF = s[math.floor(#s / 2) + 1]
-			ns.Debug(format("learned field of view: %.0f°", deg(2 * atan(0.5 / ns.db.calibF))))
-		end
+-- The camera (yaw, pitch) that puts marker m on screen at (ox, oy), pivoting at F at distance d: every fit
+-- from guesses around the facing and the last camera, scored by how far it turns from the facing and how far
+-- under the player's floor it puts the camera. Returns yaw, pitch or nil.
+local function solveCamera(facing, F, d, ox, oy, m, floor)
+	local set = function(yaw, pitch) setCamera(yaw, pitch, F[1], F[2], F[3], d) end
+	local bestYaw, bestPitch, bestScore
+	local function try(y0, p0)
+		local yaw, pitch = solve2(y0, p0, set, ox, oy, m[1], m[2], m[3])
+		if not yaw or abs(pitch) >= 1.55 then return end
+		local below = max(0, floor - FLOOR_SLACK - (F[3] + d * sin(pitch)))
+		local score = abs(wrap(yaw - facing)) + BELOW_COST * below
+		if not bestScore or score < bestScore then bestYaw, bestPitch, bestScore = wrap(yaw), pitch, score end
 	end
+	if cam.yaw then try(cam.yaw, cam.pitch) end
+	for _, dy in ipairs({ 0, 0.8, -0.8, pi }) do
+		for _, p0 in ipairs({ cam.pitch, 0.9, -0.3 }) do try(facing + dy, p0) end
+	end
+	return bestYaw, bestPitch
 end
 
 local function dot(i)
@@ -141,15 +139,14 @@ local function draw()
 	local ui = UIParent:GetEffectiveScale()
 	local wf = WorldFrame:GetEffectiveScale()
 	local wcx, wcy = WorldFrame:GetCenter()
-	local W = WorldFrame:GetWidth() * wf / ui
+	local W, H = WorldFrame:GetWidth() * wf / ui, WorldFrame:GetHeight() * wf / ui
 	scx, scy = wcx * wf / ui, wcy * wf / ui
 	local nx, ny = nav:GetCenter()
 	if not nx then return 0 end
 	local ns_ = nav:GetEffectiveScale() / ui
 	local ox, oy = nx * ns_, ny * ns_
-	focal = focalFor(W)
+	focal = focalFor(W, H)
 
-	local k = p.k
 	-- Heights: the ground under the player and under each dot from the height map, else (no height data)
 	-- the path's own corner heights in a straight line between corners.
 	local ground = ns.Graph.HasGround(instance) and ns.player.z
@@ -159,35 +156,43 @@ local function draw()
 	else
 		pz = select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))
 	end
+	-- Where the game shows the marker: just after it moves on, the game may still show (and measure) it at the
+	-- last corner for a frame, so of the spot it was put on and the one before, the one at the game's distance.
 	-- The game draws a user waypoint at the player's own height, whatever height it was given (measured
 	-- with /gpath probe), so the marker sits pz + 0 while the camera pivots at pz + focus height.
-	local m = { -p.x[k], p.y[k], pz }
-	if (m[1] + px) ^ 2 + (m[2] - py) ^ 2 < 36 then return 0 end -- marker too close to solve against
+	local gd = C_Navigation.GetDistance and C_Navigation.GetDistance()
+	local m, md
+	for _, at in ipairs({ ns.Marker.at, ns.Marker.before }) do
+		local d2 = sqrt((at[1] - px) ^ 2 + (at[2] - py) ^ 2)
+		if not gd or abs(gd - d2) <= max(1.5, 0.05 * d2) then
+			m, md = { -at[1], at[2], pz }, d2
+			break
+		end
+	end
+	if m and md < 6 then return 0 end -- marker too close to solve against
 	local h = db.focusHeight + (IsMounted() and 0.9 or 0)
 	local F = { -px, py, pz + h }
 	local d = GetCameraZoom() or 0
 	local facing = GetPlayerFacing() or 0
+	local now = GetTime()
 
-	if IsMouselooking() then calibrate(facing, F, d, ox, oy, m, W) end
-
-	local set = function(yaw, pitch) setCamera(yaw, pitch, F[1], F[2], F[3], d) end
+	-- no spot at the game's distance (it has not caught up yet): the last camera for a moment
 	local yaw, pitch
-	for _, guess in ipairs({ cam.yaw or facing, facing, facing + math.pi }) do
-		yaw, pitch = solve2(guess, cam.pitch, set, ox, oy, m[1], m[2], m[3])
-		if yaw and abs(pitch) < 1.55 then break end
-		yaw = nil
-	end
-	if not yaw then
+	if m then yaw, pitch = solveCamera(facing, F, d, ox, oy, m, pz) end
+	if yaw then
+		cam.yaw, cam.pitch, cam.t = yaw, pitch, now
+	elseif cam.yaw and cam.t and now - cam.t <= KEEP_CAMERA then
+		yaw, pitch = cam.yaw, cam.pitch
+	else
 		cam.yaw = nil
 		return 0
 	end
-	cam.yaw, cam.pitch = yaw, pitch
-	set(yaw, pitch)
+	setCamera(yaw, pitch, F[1], F[2], F[3], d)
 	-- one frame of the solve and the drawn dots, for /gpath probe
 	local cap = Dots.capture
 	if cap then
 		Dots.capture = nil
-		cap.solved = { nav = { ox, oy }, marker = m, focus = F, zoom = d, facing = facing, yaw = yaw, pitch = pitch, focal = focal, W = W, center = { scx, scy } }
+		cap.solved = { nav = { ox, oy }, marker = m, focus = F, zoom = d, facing = facing, yaw = yaw, pitch = pitch, focal = focal, W = W, H = H, center = { scx, scy }, navDistance = gd }
 		cap.dots = {}
 	end
 	local rec = Dots.record or (cap and cap.dots)
@@ -336,7 +341,7 @@ function Dots.Probe()
 			worldH = WorldFrame:GetHeight(), worldScale = WorldFrame:GetEffectiveScale(), worldCenter = { wcx, wcy },
 			physical = { physW, physH }, screenW = GetScreenWidth(), screenH = GetScreenHeight() },
 		cvars = {},
-		settings = { focusHeight = ns.db.focusHeight, fov = ns.db.fov, calibF = ns.db.calibF },
+		settings = { focusHeight = ns.db.focusHeight, fov = ns.db.fov },
 		points = {},
 	}
 	for _, name in ipairs(PROBE_CVARS) do rec.cvars[name] = cvar(name) end
