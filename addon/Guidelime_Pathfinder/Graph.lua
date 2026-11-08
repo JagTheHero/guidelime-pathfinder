@@ -29,7 +29,9 @@ local NODE_W, EDGE_W, CELL_W = 14, 4, 10
 local NODE_INDOOR, NODE_SWIM, NODE_POI = 1, 2, 4
 -- edge cost multipliers by edge flag (low 3 bits), as navbuild's: 0 walk, 1 swim, 2 narrow walkway, 3 both
 local MULT = { [0] = 1, [1] = 2.5, [2] = 2.5, [3] = 2.5 }
-local POI_REACH = 5 -- yards from the target within which a quest giver's, quest object's or service's nodes are its goals
+-- yards from the target within which a quest giver's, quest object's or service's nodes are its goals: navbuild
+-- puts them where a player can stand to talk to it, up to 5 yards off (behind a counter: in front of it)
+local POI_REACH = 6
 local SWIM_GOAL = 15 -- yards a goal in the water counts as farther than one on land
 local HEURISTIC_WEIGHT = 1.15
 -- yards every leg costs on top of its length (navbuild's LEG_COST): of two routes about as long, the one with
@@ -1009,7 +1011,8 @@ function Graph.Piece(instance, x, y, z)
 end
 
 -- The pieces a route to (x, y) can end in: those of the nodes the search could end at (an NPC's spot without a
--- known height can have a layer in another piece, such as a mesa's top and the hollow under it).
+-- known height can have a layer in another piece, such as a mesa's top and the hollow under it), as { piece,
+-- height of its nearest goal node }.
 local function goalPieces(instance, x, y, z)
 	local g = graphs[instance]
 	if not g or not g.comps or (g.n or 0) == 0 then return {} end
@@ -1019,7 +1022,7 @@ local function goalPieces(instance, x, y, z)
 		local piece = v2(g.comps, (c[1] - 1) * 2 + 1)
 		if c[2] < 60 and (not z or abs(g.z[c[1]] - z) <= LAYER_GAP or flag(g.f[c[1]], NODE_POI)) and not seen[piece] then
 			seen[piece] = true
-			out[#out + 1] = piece
+			out[#out + 1] = { piece, g.z[c[1]] }
 		end
 	end
 	return out
@@ -1056,8 +1059,8 @@ function Graph.PlanTrip(s, t, opts)
 	if not S.piece then return end
 	local goals = {}
 	for i, g in ipairs(t[1] and t or { t }) do
-		for _, piece in ipairs(goalPieces(g.instance, g.x, g.y, g.z)) do
-			goals[add(g.instance, g.x, g.y, g.z, piece, { kind = "goal", goal = i })] = true
+		for _, pc in ipairs(goalPieces(g.instance, g.x, g.y, g.z)) do
+			goals[add(g.instance, g.x, g.y, g.z or pc[2], pc[1], { kind = "goal", goal = i })] = true
 		end
 	end
 	if not next(goals) then return end

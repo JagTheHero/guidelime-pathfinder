@@ -13,12 +13,12 @@
 
 ## File upload
 
-- File: `dist/Guidelime_Pathfinder-0.6.0.zip` (made by `tools/package.sh`): three add-on folders, the add-on and its
+- File: `dist/Guidelime_Pathfinder-0.6.1.zip` (made by `tools/package.sh`): three add-on folders, the add-on and its
   path data for each continent (load-on-demand add-ons it loads itself)
-- Display name: Guidelime Pathfinder 0.6.0
+- Display name: Guidelime Pathfinder 0.6.1
 - Release type: Beta
 - Game version: Forever (1.60.1; the TOC says `## Interface: 16001`)
-- Changelog: the 0.6.0 section of `addon/Guidelime_Pathfinder/CHANGELOG.md`
+- Changelog: the 0.6.1 section of `addon/Guidelime_Pathfinder/CHANGELOG.md`
 - Related projects (both **Required Dependency**):
   - Guidelime: https://www.curseforge.com/wow/addons/guidelime
   - Questie: https://www.curseforge.com/wow/addons/questie

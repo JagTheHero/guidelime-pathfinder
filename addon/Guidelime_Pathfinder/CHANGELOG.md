@@ -1,5 +1,18 @@
 # Guidelime Pathfinder
 
+## 0.6.1 (beta)
+
+- `/gpath go bank` in Stormwind takes you to Stormwind's bank, not Ironforge's. Routes to quest givers and town
+  services now end where you can stand to talk to them (within 5 yards), not only on the ground right under them:
+  Stormwind's bankers stand behind their counter, and the only path data under them was a sealed space below the
+  bank's floor, so the bank looked out of reach. The same goes for anyone behind a counter, a desk or a rail.
+- The dots lead you onto the route instead of cutting across to its next corner. The route's corners stay where
+  they are (they were picked for their directions); the dots join the route a little ahead of your spot on it (as
+  far ahead as you are off it, at most 12 yards), going around anything in the way. On the simulated walks, walking
+  6 yards beside the route, about 40% fewer dots are off the ground, and on the route about as many as in 0.6.0.
+- A trip to a goal down in a city counts the climb down to it, so from the Undercity's zeppelin tower it takes the
+  lift down to the flight master.
+
 ## 0.6.0 (beta)
 
 - Restart the game once after updating: the path data now comes as two more add-ons in the zip,

@@ -2,8 +2,9 @@
 
 usage: pois.py <out_dir>    writes <out_dir>/Azeroth.pois and Kalimdor.pois: "worldX worldY [worldZ]" per line
 
-Routes end at the graph node nearest the target, so navbuild puts a node where these stand: on the level of
-their height when known (a pier's deck, an inn's upper floor), on every walkable level over the spot otherwise.
+Routes end at the graph node nearest the target, so navbuild puts nodes where a player can stand to talk to these
+(within 5 yards: in front of a banker's counter): within reach of their height when known (a pier's deck, an
+inn's upper floor), on every walkable level over the spot otherwise.
 QuestieDB keeps its rows as base-64 CBOR in TOC metadata: ## X-Npc-<id>-<field> (S: the scalar fields, 7:
 spawns, 10/11: quests it starts/ends) and ## X-Object-<id>-<field> (2/3: quests it starts/ends, 4: spawns).
 Spawns are zone percent per area id; QuestieDB maps area ids to UiMap ids, and the client's UiMapAssignment to

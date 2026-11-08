@@ -1102,13 +1102,15 @@ struct Builder {
 		for (int id : orphans) dead[id] = 1;
 	}
 
-	// Nodes where quest givers, quest objects and town services stand (tools/pois.py: "worldX worldY" per line),
-	// one on every walkable layer within POI_REACH yards that is not water. Without them a route ends at the
-	// nearest node in plan view, which can be the beach under the pier the NPC stands on.
+	// Nodes where a player can stand to talk to a quest giver or town service, or use a quest object (tools/pois.py:
+	// "worldX worldY [worldZ]" per line): the nearest point within INTERACT yards of every walkable piece on every
+	// layer that is not water. Bankers and auctioneers stand behind counters, on ground too small for nodes or cut
+	// off from the hall in front, so the hall in front counts, not only the ground under them. Without these nodes a
+	// route ends at the nearest node in plan view, which can be the beach under the pier the NPC stands on.
 	void addPois(const std::string& path) {
-		// a spot with a height (from tools/pois.py) gets a node on the level nearest it, if one is within POI_HEIGHT;
-		// one without, on every level
-		static const float POI_REACH = 3.0f, POI_LAYER = 3.0f, POI_REUSE = 2.0f, POI_HEIGHT = 5.0f;
+		// a spot with a height (from tools/pois.py) gets nodes within INTERACT of it in 3D, else on the level nearest
+		// it if one is within POI_HEIGHT; one without, on every level
+		static const float INTERACT = 5.0f, POI_LAYER = 3.0f, POI_REUSE = 2.0f, POI_HEIGHT = 5.0f;
 		FILE* f = fopen(path.c_str(), "r");
 		if (!f) { fprintf(stderr, "cannot read %s\n", path.c_str()); return; }
 		std::vector<std::array<float, 3>> pts;
@@ -1121,35 +1123,46 @@ struct Builder {
 		fclose(f);
 		dtNavMeshQuery* q = dtAllocNavMeshQuery();
 		q->init(nav, 4096);
-		size_t added = 0, reused = 0, none = 0, onLevel = 0;
+		size_t added = 0, reused = 0, none = 0, onLevel = 0, inReach = 0;
 		for (auto& w : pts) {
-			float c[3] = { w[1], 0, w[0] }, ext[3] = { POI_REACH, 5000, POI_REACH };
+			float c[3] = { w[1], 0, w[0] }, ext[3] = { INTERACT, 5000, INTERACT };
 			dtPolyRef refs[256]; int n = 0;
 			q->queryPolygons(c, ext, &filter, refs, &n, 256);
-			struct Spot { float d; float p[3]; dtPolyRef ref; };
+			struct Spot { float d; float p[3]; dtPolyRef ref; int comp; };
 			std::vector<Spot> spots;
+			bool known = !std::isnan(w[2]);
 			for (int i = 0; i < n; i++) {
 				if (polyArea(refs[i]) == A_SWIM) continue;
 				int ci = compOf(refs[i]);
 				if (ci < 0 || compArea[ci] < MIN_ISLAND) continue;
 				Spot s; bool over;
-				if (dtStatusFailed(q->closestPointOnPoly(refs[i], c, s.p, &over))) continue;
-				s.d = dtVdist2D(s.p, c); s.ref = refs[i];
-				if (s.d <= POI_REACH) spots.push_back(s);
+				float at[3] = { c[0], known ? w[2] : 0, c[2] };
+				if (dtStatusFailed(q->closestPointOnPoly(refs[i], at, s.p, &over))) continue;
+				s.d = dtVdist2D(s.p, c); s.ref = refs[i]; s.comp = ci;
+				if (s.d <= INTERACT) spots.push_back(s);
 			}
-			std::sort(spots.begin(), spots.end(), [](const Spot& a, const Spot& b) { return a.p[1] < b.p[1]; });
-			if (!std::isnan(w[2]) && !spots.empty()) {
-				const Spot* best = &spots[0];
-				for (const Spot& s : spots) if (fabsf(s.p[1] - w[2]) < fabsf(best->p[1] - w[2])) best = &s;
-				if (fabsf(best->p[1] - w[2]) <= POI_HEIGHT) {
-					float h = best->p[1];
-					spots.erase(std::remove_if(spots.begin(), spots.end(), [&](const Spot& s) { return fabsf(s.p[1] - h) > POI_LAYER; }), spots.end());
-					onLevel++;
+			if (known && !spots.empty()) {
+				auto far3 = [&](const Spot& s) { return s.d * s.d + (s.p[1] - w[2]) * (s.p[1] - w[2]) > INTERACT * INTERACT; };
+				bool any = false;
+				for (const Spot& s : spots) any = any || !far3(s);
+				if (any) { // where a player can reach it from (in front of a counter)
+					spots.erase(std::remove_if(spots.begin(), spots.end(), far3), spots.end());
+					for (Spot& s : spots) s.d = sqrtf(s.d * s.d + (s.p[1] - w[2]) * (s.p[1] - w[2]));
+					inReach++;
+				} else {
+					const Spot* best = &spots[0];
+					for (const Spot& s : spots) if (fabsf(s.p[1] - w[2]) < fabsf(best->p[1] - w[2])) best = &s;
+					if (fabsf(best->p[1] - w[2]) <= POI_HEIGHT) {
+						float h = best->p[1];
+						spots.erase(std::remove_if(spots.begin(), spots.end(), [&](const Spot& s) { return fabsf(s.p[1] - h) > POI_LAYER; }), spots.end());
+						onLevel++;
+					}
 				}
 			}
-			for (size_t i = 0; i < spots.size();) { // per layer, the spot nearest the POI
+			std::sort(spots.begin(), spots.end(), [](const Spot& a, const Spot& b) { return a.comp != b.comp ? a.comp < b.comp : a.p[1] < b.p[1]; });
+			for (size_t i = 0; i < spots.size();) { // per walkable piece and layer, the spot nearest the POI
 				size_t best = i, j = i;
-				for (; j < spots.size() && spots[j].p[1] - spots[i].p[1] <= POI_LAYER; j++) if (spots[j].d < spots[best].d) best = j;
+				for (; j < spots.size() && spots[j].comp == spots[i].comp && spots[j].p[1] - spots[i].p[1] <= POI_LAYER; j++) if (spots[j].d < spots[best].d) best = j;
 				Spot s = spots[best];
 				interior(q, s.ref, s.p);
 				int cx = (int)floorf(s.p[0] / CELL), cz = (int)floorf(s.p[2] / CELL), found = -1;
@@ -1171,8 +1184,8 @@ struct Builder {
 			if (spots.empty()) none++;
 		}
 		dtFreeNavMeshQuery(q);
-		printf("points of interest: %zu (%zu on the level of their height), nodes added %zu, existing nodes used %zu, no walkable ground near %zu\n",
-			pts.size(), onLevel, added, reused, none);
+		printf("points of interest: %zu (%zu with ground within reach of their height, %zu on the level of their height), nodes added %zu, existing nodes used %zu, no walkable ground near %zu\n",
+			pts.size(), inReach, onLevel, added, reused, none);
 	}
 
 	// Is there a way from s to t over adj (neighbour, cost) costing at most limit?
@@ -2035,7 +2048,7 @@ int main(int argc, char** argv) {
 		// writes "P route step x y along addonZ trueZ localCorners" and "D route step along x y addonZ trueZ nearestZ"
 		// (nearestZ: the surface nearest the addon's height there).
 		if (argc < 6) return 1;
-		struct Step { int step; float x, y, along, pz; int k; float ax, ay; std::vector<std::array<float, 2>> lc; std::vector<std::array<float, 4>> dots; std::vector<std::array<float, 2>> truth; float pTrue; };
+		struct Step { int step; float x, y, along, pz; int k, js; float ax, ay; std::vector<std::array<float, 2>> lc; std::vector<std::array<float, 4>> dots; std::vector<std::array<float, 2>> truth; float pTrue; };
 		struct Route { int id; std::vector<std::array<float, 3>> c; std::vector<Step> steps; };
 		std::vector<Route> routes;
 		std::unordered_map<int, size_t> byId;
@@ -2053,7 +2066,7 @@ int main(int argc, char** argv) {
 				routes.push_back(std::move(r));
 			} else if (line[0] == 'P') {
 				Step s; int id, nlc = 0, used = 0;
-				if (sscanf(line + 2, "%d %d %f %f %f %f %d %f %f %f %d%n", &id, &s.step, &s.x, &s.y, &s.along, &s.pz, &s.k, &s.ax, &s.ay, &s.pTrue, &nlc, &used) == 11) {
+				if (sscanf(line + 2, "%d %d %f %f %f %f %d %f %f %f %d %d%n", &id, &s.step, &s.x, &s.y, &s.along, &s.pz, &s.k, &s.ax, &s.ay, &s.pTrue, &s.js, &nlc, &used) == 12) {
 					char* q = line + 2 + used;
 					for (int k = 0; k < nlc; k++) { float cx, cy; int u2; if (sscanf(q, "%f %f%n", &cx, &cy, &u2) != 2) break; s.lc.push_back({ cx, cy }); q += u2; }
 					routes[byId[id]].steps.push_back(std::move(s));
@@ -2099,21 +2112,24 @@ int main(int argc, char** argv) {
 				for (auto& c : r.c) { float o[3]; rc(c[0], c[1], c[2], o); pts.push_back({ o[0], o[1], o[2] }); }
 				for (auto& s : r.steps) {
 					float o[3];
-					// the dots' line: the player's own way to the end of the leg (the corner after the one they passed), then on
+					// the dots' line: the player's own way onto the route (its last corner the join point, on the route's leg
+					// from corner js, at the route's height there), then the route's corners after it
 					std::vector<std::array<float, 3>> line;
 					rc(s.x, s.y, s.pTrue, o); line.push_back({ o[0], o[1], o[2] });
-					for (auto& c : s.lc) { rc(c[0], c[1], s.pTrue, o); line.push_back({ o[0], o[1], o[2] }); }
-					if (!s.lc.empty()) line.pop_back(); // the last is the leg's end
-					int first = 1;
-					{ // the end of the player's leg: the route corner after their spot along it
-						float acc = 0;
-						for (size_t k = 1; k < r.c.size(); k++) {
-							acc += dtVdist2D(pts[k - 1].data(), pts[k].data());
-							if (acc >= s.along - 1e-3f) { first = (int)k + 1; break; }
-							first = (int)k + 1;
+					int js = std::max(1, std::min(s.js, (int)r.c.size()));
+					for (size_t k = 0; k < s.lc.size(); k++) {
+						float z = s.pTrue;
+						if (k + 1 == s.lc.size() && js < (int)r.c.size()) {
+							const auto& a = r.c[js - 1]; const auto& b = r.c[js];
+							float dx = b[0] - a[0], dy = b[1] - a[1], L2 = dx * dx + dy * dy;
+							float t = L2 > 0 ? std::max(0.0f, std::min(1.0f, ((s.lc[k][0] - a[0]) * dx + (s.lc[k][1] - a[1]) * dy) / L2)) : 0;
+							z = a[2] + (b[2] - a[2]) * t;
 						}
+						rc(s.lc[k][0], s.lc[k][1], z, o);
+						// on the route the join point is the player's own spot: no leg without a direction to look ahead in
+						if (dtVdist2D(o, line.back().data()) > 0.05f) line.push_back({ o[0], o[1], o[2] });
 					}
-					for (int k = first; k <= (int)r.c.size(); k++) line.push_back(pts[k - 1]);
+					for (int k = js + 1; k <= (int)r.c.size(); k++) line.push_back(pts[k - 1]);
 					float maxA = 0;
 					for (auto& d : s.dots) maxA = std::max(maxA, d[0]);
 					std::vector<std::pair<float, float>> dp;

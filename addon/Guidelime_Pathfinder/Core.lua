@@ -341,21 +341,44 @@ function ns.PointOnSeg(p, i, t)
 	return p.x[i] + (p.x[j] - p.x[i]) * t, p.y[i] + (p.y[j] - p.y[i]) * t, z0 + (z1 - z0) * t
 end
 
+local JOIN_LEAD = 12 -- yards: the furthest ahead of the player's spot on the route the way onto it joins it
+
+-- Where a way from (x0, y0) onto the route joins it: the route's point ahead of the player's spot on it by as far as
+-- the player is off it (a way in at about 45 degrees; on the route, the spot itself), at most JOIN_LEAD yards.
+-- Returns x, y, the route's height there and the leg it is on (the route's corners after it follow, as they are).
+function ns.JoinPoint(p, x0, y0)
+	local i = p.seg
+	local x, y, z = ns.PointOnSeg(p, i, p.segT or 0)
+	local d = min(dist(x0, y0, x, y), JOIN_LEAD)
+	while i < p.n do
+		local nx, ny, nz = p.x[i + 1], p.y[i + 1], p.z and p.z[i + 1] or 0
+		local L = dist(x, y, nx, ny)
+		if L >= d or i + 1 == p.n then
+			local u = L > 0 and min(1, d / L) or 0
+			return x + (nx - x) * u, y + (ny - y) * u, z + (nz - z) * u, i
+		end
+		d = d - L
+		x, y, z, i = nx, ny, nz, i + 1
+	end
+	return x, y, z, i
+end
+
 -- Calls fn(x, y, z, distanceAlong) every `spacing` yards along the path ahead of the player: from the player's
--- spot on the path, or from (x0, y0, z0) straight to the end of the player's leg, then corner to corner (through
--- the corner the marker has already moved past: in a tight spot cutting it can cross a drop).
+-- spot on the path, or from (x0, y0, z0) straight onto it (ns.JoinPoint), then corner to corner.
 function ns.SamplePath(p, spacing, maxDist, fn, x0, y0, z0)
 	if not p or not p.seg then return end
-	local i
+	local xs, ys, zs, i = {}, {}, {}, p.seg
 	if x0 then
-		i = p.seg
+		local jx, jy, jz, js = ns.JoinPoint(p, x0, y0)
+		xs[1], ys[1], zs[1], i = jx, jy, jz, js
 	else
-		i = p.seg
 		x0, y0, z0 = ns.PointOnSeg(p, i, p.segT or 0)
 	end
+	for k = i + 1, p.n do xs[#xs + 1], ys[#ys + 1], zs[#zs + 1] = p.x[k], p.y[k], p.z and p.z[k] or 0 end
 	local travelled, nextS = 0, spacing
-	while i < p.n and travelled < maxDist do
-		local x1, y1, z1 = p.x[i + 1], p.y[i + 1], p.z and p.z[i + 1] or 0
+	for k = 1, #xs do
+		if travelled >= maxDist then return end
+		local x1, y1, z1 = xs[k], ys[k], zs[k]
 		local L = dist(x0, y0, x1, y1)
 		while nextS <= travelled + L and nextS <= maxDist do
 			local u = (nextS - travelled) / L
@@ -364,35 +387,44 @@ function ns.SamplePath(p, spacing, maxDist, fn, x0, y0, z0)
 		end
 		travelled = travelled + L
 		x0, y0, z0 = x1, y1, z1
-		i = i + 1
 	end
 end
 
 local CORNER_SNAP = 3 -- yards from a corner's layer the walked height may be before it goes back on it
 local UNSURE_HOLE = 2 -- yards over no known ground after which a dot's height is a guess
 local UNSURE_STEEP = 3 -- yards over ground too steep to walk after which it is not the way (nor quite the ground)
-local LOCAL_EVERY, LOCAL_MOVE = 0.5, 2 -- seconds, yards: how often the way to the end of the leg is looked at again
+local LOCAL_EVERY, LOCAL_MOVE = 0.5, 2 -- seconds, yards: how often a way around onto the route is looked for again
 
--- The player's own way to the end of the leg they are on: straight when that walks (the usual: on or near the
--- route line), else around what is in the way (Graph.LocalPath: a drop, a wall, the other side of a house).
--- Corners after the player's spot, or nil for straight.
+-- The player's own way onto the route (at ns.JoinPoint): straight when that walks (the usual: on or near the route
+-- line), else around what is in the way (Graph.LocalPath: a drop, a wall, the other side of a house). The route's
+-- corners stay as they are (they were picked for their directions): the way only leads onto them. Returns its
+-- corners (the last the join point), the route's ground height at the join point and the leg it is on.
 local localLeg = {}
 function ns.LocalLeg(p, instance, x0, y0, z0)
-	local i = p.seg + 1
-	local bx, by, bz = p.x[i], p.y[i], p.z and p.z[i]
-	if not bz or not p.graph or not z0 then return end
+	local jx, jy, jz, js = ns.JoinPoint(p, x0, y0)
+	local straight = { { jx, jy } }
+	if not p.graph or not p.z or not z0 or not ns.Graph.HasGround(instance) then return straight, jz, js end
+	local rz = ns.Graph.GroundZ(instance, jx, jy, jz, 0) or jz
 	local c = localLeg
-	if c.pathId == p.id and c.seg == p.seg and (dist(c.x0, c.y0, x0, y0) < LOCAL_MOVE or GetTime() - c.t < LOCAL_EVERY) then
-		return c.corners
+	if c.pathId == p.id and c.seg == js and dist(c.x0, c.y0, x0, y0) < LOCAL_MOVE and GetTime() - c.t < LOCAL_EVERY then
+		if not c.corners then return straight, rz, js end -- no way around nearby
+		local way = { unpack(c.corners) }
+		way[#way] = straight[1] -- the join point has moved on with the player
+		return way, rz, js
 	end
-	local z, fell, lost, steep = ns.Graph.Walk(instance, x0, y0, z0, bx, by, nil, true)
-	local corners
-	if fell or lost or steep or abs(z - bz) > CORNER_SNAP then corners = ns.Graph.LocalPath(instance, x0, y0, z0, bx, by, bz) end
-	c.pathId, c.seg, c.x0, c.y0, c.t, c.corners = p.id, p.seg, x0, y0, GetTime(), corners
-	return corners
+	local z, fell, lost, steep = ns.Graph.Walk(instance, x0, y0, z0, jx, jy, nil, true)
+	-- a straight walk onto the route's level (between corners the route's height is only near its ground, and
+	-- another surface can be nearer it): the ground walked on is the route's ground there
+	if not (fell or lost or steep or abs(z - jz) > CORNER_SNAP) then
+		c.pathId = nil
+		return straight, z, js
+	end
+	local way = ns.Graph.LocalPath(instance, x0, y0, z0, jx, jy, rz)
+	c.pathId, c.seg, c.x0, c.y0, c.t, c.corners = p.id, js, x0, y0, GetTime(), way
+	return way or straight, rz, js
 end
 
--- SamplePath from the player at (x0, y0) to the end of the leg (around what is in the way: ns.LocalLeg) and on, with
+-- SamplePath from the player at (x0, y0) onto the route (around what is in the way: ns.LocalLeg) and along it, with
 -- the ground height under each point walked on the walk grid from the player's height z0 (Graph.Walk: up stairs,
 -- along a bridge and not the river under it), back on each corner's own layer at the corner (a graph route's corners
 -- are on its layers). Without ground data (or z0) the heights are the path's own. fn(x, y, z, along, lineZ, unsure)
@@ -406,13 +438,13 @@ function ns.SampleGround(p, instance, x0, y0, z0, spacing, maxDist, fn)
 	end
 	if not p or not p.seg then return end
 	local anchored = p.graph and p.z
-	-- the dots' line: the player's own way to the end of the leg, then the route's corners
+	-- the dots' line: the player's own way onto the route, then the route's corners
 	local xs, ys, zs = {}, {}, {}
-	for _, c in ipairs(ns.LocalLeg(p, instance, x0, y0, z0) or {}) do
-		xs[#xs + 1], ys[#ys + 1] = c[1], c[2]
+	local way, rz, js = ns.LocalLeg(p, instance, x0, y0, z0)
+	for k, c in ipairs(way) do
+		xs[k], ys[k], zs[k] = c[1], c[2], k == #way and anchored and rz or false
 	end
-	if #xs > 0 then xs[#xs], ys[#ys] = nil, nil end -- the last is the leg's end, from the route below
-	for i = p.seg + 1, p.n do
+	for i = js + 1, p.n do
 		xs[#xs + 1], ys[#ys + 1], zs[#xs + 1] = p.x[i], p.y[i], anchored and p.z[i] or false
 	end
 	local along, nextS, z, lineA = 0, spacing, z0, z0
@@ -705,7 +737,8 @@ local function serviceLists()
 	return lists
 end
 
--- every place one of them stands that the player's faction may use, in world coordinates
+-- every place one of them stands that the player's faction may use, in world coordinates; no height (Questie has
+-- none): the path data has goal nodes where a player can stand to talk to each, on every level there
 local function serviceSpots(name, ids)
 	local DB = QuestieLoader:ImportModule("QuestieDB")
 	local C = QuestieLoader:ImportModule("QuestieCorrections")
@@ -719,10 +752,7 @@ local function serviceSpots(name, ids)
 		if not blacklist[id] and (not friendly or friendly == "AH" or friendly == mine) then
 			local n = #spots
 			spawnSpots(query, id, spots)
-			for i = n + 1, #spots do
-				local sp = spots[i]
-				sp.z, sp.name = ns.Graph.LikelyZ(sp.instance, sp.x, sp.y), query(id, "name")
-			end
+			for i = n + 1, #spots do spots[i].name = query(id, "name") end
 		end
 	end
 	return spots

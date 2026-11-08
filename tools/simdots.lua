@@ -8,10 +8,11 @@
 --   routes.txt: instance sx sy tx ty sz name (tools/simroutes.py; sz the start's height or nan)
 -- Output lines (HereBeDragons coordinates):
 --   R route instance name corners: x y z ...      a planned route (again after every replan)
---   P route step x y along pz k ax ay tz n cx cy ...  the player: distance along the route (at the route line's
+--   P route step x y along pz k ax ay tz j n cx cy ...  the player: distance along the route (at the route line's
 --                                                  point ax, ay beside them), height the addon tracks, the corner the
 --                                                  marker is on, the true height, and the n corners of the dots' own
---                                                  way to the end of the leg
+--                                                  way onto the route, the last where it joins the route on its leg
+--                                                  from corner j
 --   D route step along x y z                       a ground dot: yards along the dots' line from the player
 --   U route step along x y z                       a dot Dots.lua leaves out: over no known ground
 --   B route step x y z why                         where a real player cannot walk on along the route line (why: a
@@ -141,10 +142,10 @@ for line in io.lines(arg[2]) do
 				local ax, ay = ns.PointOnSeg(p, p.seg, p.segT or 0)
 				local ground = ns.player.z
 				local pz = ground and (ns.Graph.GroundZ(inst, M.px, M.py, ground, 1) or ground)
-				local lc = {}
-				for _, c in ipairs(ns.LocalLeg(p, inst, M.px, M.py, pz) or {}) do lc[#lc + 1] = string.format("%.2f %.2f", c[1], c[2]) end
-				out:write(string.format("P %d %d %.2f %.2f %.2f %.2f %d %.2f %.2f %.2f %d%s%s\n", routeId, step, M.px, M.py, along, pz or 0 / 0, p.k,
-					ax, ay, th, #lc, #lc > 0 and " " or "", table.concat(lc, " ")))
+				local lc, way, _, js = {}, ns.LocalLeg(p, inst, M.px, M.py, pz)
+				for _, c in ipairs(way) do lc[#lc + 1] = string.format("%.2f %.2f", c[1], c[2]) end
+				out:write(string.format("P %d %d %.2f %.2f %.2f %.2f %d %.2f %.2f %.2f %d %d %s\n", routeId, step, M.px, M.py, along, pz or 0 / 0, p.k,
+					ax, ay, th, js, #lc, table.concat(lc, " ")))
 				ns.SampleGround(p, inst, M.px, M.py, pz, ns.db.dotSpacing, ns.db.dotRange, function(dx, dy, dz, a, _, unsure)
 					if a >= 2 then out:write(string.format("%s %d %d %.2f %.2f %.2f %.2f\n", unsure and "U" or "D", routeId, step, a, dx, dy, dz)) end
 				end)

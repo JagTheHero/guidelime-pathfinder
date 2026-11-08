@@ -2,7 +2,7 @@
 ## Title: Guidelime |cff9fff3fPathfinder|r: Kalimdor
 ## Notes: Path data for Guidelime Pathfinder, loaded when it is needed (in Kalimdor or on the way there).
 ## Author: Jag
-## Version: 0.6.0
+## Version: 0.6.1
 ## Dependencies: Guidelime_Pathfinder
 ## LoadOnDemand: 1
 ## X-License: GPL-3.0-or-later

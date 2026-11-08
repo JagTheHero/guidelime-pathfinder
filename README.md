@@ -93,7 +93,8 @@ too steep to walk), packed into the Lua data files. You need Linux, a WoW: Forev
 
    `tools/build_tiles.sh` runs `navbuild` in a memory-capped systemd scope (16 GB); drop the `systemd-run`
    prefix if you have no user systemd. `tools/pois.py` reads the installed QuestieDB add-on and the CMaNGOS
-   database: routes end on a graph node on the level where an NPC stands (a pier's deck, not the sea beside it).
+   database: routes end on a graph node where a player can stand to talk to an NPC, on the level it stands on (a
+   pier's deck, not the sea beside it) and in front of its counter.
 
 ## Checking the ground dots
 

@@ -580,7 +580,9 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 		check(ns.riding and not ns.path, "riding: the new continent does not start a new plan")
 		goTo(0, l.to.x, l.to.y)
 		settle()
-		check(ns.trip and not ns.trip.next and ns.path and ns.path.graph and ns.dest.instance == 0, "off the zeppelin: on to the goal")
+		local nx = ns.trip and ns.trip.next
+		check(ns.trip and nx and nx.kind == "lift" and ns.path and ns.path.graph and ns.dest.instance == 0,
+			"off the zeppelin: on to the goal, the flight master down in the city, by a lift" .. (nx and string.format(" (next: %s %s)", nx.kind, nx.name or "") or ""))
 	end
 	M.faction, M.taxiNodes, M.taxiSlots = nil, nil, nil
 
@@ -625,8 +627,8 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 		if ns.path and ns.path.graph and not ns.planning and near(routeEnd(), sv, 15) then break end
 	end
 	local p = ns.path
-	check(ns.targetSource == "service" and p and p.graph and near(routeEnd(), sv, 15) and math.abs(p.z[p.n] - sv.z) < 10,
-		string.format("the route walks to the banker, in Ironforge's halls (ends at height %.0f, the bank's floor %.0f)", p and p.z and p.z[p.n] or -1, sv and sv.z or -1))
+	check(ns.targetSource == "service" and p and p.graph and near(routeEnd(), sv, 15) and math.abs(p.z[p.n] - 504) < 10,
+		string.format("the route walks to the banker, in Ironforge's halls (ends at height %.0f, the bank's floor 504)", p and p.z and p.z[p.n] or -1))
 	go("go auction house")
 	check(ns.service and ns.service.name == "Auctioneer Buckler", "go auction house: Ironforge's auctioneer (" .. said() .. ")")
 	go("go ah")
@@ -649,6 +651,21 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 	for _ = 1, 3 do M.Step(0.1) end
 	check(not ns.service and lastHint() == "here: Innkeeper Hearthstove (innkeeper)" and ns.targetSource == "guidelime",
 		"at the inn it says so and goes back to Guidelime's step (" .. lastHint() .. ")")
+	-- Stormwind's bankers stand behind their counter, on ground too small for path nodes and over a sealed space
+	-- under the floor: the route ends in front of the counter, in the bank's hall
+	goTo(0, 600, -8860) -- the Trade District
+	settle()
+	go("go bank")
+	sv = ns.service
+	check(sv and sv.name == "Olivia Burnside" and said():find("in Stormwind City", 1, true), "Stormwind: its own bank, not Ironforge's (" .. said() .. ")")
+	for _ = 1, 400 do
+		M.Step(0.05)
+		if ns.path and ns.path.graph and not ns.planning and near(routeEnd(), sv, 1) then break end
+	end
+	p = ns.path
+	local stand = p and p.n > 1 and { x = p.x[p.n - 1], y = p.y[p.n - 1] }
+	check(ns.targetSource == "service" and p and p.graph and near(stand, sv, 6) and math.abs(p.z[p.n] - 99.5) < 3,
+		string.format("the route ends within talking range of the banker, on the bank's floor (height %.1f, the floor 99.5)", p and p.z and p.z[p.n] or -1))
 	M.faction, M.zones, QuestieLoader, Questie = nil, nil, nil, nil
 end
 
