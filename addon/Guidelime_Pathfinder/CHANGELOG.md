@@ -1,5 +1,28 @@
 # Guidelime Pathfinder
 
+## 0.6.0 (beta)
+
+- Restart the game once after updating: the path data now comes as two more add-ons in the zip,
+  Guidelime_Pathfinder_Azeroth and Guidelime_Pathfinder_Kalimdor, and only the continent you are on is loaded
+  (about 50 MB of memory in the Eastern Kingdoms, 67 MB in Kalimdor, where 0.5.0 took 75 MB for both).
+- Dots stop at the edge: the path data says where the ground ends between its points, measured on the game's
+  collision surfaces to about a quarter of a yard, so dots no longer float up to 2 yards out past a ledge, a pit or
+  the side of a walkway.
+- Steep ground: the ground beside the walkable ground that is too steep to walk (an embankment, a hillside) is in the
+  path data too, so your height is followed when you slide down a bank, and dots that cross a bit of it stay on it.
+- Ramps: where a ramp or stairway rises off the ground, the ground under its low end (where nobody fits) is no
+  longer taken for a floor, so your height follows you up the ramp (Darnassus, Ironforge).
+- Caves under lakes are no longer taken for the lake's surface.
+- The camera: on a slope or looking up from low down, the game pulls its camera in front of the ground behind you;
+  the dots now do the same, instead of landing several yards off on hillsides.
+- Lifts: the Great Lift, Freewind Post's lifts and Undercity's three lifts are in the routes, and a Thunder Bluff lift
+  that was linked to the wrong landing is fixed. Walking up or down a cliff counts for the climb, so a route takes
+  the lift where that is quicker.
+- Checked against a simulated player who walks the game's collision surfaces like a real one (not through walls,
+  not up slopes too steep, not off big drops): on the route, 99.5% of the dots are within a yard of the true ground
+  (half of them within 6 cm), and walking 6 yards beside the route about half as many dots are off as in 0.5.0 in
+  the Eastern Kingdoms.
+
 ## 0.5.0 (beta)
 
 - Ground dots stay on the ground: the path data now has the ground height every 2 yards on every level you can

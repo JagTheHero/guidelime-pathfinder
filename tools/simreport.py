@@ -11,7 +11,7 @@ import numpy as np
 
 
 def main():
-    names, inst, unsure, dots = {}, {}, 0, 0
+    names, inst, unsure, dots, blocked = {}, {}, 0, 0, 0
     for line in open(sys.argv[1]):
         if line[0] == "R":
             f = line.split()
@@ -20,13 +20,12 @@ def main():
             unsure += 1
         elif line[0] == "D":
             dots += 1
-    P, D, skipped = {}, [], 0
+        elif line[0] == "B":
+            blocked += 1
+    P, D = {}, []
     for line in open(sys.argv[2]):
         f = line.split()
         if f[0] == "P":
-            if len(f) > 9 and f[9] == "1":
-                skipped += 1
-                continue  # a spot beside the route that is not on its level: nobody stands there
             P[(int(f[1]), int(f[2]))] = (float(f[3]), float(f[4]), float(f[6]), float(f[7]), float(f[5]), int(f[8]) if len(f) > 8 else 0)
         else:
             D.append((int(f[1]), int(f[2]), float(f[3]), float(f[4]), float(f[5]), float(f[6]), float(f[7]), float(f[8])))
@@ -36,9 +35,8 @@ def main():
     solved = sum(1 for v in P.values() if v[5] > 0)
     print("steps %d, of them with the dots' own way around something to the end of the leg: %d (%.1f%%)" % (len(P), solved, 100 * solved / max(1, len(P))))
     rows = []
-    if skipped:
-        print("left out %d steps beside the route off its level" % skipped)
     print("dots left out over no known ground: %d (%.2f%% of %d)" % (unsure, 100 * unsure / max(1, unsure + dots), unsure + dots))
+    print("steps where a player could not walk the route line: %d (%.2f%%)" % (blocked, 100 * blocked / max(1, len(P))))
     for r, s, a, x, y, z, zt, zn in D:
         if (r, s) not in P:
             continue

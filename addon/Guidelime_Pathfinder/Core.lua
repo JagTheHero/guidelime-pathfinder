@@ -370,6 +370,7 @@ end
 
 local CORNER_SNAP = 3 -- yards from a corner's layer the walked height may be before it goes back on it
 local UNSURE_HOLE = 2 -- yards over no known ground after which a dot's height is a guess
+local UNSURE_STEEP = 3 -- yards over ground too steep to walk after which it is not the way (nor quite the ground)
 local LOCAL_EVERY, LOCAL_MOVE = 0.5, 2 -- seconds, yards: how often the way to the end of the leg is looked at again
 
 -- The player's own way to the end of the leg they are on: straight when that walks (the usual: on or near the
@@ -384,9 +385,9 @@ function ns.LocalLeg(p, instance, x0, y0, z0)
 	if c.pathId == p.id and c.seg == p.seg and (dist(c.x0, c.y0, x0, y0) < LOCAL_MOVE or GetTime() - c.t < LOCAL_EVERY) then
 		return c.corners
 	end
-	local z, fell, lost = ns.Graph.Walk(instance, x0, y0, z0, bx, by)
+	local z, fell, lost, steep = ns.Graph.Walk(instance, x0, y0, z0, bx, by, nil, true)
 	local corners
-	if fell or lost or abs(z - bz) > CORNER_SNAP then corners = ns.Graph.LocalPath(instance, x0, y0, z0, bx, by, bz) end
+	if fell or lost or steep or abs(z - bz) > CORNER_SNAP then corners = ns.Graph.LocalPath(instance, x0, y0, z0, bx, by, bz) end
 	c.pathId, c.seg, c.x0, c.y0, c.t, c.corners = p.id, p.seg, x0, y0, GetTime(), corners
 	return corners
 end
@@ -396,8 +397,8 @@ end
 -- along a bridge and not the river under it), back on each corner's own layer at the corner (a graph route's corners
 -- are on its layers). Without ground data (or z0) the heights are the path's own. fn(x, y, z, along, lineZ, unsure)
 -- as SamplePath's, lineZ the height on the straight line between corners, unsure where the walk has gone more than
--- UNSURE_HOLE yards over no known ground (a slope too steep for the navmesh, the way off the graph to a target):
--- the height kept from before it, not the ground's.
+-- UNSURE_HOLE yards over no known ground (the way off the graph to a target: the height kept from before it, not the
+-- ground's) or UNSURE_STEEP yards over ground too steep to walk (a hillside a way off the route crosses).
 function ns.SampleGround(p, instance, x0, y0, z0, spacing, maxDist, fn)
 	if not z0 or not ns.Graph.HasGround(instance) then
 		local _, _, lineZ0 = ns.PointOnSeg(p, p.seg, p.segT or 0)
@@ -416,27 +417,28 @@ function ns.SampleGround(p, instance, x0, y0, z0, spacing, maxDist, fn)
 	end
 	local along, nextS, z, lineA = 0, spacing, z0, z0
 	local ax, ay = x0, y0
-	local done, hole = false, 0
+	local done, hole, steep = false, 0, 0
 	for i = 1, #xs do
 		local bx, by = xs[i], ys[i]
 		local L = dist(ax, ay, bx, by)
 		local lineB = zs[i] or lineA
 		local prevD, prevZ = 0, z
-		z = ns.Graph.Walk(instance, ax, ay, z, bx, by, function(_, _, wz, d, overHole)
+		z = ns.Graph.Walk(instance, ax, ay, z, bx, by, function(_, _, wz, d, overHole, onSteep)
 			hole = overHole and hole + d - prevD or 0
+			steep = onSteep and steep + d - prevD or 0
 			while nextS <= along + d + 1e-6 do
 				if nextS > maxDist then done = true return false end
 				local u = (nextS - along - prevD) / max(d - prevD, 1e-6)
 				local t = (nextS - along) / max(L, 1e-6)
 				if fn(ax + (bx - ax) * t, ay + (by - ay) * t, prevZ + (wz - prevZ) * u, nextS, lineA + (lineB - lineA) * t,
-						hole > UNSURE_HOLE) == false then
+						hole > UNSURE_HOLE or steep > UNSURE_STEEP) == false then
 					done = true
 					return false
 				end
 				nextS = nextS + spacing
 			end
 			prevD, prevZ = d, wz
-		end)
+		end, true)
 		along = along + L
 		if done or along >= maxDist then return end
 		if zs[i] then -- after a way over no known ground, the corner's layer wherever it is

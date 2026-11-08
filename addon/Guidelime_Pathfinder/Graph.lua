@@ -1,7 +1,9 @@
 local ADDON, ns = ...
 
 -- Walkable-path graphs, one per continent (instance ID), generated offline from the game's terrain,
--- buildings and doodads (tools/navbuild.cpp builds a navmesh and the graph, tools/pack.py packs it).
+-- buildings and doodads (tools/navbuild.cpp builds a navmesh and the graph, tools/pack.py packs it). Each
+-- continent's data is a load-on-demand addon of its own (DATA_ADDON), loaded the first time that continent is
+-- asked for: only the one you are on takes memory.
 -- Every edge is a straight line that was checked to be walkable (small props like trees aside), so a path
 -- is just a list of corners. Data is packed into base-64 strings and read in place.
 --
@@ -37,7 +39,15 @@ local BACK_COST = 4 -- per yard a route walks back over its first or last leg (b
 local LAYER_GAP = 8 -- yards of height between a node and the player before the node counts as another layer
 local FRAME_BUDGET_MS = 4
 
-local graphs = {}
+local DATA_ADDON = { [0] = "Guidelime_Pathfinder_Azeroth", [1] = "Guidelime_Pathfinder_Kalimdor" }
+local tried = {}
+local graphs = setmetatable({}, { __index = function(t, instance)
+	if tried[instance] or not DATA_ADDON[instance] then return end
+	tried[instance] = true
+	local load = C_AddOns and C_AddOns.LoadAddOn or LoadAddOn
+	if load then pcall(load, DATA_ADDON[instance]) end
+	return rawget(t, instance)
+end })
 local layersAt -- every walkable layer's height at a spot, from the walk grid (below)
 
 local function v3(s, p)
@@ -55,6 +65,7 @@ local function v4(s, p)
 	return ((DEC[a] * 64 + DEC[b]) * 64 + DEC[c]) * 64 + DEC[d]
 end
 
+-- called by the data addons (through the global GuidelimePathfinder, Core.lua)
 function Graph.Register(instance, g)
 	graphs[instance] = g
 end
@@ -542,6 +553,12 @@ end
 --     extra layers: count(3), then per extra layer the point's index as a step from the last one's (1 char below
 --       63, else 63 and the index(2)), and its height above the point's first + 2048 (2; 4095 then an absolute
 --       height(3) when over 511 yards away)
+--     edges: count(3), then per layer that ends before one of its 4 neighbours: the point's index as a step from
+--       the last one's (1 char: the step - 1 below 62, else 62 and the index(2)), the edge bits (2: 3 bits each for
+--       +x, -x, +y, -y from the low bits, how far it reaches in 2/7 yards, 7 all the way), and at a point with more
+--       than one layer, the layer's rank from the lowest (1). A point with an edge is in a full block.
+--   scells, steep: the steep grid, the same way without edges: ground within 12 yards of the walk grid's that is
+--   too steep to walk (an embankment, a hillside) but under a player who slides on it
 --   A chain codes each point as a step from the one before: 0-48 two points' steps a, b in -3..3 as
 --   (a + 3) * 7 + b + 3; 49-55 one step of c - 52; 56-59 one step of -5, -4, 4 or 5; 60 no ground; 61 four points
 --   without ground; 62 a step of the next char - 32; 63 an absolute height in the next 3 chars.
@@ -563,8 +580,12 @@ for b = 0, WN * WN - 1 do
 end
 local CACHE_CELLS = 256
 -- a grid point fits a reference height within CLIMB + SLOPE x its distance + REACH x how far back the reference
--- was measured (52-degree slopes, the steepest walkable)
-local CLIMB, SLOPE, REACH = 1.3, 1.3, 0.4
+-- was measured (52-degree slopes, the steepest walkable; STEEP_SLOPE on the steep grid, 70 degrees)
+local CLIMB, SLOPE, REACH, STEEP_SLOPE = 1.3, 1.3, 0.4, 2.75
+local NO_EDGE = 4095
+-- the two grids' fields in the data and their caches
+local WALK = { c = "wc", cells = "wcells", data = "walk", cache = "wcache", n = "wcached", edges = true }
+local STEEP = { c = "sc", cells = "scells", data = "steep", cache = "scache", n = "scached", slope = true }
 local WALK_STEP = 1 -- yards between the points Graph.Walk tries
 
 local function v5(s, p)
@@ -604,12 +625,12 @@ local function chain(s, p, pts, z, prev)
 	return p
 end
 
-local function walkCell(g, key)
-	local cache = g.wcache
-	if not cache then cache = {}; g.wcache, g.wcached = cache, 0 end
+local function walkCell(g, key, grid)
+	local cache = g[grid.cache]
+	if not cache then cache = {}; g[grid.cache], g[grid.n] = cache, 0 end
 	local cell = cache[key]
 	if cell ~= nil then return cell end
-	local s, lo, hi, off = g.wcells, 1, g.wc, nil
+	local s, lo, hi, off = g[grid.cells], 1, g[grid.c] or 0, nil
 	while lo <= hi do
 		local mid = floor((lo + hi) / 2)
 		local k = v4(s, (mid - 1) * 9 + 1)
@@ -618,7 +639,7 @@ local function walkCell(g, key)
 	end
 	cell = false
 	if off then
-		s = g.walk
+		s = g[grid.data]
 		local z, full, more = {}, {}, {}
 		local p = chain(s, off + 1, CORNERS, z, nil)
 		for c = 0, 10 do
@@ -652,17 +673,36 @@ local function walkCell(g, key)
 			end
 		end
 		cell = { z = z, full = full, more = more }
+		if grid.edges then
+			local n, edge = v3(s, p), nil
+			p, idx = p + 3, -1
+			for _ = 1, n do
+				local gap = DEC[byte(s, p)]
+				if gap < 62 then
+					idx, p = idx + gap + 1, p + 1
+				else
+					idx, p = v2(s, p + 1), p + 3
+				end
+				local bits, rank = v2(s, p), 0
+				p = p + 2
+				if more[idx] then rank, p = DEC[byte(s, p)], p + 1 end
+				edge = edge or {}
+				edge[idx * 8 + rank] = bits
+			end
+			cell.edge = edge
+		end
 	end
-	if g.wcached >= CACHE_CELLS then wipe(cache); g.wcached = 0 end
-	cache[key], g.wcached = cell, g.wcached + 1
+	if g[grid.n] >= CACHE_CELLS then wipe(cache); g[grid.n] = 0 end
+	cache[key], g[grid.n] = cell, g[grid.n] + 1
 	return cell
 end
 
 -- The layers at walk grid point (sx, sy) (global 2-yard indices) in quarter yards: the first, and a list of the
 -- others or nil. A point in a smooth block is the blend of its corners.
-local function walkPoint(g, sx, sy)
+local function walkPoint(g, sx, sy, grid)
+	grid = grid or WALK
 	local cx, cy = floor(sx / WP), floor(sy / WP)
-	local cell = walkCell(g, cx + cy * 1024)
+	local cell = walkCell(g, cx + cy * 1024, grid)
 	if not cell then return end
 	local i, j = sx - cx * WP, sy - cy * WP
 	local oi, oj = i % WB, j % WB
@@ -670,9 +710,9 @@ local function walkPoint(g, sx, sy)
 	if (oi == 0 and oj == 0) or cell.full[floor(j / WB) * WN + floor(i / WB)] then return z[j * WP + i], cell.more[j * WP + i] end
 	local c00 = z[(j - oj) * WP + i - oi]
 	if not c00 then return end
-	local c10 = walkPoint(g, sx - oi + WB, sy - oj) or c00
-	local c01 = walkPoint(g, sx - oi, sy - oj + WB) or c00
-	local c11 = walkPoint(g, sx - oi + WB, sy - oj + WB) or c00
+	local c10 = walkPoint(g, sx - oi + WB, sy - oj, grid) or c00
+	local c01 = walkPoint(g, sx - oi, sy - oj + WB, grid) or c00
+	local c11 = walkPoint(g, sx - oi + WB, sy - oj + WB, grid) or c00
 	local fx, fy = oi / WB, oj / WB
 	return c00 * (1 - fx) * (1 - fy) + c10 * fx * (1 - fy) + c01 * (1 - fx) * fy + c11 * fx * fy
 end
@@ -715,34 +755,73 @@ function Graph.HasGround(instance)
 	return g ~= nil and (g.wc or 0) > 0
 end
 
--- Ground height at (x, y), on the layer that continues from height `ref` measured `reach` yards away: the blend of
--- the four grid points around, each on its layer nearest ref, of those that fit ref (not the water under a bridge).
--- Returns nil, guess when none fits ref (guess: the blend of the layers nearest ref), and nil without ground here.
--- With below, the highest layer at most ref at each point instead (where a fall lands).
-function Graph.GroundZ(instance, x, y, ref, reach, below)
-	local g = graphs[instance]
-	if not g or not g.wc then return end
+-- Whether the walk grid's layer at height h at point (sx, sy) reaches (rx, ry) grid steps from it (each within
+-- -1..1): as far as its edges say towards each side.
+local function withinEdges(g, sx, sy, h, rx, ry)
+	local cx, cy = floor(sx / WP), floor(sy / WP)
+	local cell = walkCell(g, cx + cy * 1024, WALK)
+	local edge = cell and cell.edge
+	if not edge then return true end
+	local idx = (sy - cy * WP) * WP + sx - cx * WP
+	local more, rank = cell.more[idx], 0
+	if more then
+		local q = floor((h + OFFSET_Z) * WQ + 0.5)
+		if cell.z[idx] < q then rank = 1 end
+		for _, m in ipairs(more) do if m < q then rank = rank + 1 end end
+	end
+	local bits = edge[idx * 8 + rank]
+	if not bits then return true end
+	local cx3 = rx >= 0 and bits % 8 or floor(bits / 8) % 8
+	local cy3 = ry >= 0 and floor(bits / 64) % 8 or floor(bits / 512) % 8
+	return (cx3 == 7 or abs(rx) <= (cx3 + 0.5) / 7) and (cy3 == 7 or abs(ry) <= (cy3 + 0.5) / 7)
+end
+
+-- One grid's ground at (x, y) (see Graph.GroundZ); with edge (the walk grid), only within the edges of a point
+-- that fits.
+local function gridZ(g, grid, x, y, ref, reach, below, edge)
+	if not g[grid.c] then return end
 	local gx, gy = (x + OFFSET_XY) / WS, (y + OFFSET_XY) / WS
 	local ix, iy = floor(gx), floor(gy)
 	local fx, fy = gx - ix, gy - iy
-	local sum, wsum, any, anyW = 0, 0, 0, 0
+	local slope = grid.slope and STEEP_SLOPE or SLOPE
+	local sum, wsum, any, anyW, inside = 0, 0, 0, 0, not edge
 	for c = 0, 3 do
 		local dx, dy = c % 2, floor(c / 2)
 		local w = (dx == 1 and fx or 1 - fx) * (dy == 1 and fy or 1 - fy)
 		if w > 0 then
-			local first, more = walkPoint(g, ix + dx, iy + dy)
+			local first, more = walkPoint(g, ix + dx, iy + dy, grid)
 			local h = first and layer(first, more, ref, below)
 			if h then
 				any, anyW = any + w * h, anyW + w
 				local d = WS * sqrt((dx - fx) ^ 2 + (dy - fy) ^ 2)
-				if below or not ref or abs(h - ref) <= CLIMB + SLOPE * d + REACH * (reach or 0) then
+				if below or not ref or abs(h - ref) <= CLIMB + slope * d + REACH * (reach or 0) then
 					sum, wsum = sum + w * h, wsum + w
+					inside = inside or withinEdges(g, ix + dx, iy + dy, h, fx - dx, fy - dy)
 				end
 			end
 		end
 	end
-	if wsum > 1e-3 then return sum / wsum end
+	if wsum > 1e-3 and inside then return sum / wsum end
 	if anyW > 1e-3 then return nil, any / anyW end
+end
+
+-- Ground height at (x, y), on the layer that continues from height `ref` measured `reach` yards away: the blend of
+-- the four grid points around, each on its layer nearest ref, of those that fit ref (not the water under a bridge);
+-- where the walk grid has none, the steep grid's (a player sliding down a bank). Returns nil, guess when none fits
+-- ref (guess: the blend of the layers nearest ref), and nil without ground here. With below, the highest layer at
+-- most ref at each point instead (where a fall lands).
+function Graph.GroundZ(instance, x, y, ref, reach, below)
+	local g = graphs[instance]
+	if not g or not g.wc then return end
+	local z, guess = gridZ(g, WALK, x, y, ref, reach, below)
+	if below then
+		local sz = gridZ(g, STEEP, x, y, ref, reach, true)
+		return sz and (not z or sz > z) and sz or z
+	end
+	if z then return z end
+	local sz, sguess = gridZ(g, STEEP, x, y, ref, reach)
+	if sz then return sz end
+	return nil, guess or sguess
 end
 
 -- The layer continuing from height z at the nearest of the walk grid points a step further out than the four around
@@ -768,28 +847,39 @@ end
 
 -- Walks from (x0, y0) at height z0 to (x1, y1) a yard at a time like a player: up and down the ground the feet are
 -- on (stairs, a bridge, not the river under it), falling where it drops away (no ground on its layer within a grid
--- step and a half), keeping the height over a hole. fn(x, y, z, yards, overHole) at each step, if given, can stop
--- the walk by returning false. Returns the last height, whether the walk fell somewhere, and whether it crossed a hole or ran
--- into ground too high to climb (a wall, a cliff).
-function Graph.Walk(instance, x0, y0, z0, x1, y1, fn)
+-- step and a half), keeping the height over a hole. fn(x, y, z, yards, overHole, onSteep) at each step, if given,
+-- can stop the walk by returning false. Returns the last height, whether the walk fell somewhere, and whether it crossed a hole or ran
+-- into ground too high to climb (a wall, a cliff), and whether it went over ground too steep to walk (the steep
+-- grid: a player slides down it). With edge (the dots and the ways they show), the walk grid's ground ends where its
+-- edges say, not up to a grid step past them.
+function Graph.Walk(instance, x0, y0, z0, x1, y1, fn, edge)
 	local g = graphs[instance]
+	if not g or not g.wc then return z0, false, true, false end
 	local dx, dy = x1 - x0, y1 - y0
 	local len = sqrt(dx * dx + dy * dy)
 	local n = max(1, floor(len / WALK_STEP + 0.999))
-	local z, fell, lost = z0, false, false
+	local z, fell, lost, steep = z0, false, false, false
 	for k = 1, n do
 		local t = k / n
 		local x, y = x0 + dx * t, y0 + dy * t
-		local nz = Graph.GroundZ(instance, x, y, z, 0) or (g and g.wc and layerNearby(g, x, y, z))
+		local nz = gridZ(g, WALK, x, y, z, 0, nil, edge) or (not edge and layerNearby(g, x, y, z))
+		local onSteep = false
+		if not nz then
+			nz = gridZ(g, STEEP, x, y, z, 0)
+			if nz then steep, onSteep = true, true end
+		end
 		local hole = false
 		if not nz then
-			nz = Graph.GroundZ(instance, x, y, z + CLIMB, 0, true)
+			-- the highest ground under the feet on either grid; at an edge, under the layer that ends there
+			local ref = edge and z - CLIMB or z + CLIMB
+			local wz, sz = gridZ(g, WALK, x, y, ref, 0, true), gridZ(g, STEEP, x, y, ref, 0, true)
+			nz = wz and sz and max(wz, sz) or wz or sz
 			if nz then fell = true else nz, lost, hole = z, true, true end
 		end
 		z = nz
-		if fn and fn(x, y, z, len * t, hole) == false then break end
+		if fn and fn(x, y, z, len * t, hole, onSteep) == false then break end
 	end
-	return z, fell, lost
+	return z, fell, lost, steep
 end
 
 -- A walkable way on the walk grid from (x0, y0) at height z0 to (x1, y1) at height z1 when the straight line is not
@@ -856,8 +946,8 @@ function Graph.LocalPath(instance, x0, y0, z0, x1, y1, z1)
 	while i <= #pts do
 		local j = #pts
 		while j > i do
-			local z, fell, lost = Graph.Walk(instance, ax, ay, az, pts[j][1], pts[j][2])
-			if not fell and not lost and abs(z - pts[j][3]) <= CLIMB then break end
+			local z, fell, lost, steep = Graph.Walk(instance, ax, ay, az, pts[j][1], pts[j][2], nil, true)
+			if not fell and not lost and not steep and abs(z - pts[j][3]) <= CLIMB then break end
 			j = j - 1
 		end
 		corners[#corners + 1] = { pts[j][1], pts[j][2] }
@@ -905,6 +995,7 @@ end
 -- goal, the known flight masters, every dock, landing and portal. Walking counts only within one piece, at
 -- the straight-line distance times WALK_DETOUR; flights chain through known flight masters like the game's.
 local WALK_DETOUR = 1.3
+local CLIMB_DETOUR = 3 -- yards of walking per yard of height on foot (a way up or down a cliff winds; a lift does not)
 local TAKE_FLIGHT, LAND = 20, 5 -- seconds: talking to the flight master and taking off; landing
 local TAKE_RIDE = 15            -- seconds: getting on and off a boat, a zeppelin, a lift, the tram
 
@@ -1022,7 +1113,8 @@ function Graph.PlanTrip(s, t, opts)
 			for _, v in ipairs(places) do
 				if v.piece == u.piece and v.instance == u.instance and v ~= u and v ~= S and not done[v] then
 					local dx, dy = v.x - u.x, v.y - u.y
-					relax(v, sqrt(dx * dx + dy * dy) * WALK_DETOUR / speed, "walk")
+					local climb = v.z and u.z and abs(v.z - u.z) or 0
+					relax(v, (sqrt(dx * dx + dy * dy) + CLIMB_DETOUR * climb) * WALK_DETOUR / speed, "walk")
 				end
 			end
 		end

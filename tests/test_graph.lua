@@ -10,10 +10,18 @@ end
 
 GuidelimeArrow = M.NewFrame()
 GuidelimeData = {}
-local t0 = os.clock()
 local ns = M.LoadAddon(dir, "Guidelime_Pathfinder")
-print(string.format("     data loaded in %.0f ms, Lua memory %.0f MB", (os.clock() - t0) * 1000, collectgarbage("count") / 1024))
 M.Fire("ADDON_LOADED", "Guidelime_Pathfinder")
+-- each continent's data addon loads the first time it is asked for
+for _, inst in ipairs({ 0, 1 }) do
+	local t0 = os.clock()
+	collectgarbage("collect")
+	local m0 = collectgarbage("count")
+	local has = ns.Graph.Has(inst)
+	collectgarbage("collect")
+	check(has, string.format("continent %d's data loads when asked for: %.0f ms, %.0f MB of Lua memory", inst,
+		(os.clock() - t0) * 1000, (collectgarbage("count") - m0) / 1024))
+end
 
 local function route(instance, sx, sy, tx, ty, sz)
 	local result, done = nil, false
@@ -114,6 +122,18 @@ do
 	G.SetThreat(8, 2)
 	check(G.PathJam(0, plain) > 100, "the Horde gets the same troggs (hostile to both sides)")
 	G.SetThreat(0, 0)
+end
+-- lifts: from Freewind Post's mesa to the floor of Thousand Needles, the floor up to the Barrens by the Great Lift,
+-- Undercity up to the ruins of Lordaeron
+for _, c in ipairs({
+	{ "Freewind Post -> Thousand Needles floor", { instance = 1, x = -2498, y = -5404.6, z = 89.3 }, { instance = 1, x = -2470, y = -5300, z = -50 } },
+	{ "Thousand Needles floor -> top of the Great Lift", { instance = 1, x = -1900, y = -4700, z = -50 }, { instance = 1, x = -1800, y = -4600, z = 85 } },
+	{ "Undercity -> the ruins above", { instance = 0, x = 240, y = 1580, z = -41 }, { instance = 0, x = 250, y = 1640, z = 62 } },
+}) do
+	local trip = ns.Graph.PlanTrip(c[2], c[3], {})
+	local lift
+	for _, leg in ipairs(trip and trip.legs or {}) do lift = lift or leg.kind == "lift" end
+	check(lift, string.format("%s takes the lift (%s)", c[1], trip and string.format("%.0f s", trip.cost) or "no trip"))
 end
 print(string.format("     Lua memory after searches %.0f MB", collectgarbage("count") / 1024))
 

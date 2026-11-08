@@ -3,7 +3,8 @@ local ADDON, ns = ...
 -- EXPERIMENTAL ground dots. Addons cannot project world points to the screen, but the game projects one
 -- point for us: the in-world navigation marker. Knowing where that point is in the world, where the
 -- player stands and how far the camera is zoomed out, we solve the camera's yaw and pitch so that our
--- own projection lands exactly on the marker, then project the path ahead with the same camera.
+-- own projection lands exactly on the marker, then project the path ahead with the same camera (pulled in where
+-- the ground is in the way, as the game does).
 -- The field of view follows the cameraFov CVar: the game's vertical field of view is 0.6 x cameraFov
 -- (fitted to /gpath probe data: within a pixel at every zoom and pitch measured).
 
@@ -21,6 +22,9 @@ local VFOV_PER_FOV = 0.6
 -- one under the player's floor counts BELOW_COST per yard under it.
 local BELOW_COST, FLOOR_SLACK = 4, 0.5
 local KEEP_CAMERA = 0.25 -- seconds the last solved camera is used while the marker's spot is not ours yet
+-- The game pulls the camera in where the line back from the player to it runs into the ground (a slope behind the
+-- player, looking up from low down): it stays CAM_CLEAR yards over the ground, checked every CAM_STEP yards.
+local CAM_CLEAR, CAM_STEP = 0.3, 0.5
 
 local layer = CreateFrame("Frame", nil, UIParent)
 layer:SetAllPoints()
@@ -96,6 +100,19 @@ end
 local function wrap(a)
 	return (a + pi) % (2 * pi) - pi
 end
+
+-- How far back from the pivot F the camera at (yaw, pitch) really is: the zoom, or less where the line back to it
+-- runs into the ground on the player's level (at height pz).
+local function cameraDistance(instance, F, yaw, pitch, zoom, pz)
+	if zoom <= CAM_STEP or not ns.Graph.HasGround(instance) then return zoom end
+	local bx, by, bz = sin(yaw) * cos(pitch), -cos(yaw) * cos(pitch), sin(pitch)
+	for d = CAM_STEP, zoom, CAM_STEP do
+		local g = ns.Graph.GroundZ(instance, -(F[1] + bx * d), F[2] + by * d, pz, d)
+		if g and F[3] + bz * d < g + CAM_CLEAR then return max(CAM_STEP, d - CAM_STEP) end
+	end
+	return zoom
+end
+Dots.CameraDistance = cameraDistance
 
 -- The camera (yaw, pitch) that puts marker m on screen at (ox, oy), pivoting at F at distance d: every fit
 -- from guesses around the facing and the last camera, scored by how far it turns from the facing and how far
@@ -178,11 +195,22 @@ local function draw()
 
 	-- no spot at the game's distance (it has not caught up yet): the last camera for a moment
 	local yaw, pitch
-	if m then yaw, pitch = solveCamera(facing, F, d, ox, oy, m, pz) end
+	if m then
+		yaw, pitch = solveCamera(facing, F, d, ox, oy, m, pz)
+		-- pulled in by the ground: solve again from there with the nearer camera, until it settles
+		for _ = 1, 3 do
+			local cd = yaw and cameraDistance(instance, F, yaw, pitch, GetCameraZoom() or 0, pz)
+			if not cd or abs(cd - d) < 0.25 then break end
+			d = cd
+			local y2, p2 = solve2(yaw, pitch, function(a, b) setCamera(a, b, F[1], F[2], F[3], d) end, ox, oy, m[1], m[2], m[3])
+			if not y2 then break end
+			yaw, pitch = wrap(y2), p2
+		end
+	end
 	if yaw then
-		cam.yaw, cam.pitch, cam.t = yaw, pitch, now
+		cam.yaw, cam.pitch, cam.t, cam.d = yaw, pitch, now, d
 	elseif cam.yaw and cam.t and now - cam.t <= KEEP_CAMERA then
-		yaw, pitch = cam.yaw, cam.pitch
+		yaw, pitch, d = cam.yaw, cam.pitch, cam.d or d
 	else
 		cam.yaw = nil
 		return 0

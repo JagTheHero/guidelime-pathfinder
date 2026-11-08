@@ -19,6 +19,8 @@ M.ground = function(x, y)
 	local z, guess = ns.Graph.GroundZ(M.instance, x, y, M.pz, 1)
 	return z or guess
 end
+-- and the game's camera runs into it
+M.cameraGround = function(x, y, reach) return (ns.Graph.GroundZ(M.instance, x, y, M.pz, reach)) end
 M.Fire("ADDON_LOADED", "Guidelime_Pathfinder")
 M.Fire("PLAYER_LOGIN")
 for _ = 1, 5 do M.Step(0.05) end
@@ -94,7 +96,45 @@ for _, zoom in ipairs({ 5, 12, 25 }) do
 	end
 end
 check(cases > 150 and bad == 0, string.format("cameras turned up to 50 degrees from the facing, at any pitch and zoom: %d of %d off (worst %.1f px)", bad, cases, sweepWorst))
+-- the camera swung round the character fast (mouse look), 20 degrees a frame
+M.zoom, M.truePitch, M.trueYaw = 12, 0.35, M.facing
+ahead(30, 0)
+local swingBad, swingN, swingWorst = 0, 0, 0
+for k = 1, 36 do
+	M.trueYaw = M.facing + math.rad(20 * k)
+	worst, count = dotError()
+	if count > 0 then
+		swingN, swingWorst = swingN + 1, math.max(swingWorst, worst)
+		if worst > 2 then swingBad = swingBad + 1 end
+	end
+end
+check(swingN >= 8 and swingBad == 0, string.format("camera swung round the character 20 degrees a frame: %d of %d frames off (worst %.1f px)", swingBad, swingN, swingWorst))
 M.instance, M.trueYaw, M.truePitch, M.facing, M.zoom = 1, -0.2, 0.3, 0.4, 12
+GuidelimeArrow.element = { wx = -150, wy = 300, instance = 1 }
+for _ = 1, 3 do M.Step(0.1) end
+
+-- looking up from low down: the ground behind the player pulls the game's camera in nearer than the zoom, and the
+-- solved one with it (the Crossroads)
+do
+	local zone = M.zone
+	M.instance, M.px, M.py, M.zoom = 1, -2650, -450, 20
+	M.zone = { id = 1411, left = M.px + 2000, top = M.py + 2000, w = 4000, h = 4000 }
+	M.pz = select(1, ns.Graph.GroundZ(1, M.px, M.py, ns.Graph.LikelyZ(1, M.px, M.py), 6)) or 0
+	ns.player.gx, ns.player.gy, ns.player.ginstance, ns.player.z = M.px, M.py, 1, M.pz
+	M.facing, M.trueYaw, M.truePitch = 0.4, 0.4, -0.1
+	local tx, ty = M.px + 60 * math.sin(M.facing), M.py + 60 * math.cos(M.facing)
+	GuidelimeArrow.element = { wx = tx, wy = ty, instance = 1 }
+	for _ = 1, 2000 do
+		M.Step(0.05)
+		local p = ns.path
+		if p and not ns.planning and math.abs(p.x[p.n] - tx) < 1 and math.abs(p.y[p.n] - ty) < 1 then break end
+	end
+	for _ = 1, 3 do worst, count = dotError() end
+	check(M.camDist < M.zoom - 2 and count > 0 and worst < 2, string.format(
+		"camera pulled in by the ground to %.1f of %d yd: %d dots match (worst %.2f px)", M.camDist, M.zoom, count, worst))
+	M.zone = zone
+end
+M.instance, M.px, M.py, M.trueYaw, M.truePitch, M.facing, M.zoom = 1, 0, 0, -0.2, 0.3, 0.4, 12
 GuidelimeArrow.element = { wx = -150, wy = 300, instance = 1 }
 for _ = 1, 3 do M.Step(0.1) end
 

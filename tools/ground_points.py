@@ -1,7 +1,7 @@
 """Write test points for tests/test_ground.lua: points of the walk grid with every layer, straight from navbuild's
-.hgt2 (before packing), around random graph nodes.
+.hgt3 (before packing), around random graph nodes.
 
-usage: ground_points.py <out.tsv> <name>:<instance> ...   (reads build/wg/<name>.hgt2 and data/graph/<name>.graph)
+usage: ground_points.py <out.tsv> <name>:<instance> ...   (reads build/wg/<name>.hgt3 and data/graph/<name>.graph)
 """
 import random
 import sys
@@ -20,7 +20,7 @@ def main():
     rnd = random.Random(7)
     for arg in sys.argv[2:]:
         name, instance = arg.split(":")
-        cells = read_hgt2("build/wg/%s.hgt2" % name)
+        cells = read_hgt2("build/wg/%s.hgt3" % name)
         nodes, _ = read_graph("data/graph/%s.graph" % name)
         picked = 0
         while picked < 2000:

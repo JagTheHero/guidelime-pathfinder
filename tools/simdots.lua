@@ -1,15 +1,22 @@
--- Walks routes through the addon's own code (tests/mock_wow.lua) and writes where it puts the player's height and
--- every ground dot, for `navbuild simtruth` to check against the navmesh.
--- usage: lua51 tools/simdots.lua <addon dir> <routes.txt> <out.tsv> [side yards]   (run from the repository root)
---   side: walk that far beside the route line (left on odd routes, right on even ones), where the ground is
+-- Walks routes through the addon's own code (tests/mock_wow.lua) with a player that walks on the game's collision
+-- surfaces like a real one (`navbuild geoserve`: no walking through walls or up slopes too steep, no jumping off big
+-- drops), and writes where the addon puts the player's height and every ground dot, for `navbuild simtruth` to check
+-- against the collision surfaces.
+-- usage: lua51 tools/simdots.lua <addon dir> <routes.txt> <out.tsv> <geo dir> [side yards]   (from the repository root)
+--   geo dir: data/geo/<map> of the routes' map (one map per routes file)
+--   side: walk that far beside the route line (left on odd routes, right on even ones) where a player can, else on it
 --   routes.txt: instance sx sy tx ty sz name (tools/simroutes.py; sz the start's height or nan)
 -- Output lines (HereBeDragons coordinates):
 --   R route instance name corners: x y z ...      a planned route (again after every replan)
---   P route step x y along pz k ax ay n cx cy ...  the player: distance along the route (at the route line's point
---                                                  ax, ay beside them), height the addon tracks, the corner the marker
---                                                  is on, and the n corners of the dots' own way to the end of the leg
+--   P route step x y along pz k ax ay tz n cx cy ...  the player: distance along the route (at the route line's
+--                                                  point ax, ay beside them), height the addon tracks, the corner the
+--                                                  marker is on, the true height, and the n corners of the dots' own
+--                                                  way to the end of the leg
 --   D route step along x y z                       a ground dot: yards along the dots' line from the player
 --   U route step along x y z                       a dot Dots.lua leaves out: over no known ground
+--   B route step x y z why                         where a real player cannot walk on along the route line (why: a
+--                                                  hole, drop, slope too steep, wall): the player is put on it there,
+--                                                  and the addon told their height (it is no walk to follow)
 package.path = "tests/?.lua;" .. package.path
 local M = require("mock_wow")
 GuidelimeArrow = M.NewFrame()
@@ -21,23 +28,40 @@ ns.db.dots = true
 
 local out = assert(io.open(arg[3], "w"))
 local SPEED, DT, MAX_STEPS = 7, 0.1, 2500
-local SIDE = tonumber(arg[4] or "0")
+local SIDE = tonumber(arg[5] or "0")
 local MAX_REPLANS = 4 -- a route that keeps replanning (a target in a pocket the graph cannot reach) stops there
-local STALL_STEPS = 60 -- a walk beside the route that gets no further along it for this many steps (going back and
--- forth at a corner) stops there
-local routeId, failed, walked, offGraph, stuck, stalled = 0, 0, 0, 0, 0, 0
+local STALL_STEPS = 60 -- a walk that gets no further along the route for this many steps stops there
+local LINE_DROP, SIDE_DROP = 6, 3 -- yards: the biggest drop a player following the route line / walking beside it takes
+local OTHER_LEVEL = 5 -- yards off the route line's height beside it: on another level (a walkway over a ramp)
+local routeId, failed, walked, offGraph, stuck, stalled, blocked = 0, 0, 0, 0, 0, 0, 0
+local WHY = { [1] = "hole", [2] = "drop", [3] = "steep", [4] = "wall-low", [5] = "wall-high" } -- navbuild's WALK_*
 
+-- the collision surfaces, from navbuild geoserve through a named pipe
+local fifo = arg[3] .. ".fifo"
+os.remove(fifo)
+assert(os.execute("mkfifo '" .. fifo .. "'") == 0)
+local geoIn = assert(io.popen("build/navbuild geoserve '" .. arg[4] .. "' - - > '" .. fifo .. "'", "w"))
+local geoOut = assert(io.open(fifo, "r"))
+local function geo(fmt, ...)
+	geoIn:write(string.format(fmt, ...), "\n")
+	geoIn:flush()
+	local t = {}
+	for v in geoOut:read("*l"):gmatch("%S+") do t[#t + 1] = tonumber(v) end
+	return unpack(t)
+end
+
+-- the route line's point d yards ahead of (i, t): x, y, facing, the line's height there
 local function pointAhead(p, i, t, d)
-	local x, y = ns.PointOnSeg(p, i, t)
+	local x, y, z = ns.PointOnSeg(p, i, t)
 	while i < p.n do
-		local nx, ny = p.x[i + 1], p.y[i + 1]
+		local nx, ny, nz = p.x[i + 1], p.y[i + 1], p.z[i + 1]
 		local L = math.sqrt((nx - x) ^ 2 + (ny - y) ^ 2)
 		if L >= d then
 			local u = L > 0 and d / L or 0
-			return x + (nx - x) * u, y + (ny - y) * u, math.atan2(nx - x, ny - y)
+			return x + (nx - x) * u, y + (ny - y) * u, math.atan2(nx - x, ny - y), z + (nz - z) * u
 		end
 		d = d - L
-		x, y = nx, ny
+		x, y, z = nx, ny, nz
 		i = i + 1
 	end
 	return x, y
@@ -65,9 +89,10 @@ for line in io.lines(arg[2]) do
 		if ns.path and ns.path.graph and not ns.planning then break end
 	end
 	local p = ns.path
+	local th = p and p.graph and geo("n %.3f %.3f %.3f 6", sx, sy, sz == sz and sz or p.z[1])
 	if not (p and p.graph) then
 		failed = failed + 1
-	elseif p.n > 1 and math.sqrt((p.x[2] - p.x[1]) ^ 2 + (p.y[2] - p.y[1]) ^ 2) > 25 then
+	elseif p.n > 1 and math.sqrt((p.x[2] - p.x[1]) ^ 2 + (p.y[2] - p.y[1]) ^ 2) > 25 or th ~= th then
 		offGraph = offGraph + 1 -- a start on a scrap of ground the packer left out: a straight line to the graph
 	else
 		walked = walked + 1
@@ -84,17 +109,28 @@ for line in io.lines(arg[2]) do
 				end
 				p.simId = p.id
 			end
-			local x, y, facing = pointAhead(p, p.seg, p.segT or 0, SPEED * DT)
+			local x, y, facing, lineZ = pointAhead(p, p.seg, p.segT or 0, SPEED * DT)
 			if not facing then break end
-			-- beside the line, where there is ground on the line's level (else on it)
+			-- beside the line where a player can walk there, else back to it; where the line itself cannot be walked,
+			-- on it anyway (B)
 			local side = SIDE * (routeId % 2 == 1 and -1 or 1)
+			if math.abs(th - lineZ) > OTHER_LEVEL then side = 0 end -- beside the route but on another level: back to it
 			local ox, oy = x - side * math.cos(facing), y + side * math.sin(facing)
-			local lz = ns.player.z
-			if side ~= 0 and lz then
-				local _, fell, lost = ns.Graph.Walk(inst, x, y, lz, ox, oy)
-				if fell or lost then ox, oy = x, y end
+			local want = math.sqrt((ox - M.px) ^ 2 + (oy - M.py) ^ 2)
+			local nx, ny, nh, share, why = geo("w %.3f %.3f %.3f %.3f %.3f %.1f", M.px, M.py, th, ox, oy, side ~= 0 and SIDE_DROP or LINE_DROP)
+			if share * want < 0.5 * math.min(want, SPEED * DT) and side ~= 0 then
+				want = math.sqrt((x - M.px) ^ 2 + (y - M.py) ^ 2)
+				nx, ny, nh, share, why = geo("w %.3f %.3f %.3f %.3f %.3f %.1f", M.px, M.py, th, x, y, LINE_DROP)
 			end
-			M.px, M.py, M.facing = ox, oy, facing
+			if share * want < 0.5 * math.min(want, SPEED * DT) then
+				blocked = blocked + 1
+				out:write(string.format("B %d %d %.2f %.2f %.2f %s\n", routeId, step + 1, M.px, M.py, th, WHY[why] or why))
+				nx, ny, nh = x, y, geo("n %.3f %.3f %.3f 6", x, y, lineZ)
+				if nh ~= nh then nh = lineZ end
+				-- no player gets there like that: the addon is told where they are, as if it had followed them
+				ns.player.gx, ns.player.gy, ns.player.z = nx, ny, nh
+			end
+			M.px, M.py, M.facing, th = nx, ny, facing, nh
 			M.Step(DT)
 			step = step + 1
 			p = ns.path
@@ -107,8 +143,8 @@ for line in io.lines(arg[2]) do
 				local pz = ground and (ns.Graph.GroundZ(inst, M.px, M.py, ground, 1) or ground)
 				local lc = {}
 				for _, c in ipairs(ns.LocalLeg(p, inst, M.px, M.py, pz) or {}) do lc[#lc + 1] = string.format("%.2f %.2f", c[1], c[2]) end
-				out:write(string.format("P %d %d %.2f %.2f %.2f %.2f %d %.2f %.2f %d%s%s\n", routeId, step, M.px, M.py, along, pz or 0 / 0, p.k,
-					ax, ay, #lc, #lc > 0 and " " or "", table.concat(lc, " ")))
+				out:write(string.format("P %d %d %.2f %.2f %.2f %.2f %d %.2f %.2f %.2f %d%s%s\n", routeId, step, M.px, M.py, along, pz or 0 / 0, p.k,
+					ax, ay, th, #lc, #lc > 0 and " " or "", table.concat(lc, " ")))
 				ns.SampleGround(p, inst, M.px, M.py, pz, ns.db.dotSpacing, ns.db.dotRange, function(dx, dy, dz, a, _, unsure)
 					if a >= 2 then out:write(string.format("%s %d %d %.2f %.2f %.2f %.2f\n", unsure and "U" or "D", routeId, step, a, dx, dy, dz)) end
 				end)
@@ -118,5 +154,8 @@ for line in io.lines(arg[2]) do
 	end
 end
 out:close()
-io.stderr:write(string.format("%d routes walked, %d without a graph route, %d starting off the graph, %d stopped after %d replans, %d stalled, %d route records\n",
-	walked, failed, offGraph, stuck, MAX_REPLANS, stalled, routeId))
+geoIn:close()
+geoOut:close()
+os.remove(fifo)
+io.stderr:write(string.format("%d routes walked, %d without a graph route, %d starting off the graph, %d stopped after %d replans, %d stalled, "
+	.. "%d steps where the route line could not be walked, %d route records\n", walked, failed, offGraph, stuck, MAX_REPLANS, stalled, blocked, routeId))

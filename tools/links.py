@@ -48,12 +48,19 @@ SHIPS = {
     11616: ("boat", "A", ["Auberdine", "Stormwind Harbor"]),
 }
 
-# Lifts: (continent, lower landing, upper landing) in world (X, Y, Z), found as the only places where Thunder
-# Bluff's mesa (cut off from the ground in the graph) has walkable ground a lift's travel (71 yards, from
-# TransportAnimation 47296/47297) below it.
+# Lifts: (continent, lower landing, upper landing, TransportAnimation id) in world (X, Y, Z). Thunder Bluff's,
+# found as the only places where its mesa (cut off from the ground in the graph) has walkable ground a lift's
+# travel (71 yards, from TransportAnimation 47296/47297) below it; the others at their cars in the CMaNGOS
+# database (gameobject type 11), the landings at the ends of the car's travel (TransportAnimation): the Great
+# Lift and Freewind Post (129.5 yards), Undercity's three (96.5 yards, the top landing on the ruins' floor).
 LIFTS = [
     (1, (-1092, 140, 74), (-1100, 132, 147), 47296),
     (1, (-1084, -100, 82), (-1076, -108, 151), 47296),
+    (1, (-4670.8, -1849.6, -44.1), (-4665.4, -1827.7, 85.4), 11898),  # the Great Lift
+    (1, (-5382.5, -2489.4, -40.5), (-5399.2, -2504.6, 89.0), 11898),  # Freewind Post
+    (0, (1596.2, 291.8, -40.8), (1596.2, 291.8, 62.3), 20652),        # Undercity
+    (0, (1595.3, 188.6, -40.8), (1595.3, 188.6, 62.3), 20652),
+    (0, (1544.2, 240.8, -40.8), (1544.2, 240.8, 62.3), 20652),
 ]
 # Deeprun Tram entrances (AreaTrigger 2173 Stormwind, 2175 Ironforge) and the Teldrassil portals
 # (AreaTrigger 542 Rut'theran Village up, 527 Darnassus down); you come out next to the other end's trigger.
@@ -177,8 +184,8 @@ def main():
         cycles[tid] = max(cycles[tid], anim.field(r, 2, rid))
     for cont, low, high, tid in LIFTS:
         cycle = cycles[tid] / 1000.0
-        lo = walk.snap(cont, *low, radius=20, above=3)[:3]
-        hi = walk.snap(cont, *high, radius=20, above=3)[:3]
+        lo = walk.snap(cont, *low, radius=40, above=3)[:3]  # the graph's nodes near a lift may be some way off
+        hi = walk.snap(cont, *high, radius=40, above=3)[:3]
         data[cont]["rides"].append(["lift", "up", *hbd(*lo), cont, *hbd(*hi), round(cycle / 2), round(cycle / 2), ""])
         data[cont]["rides"].append(["lift", "down", *hbd(*hi), cont, *hbd(*lo), round(cycle / 2), round(cycle / 2), ""])
 

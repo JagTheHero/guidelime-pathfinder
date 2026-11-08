@@ -102,21 +102,33 @@ static void loadNeighbourhood(const std::string& dir, int col, int row, Geo& out
 static const float GEO_BUCKET = 4.0f;
 static void tileOf(float rx, float rz, int& col, int& row) { col = (int)floorf(32 - rx / TILE); row = (int)floorf(32 - rz / TILE); }
 
+// The surface of the water a body at height h is in (the lowest water surface over h with no solid surface between:
+// not a lake over the roof of a cave), or FLT_MAX.
+static float waterOver(const std::vector<float>& hs, const std::vector<unsigned char>& wet, float h) {
+	float water = FLT_MAX;
+	for (size_t i = 0; i < hs.size(); i++) if (wet[i] && hs[i] > h) water = std::min(water, hs[i]);
+	for (size_t i = 0; i < hs.size() && water < FLT_MAX; i++) if (!wet[i] && hs[i] > h + 0.3f && hs[i] < water) return FLT_MAX;
+	return water;
+}
+
 struct GeoTile {
 	float x0 = 0, z0 = 0;
 	int nb = 0;
 	std::vector<float> v;
 	std::vector<int> t, start, items;
 	std::vector<unsigned char> liquid; // per kept triangle: a water (or other liquid) surface
-	bool load(const std::string& dir, int col, int row) {
+	std::vector<float> cosn;           // per kept triangle: the cosine of its slope
+	std::vector<int> wt, wstart, witems; // with walls: the walls (steeper than the kept ones), bucketed the same way
+	bool load(const std::string& dir, int col, int row, bool walls = false) {
 		Geo g;
 		loadNeighbourhood(dir, col, row, g);
 		x0 = (31 - col) * TILE; z0 = (31 - row) * TILE;
 		nb = (int)ceilf(TILE / GEO_BUCKET);
 		start.assign(nb * nb + 1, 0);
+		wstart.assign(nb * nb + 1, 0);
 		if (g.a.empty()) return false;
 		v = std::move(g.v);
-		std::vector<std::vector<int>> bucket(nb * nb);
+		std::vector<std::vector<int>> bucket(nb * nb), wbucket(walls ? nb * nb : 0);
 		size_t nt = g.a.size();
 		for (size_t i = 0; i < nt; i++) {
 			const float* a = &v[g.t[i * 3] * 3]; const float* b = &v[g.t[i * 3 + 1] * 3]; const float* c = &v[g.t[i * 3 + 2] * 3];
@@ -124,24 +136,55 @@ struct GeoTile {
 			float ny = e0[2] * e1[0] - e0[0] * e1[2];
 			float nx = e0[1] * e1[2] - e0[2] * e1[1], nz = e0[0] * e1[1] - e0[1] * e1[0];
 			float len = sqrtf(nx * nx + ny * ny + nz * nz);
-			if (len < 1e-8f || fabsf(ny) / len < 0.2f) continue; // a wall
+			if (len < 1e-8f) continue;
+			bool wall = fabsf(ny) / len < 0.2f;
+			if (wall && !walls) continue;
 			float mnx = std::min({ a[0], b[0], c[0] }), mxx = std::max({ a[0], b[0], c[0] });
 			float mnz = std::min({ a[2], b[2], c[2] }), mxz = std::max({ a[2], b[2], c[2] });
 			if (mxx < x0 || mnx > x0 + TILE || mxz < z0 || mnz > z0 + TILE) continue;
-			int ti = (int)(t.size() / 3);
-			t.push_back(g.t[i * 3]); t.push_back(g.t[i * 3 + 1]); t.push_back(g.t[i * 3 + 2]);
-			liquid.push_back(g.a[i] == A_SWIM);
+			std::vector<int>& tt = wall ? wt : t;
+			int ti = (int)(tt.size() / 3);
+			tt.push_back(g.t[i * 3]); tt.push_back(g.t[i * 3 + 1]); tt.push_back(g.t[i * 3 + 2]);
+			if (!wall) { liquid.push_back(g.a[i] == A_SWIM); cosn.push_back(fabsf(ny) / len); }
 			int bx0 = std::max(0, (int)floorf((mnx - x0) / GEO_BUCKET)), bx1 = std::min(nb - 1, (int)floorf((mxx - x0) / GEO_BUCKET));
 			int bz0 = std::max(0, (int)floorf((mnz - z0) / GEO_BUCKET)), bz1 = std::min(nb - 1, (int)floorf((mxz - z0) / GEO_BUCKET));
-			for (int bz = bz0; bz <= bz1; bz++) for (int bx = bx0; bx <= bx1; bx++) bucket[bz * nb + bx].push_back(ti);
+			for (int bz = bz0; bz <= bz1; bz++) for (int bx = bx0; bx <= bx1; bx++) (wall ? wbucket : bucket)[bz * nb + bx].push_back(ti);
 		}
 		for (int i = 0; i < nb * nb; i++) { start[i + 1] = start[i] + (int)bucket[i].size(); items.insert(items.end(), bucket[i].begin(), bucket[i].end()); }
+		for (int i = 0; walls && i < nb * nb; i++) { wstart[i + 1] = wstart[i] + (int)wbucket[i].size(); witems.insert(witems.end(), wbucket[i].begin(), wbucket[i].end()); }
 		return true;
 	}
-	// heights of the surfaces over recast (x, z); wet: whether each is a liquid's
-	void heightsAt(float x, float z, std::vector<float>& out, std::vector<unsigned char>* wet = nullptr) const {
+	// whether the segment from (x0, y, z0) to (x1, y, z1) goes through a wall (load with walls)
+	bool wallHit(float ax, float az, float bx, float bz, float y) const {
+		float d[3] = { bx - ax, 0, bz - az };
+		int cx0 = std::max(0, (int)floorf((std::min(ax, bx) - x0) / GEO_BUCKET)), cx1 = std::min(nb - 1, (int)floorf((std::max(ax, bx) - x0) / GEO_BUCKET));
+		int cz0 = std::max(0, (int)floorf((std::min(az, bz) - z0) / GEO_BUCKET)), cz1 = std::min(nb - 1, (int)floorf((std::max(az, bz) - z0) / GEO_BUCKET));
+		for (int cz = cz0; cz <= cz1; cz++) for (int cx = cx0; cx <= cx1; cx++) {
+			for (int k = wstart[cz * nb + cx], e = wstart[cz * nb + cx + 1]; k < e; k++) {
+				int ti = witems[k];
+				const float* a = &v[wt[ti * 3] * 3]; const float* b = &v[wt[ti * 3 + 1] * 3]; const float* c = &v[wt[ti * 3 + 2] * 3];
+				// Moller-Trumbore: p + s d, s in [0, 1]
+				float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+				float pv[3] = { d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0] };
+				float det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+				if (fabsf(det) < 1e-9f) continue;
+				float inv = 1 / det, tv[3] = { ax - a[0], y - a[1], az - a[2] };
+				float u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+				if (u < 0 || u > 1) continue;
+				float qv[3] = { tv[1] * e1[2] - tv[2] * e1[1], tv[2] * e1[0] - tv[0] * e1[2], tv[0] * e1[1] - tv[1] * e1[0] };
+				float w = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) * inv;
+				if (w < 0 || u + w > 1) continue;
+				float sp = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+				if (sp >= 0 && sp <= 1) return true;
+			}
+		}
+		return false;
+	}
+	// heights of the surfaces over recast (x, z); wet: whether each is a liquid's; cs: the cosine of each one's slope
+	void heightsAt(float x, float z, std::vector<float>& out, std::vector<unsigned char>* wet = nullptr, std::vector<float>* cs = nullptr) const {
 		out.clear();
 		if (wet) wet->clear();
+		if (cs) cs->clear();
 		int bx = (int)floorf((x - x0) / GEO_BUCKET), bz = (int)floorf((z - z0) / GEO_BUCKET);
 		if (bx < 0 || bz < 0 || bx >= nb || bz >= nb) return;
 		for (int k = start[bz * nb + bx], e = start[bz * nb + bx + 1]; k < e; k++) {
@@ -154,6 +197,7 @@ struct GeoTile {
 			if (u < -1e-4f || w < -1e-4f || u + w > 1 + 1e-4f) continue;
 			out.push_back(a[1] + u * (b[1] - a[1]) + w * (c[1] - a[1]));
 			if (wet) wet->push_back(liquid[ti]);
+			if (cs) cs->push_back(cosn[ti]);
 		}
 	}
 };
@@ -163,6 +207,7 @@ static const float Builder_WALK_STEP = 2.0f; // Builder::WALK_STEP (Builder come
 // Per-thread cache of loaded GeoTiles (a few at a time: city tiles are big).
 struct GeoCache {
 	std::string dir;
+	bool walls = false; // load the walls too (walkTo)
 	std::vector<std::pair<std::pair<int, int>, std::unique_ptr<GeoTile>>> tiles;
 	std::vector<float> hs;
 	const GeoTile* at(float rx, float rz) {
@@ -172,7 +217,7 @@ struct GeoCache {
 			return tiles[0].second.get();
 		}
 		auto g = std::make_unique<GeoTile>();
-		g->load(dir, col, row);
+		g->load(dir, col, row, walls);
 		tiles.insert(tiles.begin(), std::make_pair(std::make_pair(col, row), std::move(g)));
 		if (tiles.size() > 4) tiles.pop_back();
 		return tiles[0].second.get();
@@ -185,29 +230,144 @@ struct GeoCache {
 		return best;
 	}
 	std::vector<unsigned char> wet;
-	// walking on from height h: where the feet land at (rx, rz): the highest ground at most CLIMB above h
-	// (stairs, kerbs, a rock), else falling to the highest below; swimming on the water over it where that is over
-	// SWIM_DEPTH deep;
-	// h itself over a hole
-	float step(float rx, float rz, float h) {
+	// Ground going on from height h within CRACK yards ahead of (x, z) in direction (dx, dz) (a unit vector): the
+	// far side of a crack between two floor pieces or bridge planks, which a body steps over. -FLT_MAX if none.
+	float acrossCrack(float x, float z, float h, float dx, float dz, float below) {
+		static const float CRACK = 0.75f;
+		float best = -FLT_MAX;
+		for (float d = 0.25f; d <= CRACK + 1e-3f && best == -FLT_MAX; d += 0.25f) {
+			at(x + dx * d, z + dz * d)->heightsAt(x + dx * d, z + dz * d, hs);
+			for (float v : hs) if (v <= h + AGENT_CLIMB && v >= h - below) best = std::max(best, v);
+		}
+		return best;
+	}
+	// walking on from height h in direction (dx, dz): where the feet land at (rx, rz): the highest ground at most
+	// CLIMB above h (stairs, kerbs, a rock), else falling to the highest below (not over a crack); swimming on the
+	// water over it where that is over SWIM_DEPTH deep; h itself over a hole
+	float step(float rx, float rz, float h, float dx, float dz) {
 		static const float SWIM_DEPTH = 1.5f;
 		at(rx, rz)->heightsAt(rx, rz, hs, &wet);
 		float ground = -FLT_MAX, water = FLT_MAX;
 		for (size_t i = 0; i < hs.size(); i++) if (!wet[i] && hs[i] <= h + AGENT_CLIMB) ground = std::max(ground, hs[i]);
-		for (size_t i = 0; i < hs.size(); i++) if (wet[i] && hs[i] > ground) water = std::min(water, hs[i]); // a swimmer floats up
+		water = waterOver(hs, wet, ground); // a swimmer floats up
 		if (water < FLT_MAX && water > ground + SWIM_DEPTH) return water;
-		if (ground < h - Builder_WALK_STEP) { // a crack between two floor pieces or bridge planks is no hole: a body is
-			// CRACK yards across
-			static const float CRACK = 1.0f;
-			float best = -FLT_MAX;
-			for (int k = 0; k < 8; k++) {
-				float a = k * (float)M_PI / 4, x = rx + CRACK * cosf(a), z = rz + CRACK * sinf(a);
-				at(x, z)->heightsAt(x, z, hs, &wet);
-				for (size_t i = 0; i < hs.size(); i++) if (hs[i] <= h + AGENT_CLIMB && hs[i] >= h - Builder_WALK_STEP) best = std::max(best, hs[i]);
-			}
+		if (ground < h - Builder_WALK_STEP) {
+			float best = acrossCrack(rx, rz, h, dx, dz, Builder_WALK_STEP);
 			if (best > -FLT_MAX) return best;
 		}
 		return ground == -FLT_MAX ? h : ground;
+	}
+	// How far walkable ground going on from height h at (x, z) reaches in direction (dx, dz) (a unit axis), up to
+	// maxLen: eighth-yard steps up or down at most CLIMB (a stair, a kerb) onto ground no steeper than 55 degrees
+	// (or a bump in it) or water, over cracks under half a yard. The end is halfway past the last step.
+	std::vector<float> ecs;
+	float walkEdge(float x, float z, float h, float dx, float dz, float maxLen) {
+		static const float SUB = 0.125f, CRACK = 0.5f;
+		static const float COS_MAX = cosf(55.0f * (float)M_PI / 180), RISE_MAX = SUB * tanf(55.0f * (float)M_PI / 180) + 0.02f;
+		float cur = h, last = 0;
+		for (float d = SUB; d <= maxLen + 1e-4f; d += SUB) {
+			at(x + dx * d, z + dz * d)->heightsAt(x + dx * d, z + dz * d, hs, &wet, &ecs);
+			float best = -FLT_MAX, bcos = 1;
+			for (size_t i = 0; i < hs.size(); i++)
+				if (hs[i] <= cur + AGENT_CLIMB && hs[i] >= cur - AGENT_CLIMB && hs[i] > best) { best = hs[i]; bcos = wet[i] ? 1 : ecs[i]; }
+			if (best == -FLT_MAX) {
+				if (d - last > CRACK) return last + SUB / 2;
+				continue;
+			}
+			if (bcos < COS_MAX && fabsf(best - cur) > RISE_MAX * (d - last) / SUB) return last + SUB / 2;
+			cur = best;
+			last = d;
+		}
+		return maxLen;
+	}
+	// The ground a player slides on from height h at (x, z) to (tx, tz): half-yard steps on the non-water surface
+	// nearest the last height within a 78-degree slope (walls are not surfaces), over cracks under half a yard;
+	// the height at (tx, tz), or NAN where it breaks off.
+	float slideTo(float x, float z, float h, float tx, float tz) {
+		static const float SUB = 0.5f, CRACK = 0.5f, SLOPE = 4.7f;
+		float dx = tx - x, dz = tz - z, len = sqrtf(dx * dx + dz * dz);
+		int n = std::max(1, (int)ceilf(len / SUB));
+		float cur = h, gap = 0;
+		for (int k = 1; k <= n; k++) {
+			float px = x + dx * k / n, pz = z + dz * k / n, step = len / n;
+			at(px, pz)->heightsAt(px, pz, hs, &wet);
+			float best = NAN;
+			for (size_t i = 0; i < hs.size(); i++)
+				if (!wet[i] && fabsf(hs[i] - cur) <= SLOPE * (step + gap) && (best != best || fabsf(hs[i] - cur) < fabsf(best - cur))) best = hs[i];
+			if (best != best) {
+				gap += step;
+				if (gap > CRACK || k == n) return NAN;
+				continue;
+			}
+			cur = best;
+			gap = 0;
+		}
+		return cur;
+	}
+	// whether a player has room to stand on height h at (x, z): no surface (but water) from just over the feet to
+	// CLEAR above them (not under the low end of a ramp, a stair or a beam)
+	bool headroom(float x, float z, float h) {
+		static const float CLEAR = 1.8f;
+		at(x, z)->heightsAt(x, z, hs, &wet);
+		for (size_t i = 0; i < hs.size(); i++) if (!wet[i] && hs[i] > h + 0.3f && hs[i] < h + CLEAR) return false;
+		return true;
+	}
+	// whether water over (x, z) is more than depth above height h (a swimmer would be at its surface)
+	bool underWater(float x, float z, float h, float depth) {
+		at(x, z)->heightsAt(x, z, hs, &wet);
+		for (size_t i = 0; i < hs.size(); i++) if (wet[i] && hs[i] > h + depth) return true;
+		return false;
+	}
+	bool wallBetween(float ax, float az, float bx, float bz, float y) {
+		int c0, r0, c1, r1;
+		tileOf(ax, az, c0, r0); tileOf(bx, bz, c1, r1);
+		if (at(bx, bz)->wallHit(ax, az, bx, bz, y)) return true;
+		return (c0 != c1 || r0 != r1) && at(ax, az)->wallHit(ax, az, bx, bz, y);
+	}
+	// A player walking from (x, z) at height h towards (tx, tz), in quarter-yard steps: onto the highest ground at
+	// most STEP_UP above the feet (a stair, a kerb) with room to stand, not up a slope steeper than 55 degrees, not
+	// through a wall at body height, not off a drop of more than maxDrop (a careful player walks round it; a crack narrower than a body
+	// is no drop), swimming at the surface of water deeper than SWIM_DEPTH. Stops before the first step that cannot
+	// be taken; x, z, h are where it got to. Returns the share of the way walked; why: what stopped it (WALK_*).
+	enum { WALK_DONE, WALK_HOLE, WALK_DROP, WALK_STEEP, WALK_WALL_LOW, WALK_WALL_HIGH };
+	std::vector<float> wcs;
+	float walkTo(float& x, float& z, float& h, float tx, float tz, float maxDrop, int* why = nullptr) {
+		if (why) *why = WALK_DONE;
+		static const float SUB = 0.25f, STEP_UP = AGENT_CLIMB, SWIM_DEPTH = 1.5f, BODY = 0.3f;
+		static const float COS_MAX = cosf(55.0f * (float)M_PI / 180), RISE_MAX = SUB * tanf(55.0f * (float)M_PI / 180);
+		float sx = x, sz = z, dx = tx - x, dz = tz - z, len = sqrtf(dx * dx + dz * dz);
+		if (len < 1e-3f) return 1;
+		int n = std::max(1, (int)ceilf(len / SUB));
+		for (int k = 1; k <= n; k++) {
+			float nx = sx + dx * k / n, nz = sz + dz * k / n;
+			at(nx, nz)->heightsAt(nx, nz, hs, &wet, &wcs);
+			float ground = -FLT_MAX, gcos = 1, water = FLT_MAX;
+			for (size_t i = 0; i < hs.size(); i++) if (!wet[i] && hs[i] <= h + STEP_UP && hs[i] > ground) { ground = hs[i]; gcos = wcs[i]; }
+			if (ground > -FLT_MAX) water = waterOver(hs, wet, ground);
+			else { // deep water: the surface the swimmer is at
+				float top = -FLT_MAX;
+				for (size_t i = 0; i < hs.size(); i++) if (wet[i] && hs[i] <= h + STEP_UP) top = std::max(top, hs[i]);
+				if (top > -FLT_MAX) water = top;
+			}
+			float nh;
+			if (water < FLT_MAX && (ground == -FLT_MAX || water > ground + SWIM_DEPTH)) nh = water;
+			else {
+				if (ground < h - maxDrop) { // a crack between planks is no drop
+					float best = acrossCrack(nx, nz, h, dx / len, dz / len, maxDrop);
+					if (best == -FLT_MAX) { if (why) *why = ground == -FLT_MAX ? WALK_HOLE : WALK_DROP; return (float)(k - 1) / n; }
+					ground = best; gcos = 1;
+				}
+				// up a slope too steep to walk (not a bump on rough ground, not onto a stair)
+				if (ground > h + RISE_MAX && gcos < COS_MAX) { if (why) *why = WALK_STEEP; return (float)(k - 1) / n; }
+				if (!headroom(nx, nz, ground)) { if (why) *why = WALK_WALL_LOW; return (float)(k - 1) / n; } // no room to stand
+				nh = ground;
+			}
+			float ex = nx + (nx - x) / SUB * BODY, ez = nz + (nz - z) / SUB * BODY; // the body reaches ahead
+			if (wallBetween(x, z, ex, ez, h + STEP_UP + 0.1f)) { if (why) *why = WALK_WALL_LOW; return (float)(k - 1) / n; }
+			if (wallBetween(x, z, ex, ez, h + 1.8f)) { if (why) *why = WALK_WALL_HIGH; return (float)(k - 1) / n; }
+			x = nx; z = nz; h = nh;
+		}
+		return 1;
 	}
 };
 
@@ -1599,15 +1759,23 @@ int main(int argc, char** argv) {
 		fclose(f);
 		return 0;
 	}
-	if (cmd == "walkgrid") { // navbuild walkgrid <nav_dir> <out.hgt2> <threads> <geo_dir>: the addon's walk grid
+	if (cmd == "walkgrid") { // navbuild walkgrid <nav_dir> <out.hgt3> <threads> <geo_dir>: the addon's walk grid
 		// Every WG_HS yards on a grid aligned with the addon's 64-yard cells (HereBeDragons coords + 17100): every
-		// walkable layer there or within REACH_POLY yards (a ramp or walkway narrower than the grid), from the navmesh, at the height of the collision surface
-		// it lies on (the navmesh is within half a yard of it, but up to two over rough ground). Points next to walkable ones that the navmesh
-		// misses (it keeps half a yard off walls and edges, and narrow walkways may fall between points) get the
-		// surface continuing a neighbour's layer. Under water only the surface counts (a swimmer stays on it). HGT2 file: cell count, then per cell: cx, cy (int32),
-		// WG_PER x WG_PER layer counts (uint8, rows of x), the heights (float32).
+		// walkable layer there or within REACH_POLY yards (a ramp or walkway narrower than the grid), from the navmesh,
+		// at the height of the collision surface it lies on (the navmesh is within half a yard of it, but up to two
+		// over rough ground). Points next to walkable ones that the navmesh misses (it keeps half a yard off walls and
+		// edges, and narrow walkways may fall between points) get the surface continuing a neighbour's layer. Under
+		// water only the surface counts (a swimmer stays on it). No layer where a player has no room to stand.
+		// Each walkable layer also says where it ends towards each of its 4 neighbours that has no layer going on from
+		// it (GeoCache::walkEdge: a drop, a slope too steep to walk, the end of a walkway), in 2/7 yards.
+		// The steep grid: the ground within FLOOD points of walkable ground that is too steep to walk but a player
+		// slides on (an embankment, a hillside), followed from the walkable layers over the collision surfaces.
+		// HGT3 file: cell count, then per cell: cx, cy (int32), WG_PER x WG_PER walkable layer counts (uint8, rows of
+		// x), their heights (float32), their edges (uint16: 3 bits per direction +x, -x, +y, -y from the low bits, 7
+		// for none), the steep grid's layer counts (uint8) and heights (float32).
 		static const float WG_HS = 2.0f, OFF = 17100.0f, MERGE = 1.5f, SNAP = 1.0f, SNAP_BELOW = 2.5f, GROW = 1.25f, UNDER_WATER = 40.0f, REACH_POLY = 1.0f, SWIM_DEPTH = 1.5f;
-		static const int WG_PER = 32, MAX_LAYERS = 6, B = WG_PER + 2;
+		static const float FIT = 1.3f + 1.3f * WG_HS; // the addon's CLIMB + SLOPE x one grid step: a neighbour's layer goes on from this one
+		static const int WG_PER = 32, MAX_LAYERS = 6, FLOOD = 6, BORD = FLOOD + 1, BW = WG_PER + 2 * BORD;
 		Builder b;
 		b.nav = loadNavMesh(argv[2]);
 		if (!b.nav) return 1;
@@ -1620,12 +1788,14 @@ int main(int argc, char** argv) {
 			minx = std::min(minx, (int)floorf((t->header->bmin[0] + OFF) / CELL)); maxx = std::max(maxx, (int)floorf((t->header->bmax[0] + OFF) / CELL));
 			minz = std::min(minz, (int)floorf((t->header->bmin[2] + OFF) / CELL)); maxz = std::max(maxz, (int)floorf((t->header->bmax[2] + OFF) / CELL));
 		}
-		struct Cell { int cx, cy; unsigned char n[WG_PER * WG_PER]; std::vector<float> h; };
+		struct Cell { int cx, cy; unsigned char n[WG_PER * WG_PER], sn[WG_PER * WG_PER]; std::vector<float> h, sh; std::vector<uint16_t> e; };
 		std::vector<Cell> out;
 		std::mutex om;
 		std::atomic<int> nextBand{ minz };
-		std::atomic<long> samples{ 0 }, grown{ 0 }, snapped{ 0 }, layered{ 0 };
+		std::atomic<long> samples{ 0 }, grown{ 0 }, snapped{ 0 }, layered{ 0 }, edged{ 0 }, steepPts{ 0 }, cramped{ 0 };
 		static const int BAND = 8;
+		int box[4] = { INT32_MIN, INT32_MIN, INT32_MAX, INT32_MAX }; // WG_BOX="cx0 cy0 cx1 cy1": only those cells (a test build)
+		if (getenv("WG_BOX")) sscanf(getenv("WG_BOX"), "%d %d %d %d", &box[0], &box[1], &box[2], &box[3]);
 		auto worker = [&]() {
 			dtNavMeshQuery* q = dtAllocNavMeshQuery();
 			q->init(b.nav, 4096);
@@ -1633,12 +1803,14 @@ int main(int argc, char** argv) {
 			GeoCache gc{ geoDir };
 			std::vector<float> ghs;
 			std::vector<unsigned char> gwet;
-			std::vector<std::vector<float>> grid(B * B);
+			std::vector<std::vector<float>> grid(BW * BW), walk(BW * BW), steep(BW * BW);
+			auto P = [&](int i, int j) { return (j + BORD) * BW + (i + BORD); }; // i, j from -BORD
 			for (;;) {
 				int y0 = nextBand.fetch_add(BAND);
 				if (y0 > maxz) break;
 				std::vector<Cell> local;
 				for (int cy = y0; cy < y0 + BAND && cy <= maxz; cy++) for (int cx = minx; cx <= maxx; cx++) {
+					if (cx < box[0] || cy < box[1] || cx > box[2] || cy > box[3]) continue;
 					float c[3] = { (cx + 0.5f) * CELL - OFF, 0, (cy + 0.5f) * CELL - OFF };
 					float ext[3] = { CELL / 2 + 2, 5000, CELL / 2 + 2 };
 					int n = 0;
@@ -1646,11 +1818,13 @@ int main(int argc, char** argv) {
 					bool any = false;
 					for (int i = 0; i < n && !any; i++) { int ci = b.compOf(refs[i]); any = ci >= 0 && b.compArea[ci] >= MIN_ISLAND; }
 					if (!any) continue;
-					// navmesh layers on the cell's points and a one-point border, snapped to the surfaces
-					for (int j = -1; j <= WG_PER; j++) for (int i = -1; i <= WG_PER; i++) {
-						auto& L = grid[(j + 1) * B + (i + 1)];
+					auto at = [&](int i, int j, float* p) { p[0] = cx * CELL - OFF + i * WG_HS; p[1] = 0; p[2] = cy * CELL - OFF + j * WG_HS; };
+					// navmesh layers on the cell's points and a border of BORD points, snapped to the surfaces
+					for (int j = -BORD; j < WG_PER + BORD; j++) for (int i = -BORD; i < WG_PER + BORD; i++) {
+						auto& L = grid[P(i, j)];
 						L.clear();
-						float p[3] = { cx * CELL - OFF + i * WG_HS, 0, cy * CELL - OFF + j * WG_HS };
+						float p[3];
+						at(i, j, p);
 						float e[3] = { REACH_POLY, 5000, REACH_POLY };
 						int m = 0;
 						dtPolyRef r[128];
@@ -1682,7 +1856,8 @@ int main(int argc, char** argv) {
 							// ground under water deeper than SWIM_DEPTH: the swimmer is at the surface (the liquid the
 							// geometry has over it, which the navmesh may not)
 							float surface = FLT_MAX;
-							for (size_t k = 0; k < ghs.size(); k++) if (gwet[k] && ghs[k] > h && ghs[k] < h + UNDER_WATER) surface = std::min(surface, ghs[k]);
+							surface = waterOver(ghs, gwet, h);
+							if (surface > h + UNDER_WATER) surface = FLT_MAX;
 							if (surface < FLT_MAX && surface - h > SWIM_DEPTH) h = surface;
 							bool dup = false;
 							for (float o : L) dup = dup || fabsf(o - h) <= MERGE;
@@ -1690,14 +1865,16 @@ int main(int argc, char** argv) {
 						}
 						std::sort(L.begin(), L.end());
 					}
-					Cell cell{ cx, cy, {}, {} };
-					bool hit = false;
-					for (int j = 0; j < WG_PER; j++) for (int i = 0; i < WG_PER; i++) {
-						std::vector<float> L = grid[(j + 1) * B + (i + 1)];
-						if (L.empty()) { // grow from walkable neighbours onto the surfaces continuing their layers
-							float p[3] = { cx * CELL - OFF + i * WG_HS, 0, cy * CELL - OFF + j * WG_HS };
+					// grow from walkable neighbours onto the surfaces continuing their layers
+					for (int j = -BORD; j < WG_PER + BORD; j++) for (int i = -BORD; i < WG_PER + BORD; i++) {
+						std::vector<float>& L = walk[P(i, j)];
+						L = grid[P(i, j)];
+						bool inner = i > -BORD && j > -BORD && i < WG_PER + BORD - 1 && j < WG_PER + BORD - 1;
+						if (L.empty() && inner) {
+							float p[3];
+							at(i, j, p);
 							for (int dj = -1; dj <= 1; dj++) for (int di = -1; di <= 1; di++) {
-								for (float hn : grid[(j + 1 + dj) * B + (i + 1 + di)]) {
+								for (float hn : grid[P(i + di, j + dj)]) {
 									float s = gc.near(p[0], p[2], hn, GROW, GROW);
 									if (s != s) continue;
 									bool dup = false;
@@ -1706,12 +1883,75 @@ int main(int argc, char** argv) {
 								}
 							}
 							std::sort(L.begin(), L.end());
-							if (!L.empty()) grown++;
+							if (!L.empty() && i >= 0 && j >= 0 && i < WG_PER && j < WG_PER) grown++;
+						}
+						if (!L.empty()) { // no layer where nobody fits (the ground under the low end of a ramp)
+							float p[3];
+							at(i, j, p);
+							size_t k = 0;
+							for (float h : L) if (gc.headroom(p[0], p[2], h)) L[k++] = h; else if (i >= 0 && j >= 0 && i < WG_PER && j < WG_PER) cramped++;
+							L.resize(k);
 						}
 						if ((int)L.size() > MAX_LAYERS) L.resize(MAX_LAYERS);
+						steep[P(i, j)].clear();
+					}
+					auto fits = [&](const std::vector<float>& L, float h, float tol) { for (float o : L) if (fabsf(o - h) <= tol) return true; return false; };
+					// the steep grid: from the walkable layers with a neighbour they do not go on to, over the
+					// surfaces a player slides on, up to FLOOD points out
+					struct Q { int i, j; float h; int d; };
+					std::vector<Q> queue;
+					for (int j = -BORD + 1; j < WG_PER + BORD - 1; j++) for (int i = -BORD + 1; i < WG_PER + BORD - 1; i++)
+						for (float h : walk[P(i, j)]) {
+							bool edge = false;
+							for (int dj = -1; dj <= 1 && !edge; dj++) for (int di = -1; di <= 1 && !edge; di++)
+								if ((di || dj) && !fits(walk[P(i + di, j + dj)], h, FIT * (di && dj ? 1.42f : 1))) edge = true;
+							if (edge) queue.push_back({ i, j, h, 0 });
+						}
+					for (size_t qi = 0; qi < queue.size(); qi++) {
+						Q u = queue[qi];
+						if (u.d >= FLOOD) continue;
+						float a[3];
+						at(u.i, u.j, a);
+						for (int dj = -1; dj <= 1; dj++) for (int di = -1; di <= 1; di++) {
+							int vi = u.i + di, vj = u.j + dj;
+							if ((!di && !dj) || vi <= -BORD || vj <= -BORD || vi >= WG_PER + BORD - 1 || vj >= WG_PER + BORD - 1) continue;
+							float e[3];
+							at(vi, vj, e);
+							float hv = gc.slideTo(a[0], a[2], u.h, e[0], e[2]);
+							if (hv != hv || fits(walk[P(vi, vj)], hv, MERGE) || fits(steep[P(vi, vj)], hv, MERGE)) continue;
+							if (gc.underWater(e[0], e[2], hv, SWIM_DEPTH) || !gc.headroom(e[0], e[2], hv)) continue;
+							if ((int)steep[P(vi, vj)].size() >= MAX_LAYERS) continue;
+							steep[P(vi, vj)].push_back(hv);
+							queue.push_back({ vi, vj, hv, u.d + 1 });
+						}
+					}
+					Cell cell{ cx, cy, {}, {}, {}, {}, {} };
+					bool hit = false;
+					static const int DI[4] = { 1, -1, 0, 0 }, DJ[4] = { 0, 0, 1, -1 };
+					for (int j = 0; j < WG_PER; j++) for (int i = 0; i < WG_PER; i++) {
+						const std::vector<float>& L = walk[P(i, j)];
 						cell.n[j * WG_PER + i] = (unsigned char)L.size();
 						cell.h.insert(cell.h.end(), L.begin(), L.end());
-						if (!L.empty()) { hit = true; samples++; }
+						float p[3];
+						at(i, j, p);
+						for (float h : L) { // where the layer ends towards each neighbour it does not go on to
+							uint16_t code = 0;
+							for (int d = 0; d < 4; d++) {
+								int c7 = 7;
+								if (!fits(walk[P(i + DI[d], j + DJ[d])], h, FIT)) {
+									float len = gc.walkEdge(p[0], p[2], h, (float)DI[d], (float)DJ[d], WG_HS);
+									if (len < WG_HS) { c7 = std::min(6, (int)floorf(len * 7 / WG_HS)); edged++; }
+								}
+								code |= (uint16_t)(c7 << (3 * d));
+							}
+							cell.e.push_back(code);
+						}
+						std::vector<float> S = steep[P(i, j)];
+						std::sort(S.begin(), S.end());
+						cell.sn[j * WG_PER + i] = (unsigned char)S.size();
+						cell.sh.insert(cell.sh.end(), S.begin(), S.end());
+						if (!S.empty()) steepPts++;
+						if (!L.empty() || !S.empty()) { hit = true; if (!L.empty()) samples++; }
 						if (L.size() > 1) layered++;
 					}
 					if (hit) local.push_back(std::move(cell));
@@ -1727,17 +1967,20 @@ int main(int argc, char** argv) {
 		std::sort(out.begin(), out.end(), [](const Cell& a, const Cell& c) { return a.cy != c.cy ? a.cy < c.cy : a.cx < c.cx; });
 		FILE* f = fopen(argv[3], "wb");
 		uint32_t nc = (uint32_t)out.size();
-		fwrite("HGT2", 1, 4, f);
+		fwrite("HGT3", 1, 4, f);
 		fwrite(&nc, 4, 1, f);
 		for (auto& cl : out) {
 			int32_t xy[2] = { cl.cx, cl.cy };
 			fwrite(xy, 4, 2, f);
 			fwrite(cl.n, 1, WG_PER * WG_PER, f);
 			fwrite(cl.h.data(), 4, cl.h.size(), f);
+			fwrite(cl.e.data(), 2, cl.e.size(), f);
+			fwrite(cl.sn, 1, WG_PER * WG_PER, f);
+			fwrite(cl.sh.data(), 4, cl.sh.size(), f);
 		}
 		fclose(f);
-		printf("walk grid: %u cells, %ld points with ground (%ld snapped to a surface, %ld grown from a neighbour), %ld with more than one layer\n",
-			nc, samples.load(), snapped.load(), grown.load(), layered.load());
+		printf("walk grid: %u cells, %ld points with ground (%ld snapped to a surface, %ld grown from a neighbour), %ld with more than one layer, %ld layers left out without room to stand, %ld edges, %ld points of steep ground\n",
+			nc, samples.load(), snapped.load(), grown.load(), layered.load(), cramped.load(), edged.load(), steepPts.load());
 		return 0;
 	}
 	if (cmd == "geoat") { // navbuild geoat <geo_dir> <hbdX> <hbdY>: the collision surfaces over a point
@@ -1751,6 +1994,25 @@ int main(int argc, char** argv) {
 		printf("tile %d_%d (%zu triangles):", col, row, t->t.size() / 3);
 		for (size_t i = 0; i < hs.size(); i++) printf(" %.2f%s", hs[i], wet[i] ? "(water)" : "");
 		printf("\n");
+		return 0;
+	}
+	if (cmd == "geoserve") { // navbuild geoserve <geo_dir> - -: answers tools/simdots.lua on stdin/stdout, a line each
+		// (HereBeDragons x y): "w x y h tx ty maxDrop" -> "x y h share why" (GeoCache::walkTo, a real player's walk),
+		// "n x y h r" -> the surface nearest h within r, or nan
+		GeoCache gc{ argv[2] };
+		gc.walls = true;
+		char line[256];
+		while (fgets(line, sizeof line, stdin)) {
+			float x, y, h, tx, ty, d;
+			if (line[0] == 'w' && sscanf(line + 2, "%f %f %f %f %f %f", &x, &y, &h, &tx, &ty, &d) == 6) {
+				int why;
+				float share = gc.walkTo(x, y, h, tx, ty, d, &why);
+				printf("%.3f %.3f %.3f %.3f %d\n", x, y, h, share, why);
+			} else if (line[0] == 'n' && sscanf(line + 2, "%f %f %f %f", &x, &y, &h, &d) == 4) {
+				printf("%.3f\n", gc.near(x, y, h, d, d));
+			} else printf("?\n");
+			fflush(stdout);
+		}
 		return 0;
 	}
 	if (cmd == "geoats") { // navbuild geoats <geo_dir> < points: geoat for each "hbdX hbdY" line, "x y h h ..." out
@@ -1769,12 +2031,11 @@ int main(int argc, char** argv) {
 	}
 	if (cmd == "simtruth") { // navbuild simtruth <geo_dir> <sim.tsv> <threads> <out.tsv>: true ground for tools/simdots.lua
 		// Walks the collision surfaces half a yard at a time (GeoCache::step: up stairs and kerbs, down ledges)
-		// along each route from its first corner (back on each corner's height at the corner), and along each
-		// step's dot line from the player's true height, and writes "P route step x y along addonZ trueZ localCorners
-		// offLevel" (offLevel: a spot beside the route nobody stands on at the route's level) and
-		// "D route step along x y addonZ trueZ nearestZ" (nearestZ: the surface nearest the addon's height there).
+		// along each step's dot line from the player's true height (simdots' walker, on the same surfaces), and
+		// writes "P route step x y along addonZ trueZ localCorners" and "D route step along x y addonZ trueZ nearestZ"
+		// (nearestZ: the surface nearest the addon's height there).
 		if (argc < 6) return 1;
-		struct Step { int step; float x, y, along, pz; int k; float ax, ay; std::vector<std::array<float, 2>> lc; std::vector<std::array<float, 4>> dots; std::vector<std::array<float, 2>> truth; float pTrue; bool offLevel = false; };
+		struct Step { int step; float x, y, along, pz; int k; float ax, ay; std::vector<std::array<float, 2>> lc; std::vector<std::array<float, 4>> dots; std::vector<std::array<float, 2>> truth; float pTrue; };
 		struct Route { int id; std::vector<std::array<float, 3>> c; std::vector<Step> steps; };
 		std::vector<Route> routes;
 		std::unordered_map<int, size_t> byId;
@@ -1792,7 +2053,7 @@ int main(int argc, char** argv) {
 				routes.push_back(std::move(r));
 			} else if (line[0] == 'P') {
 				Step s; int id, nlc = 0, used = 0;
-				if (sscanf(line + 2, "%d %d %f %f %f %f %d %f %f %d%n", &id, &s.step, &s.x, &s.y, &s.along, &s.pz, &s.k, &s.ax, &s.ay, &nlc, &used) == 10) {
+				if (sscanf(line + 2, "%d %d %f %f %f %f %d %f %f %f %d%n", &id, &s.step, &s.x, &s.y, &s.along, &s.pz, &s.k, &s.ax, &s.ay, &s.pTrue, &nlc, &used) == 11) {
 					char* q = line + 2 + used;
 					for (int k = 0; k < nlc; k++) { float cx, cy; int u2; if (sscanf(q, "%f %f%n", &cx, &cy, &u2) != 2) break; s.lc.push_back({ cx, cy }); q += u2; }
 					routes[byId[id]].steps.push_back(std::move(s));
@@ -1819,7 +2080,7 @@ int main(int argc, char** argv) {
 				int n = std::max(1, (int)ceilf(len / 0.5f));
 				for (int k = 1; k <= n; k++) {
 					float t = (float)k / n;
-					h = gc.step(a[0] + (e[0] - a[0]) * t, a[2] + (e[2] - a[2]) * t, h);
+					h = gc.step(a[0] + (e[0] - a[0]) * t, a[2] + (e[2] - a[2]) * t, h, (e[0] - a[0]) / std::max(len, 1e-3f), (e[2] - a[2]) / std::max(len, 1e-3f));
 					at(along + len * t, h);
 				}
 				along += len;
@@ -1836,25 +2097,8 @@ int main(int argc, char** argv) {
 				Route& r = routes[ri];
 				std::vector<std::array<float, 3>> pts;
 				for (auto& c : r.c) { float o[3]; rc(c[0], c[1], c[2], o); pts.push_back({ o[0], o[1], o[2] }); }
-				float h0 = gc.near(pts[0][0], pts[0][2], pts[0][1], 6.0f, 6.0f);
-				std::vector<std::pair<float, float>> prof;
-				follow(gc, pts, h0 == h0 ? h0 : pts[0][1], 1e9f, [&](float a, float h) { prof.push_back({ a, h }); });
-				auto profileAt = [&](float a) {
-					auto it = std::lower_bound(prof.begin(), prof.end(), std::make_pair(a, -FLT_MAX));
-					if (it == prof.end()) return prof.back().second;
-					return it->second;
-				};
 				for (auto& s : r.steps) {
-					// the player: on the route line's height at their spot along it, then over to beside it
-					float lineZ = profileAt(s.along);
-					std::vector<std::array<float, 3>> side;
 					float o[3];
-					rc(s.ax, s.ay, lineZ, o); side.push_back({ o[0], o[1], o[2] });
-					rc(s.x, s.y, lineZ, o); side.push_back({ o[0], o[1], o[2] });
-					s.pTrue = lineZ;
-					float lastH = lineZ, drop = 0;
-					follow(gc, side, lineZ, 1e9f, [&](float, float h) { drop = std::max(drop, fabsf(h - lastH)); lastH = h; s.pTrue = h; });
-					s.offLevel = drop > Builder::WALK_STEP; // nobody stands there on the route's level (a ledge, a canal)
 					// the dots' line: the player's own way to the end of the leg (the corner after the one they passed), then on
 					std::vector<std::array<float, 3>> line;
 					rc(s.x, s.y, s.pTrue, o); line.push_back({ o[0], o[1], o[2] });
@@ -1888,7 +2132,7 @@ int main(int argc, char** argv) {
 		for (auto& t : pool) t.join();
 		FILE* out = fopen(argv[5], "w");
 		for (auto& r : routes) for (auto& s : r.steps) {
-			fprintf(out, "P %d %d %.2f %.2f %.2f %.2f %.2f %d %d\n", r.id, s.step, s.x, s.y, s.along, s.pz, s.pTrue, (int)s.lc.size(), (int)s.offLevel);
+			fprintf(out, "P %d %d %.2f %.2f %.2f %.2f %.2f %d\n", r.id, s.step, s.x, s.y, s.along, s.pz, s.pTrue, (int)s.lc.size());
 			for (size_t i = 0; i < s.dots.size(); i++)
 				fprintf(out, "D %d %d %.2f %.2f %.2f %.2f %.2f %.2f\n", r.id, s.step, s.dots[i][0], s.dots[i][1], s.dots[i][2], s.dots[i][3], s.truth[i][0], s.truth[i][1]);
 		}

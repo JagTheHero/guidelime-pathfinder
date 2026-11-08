@@ -1,8 +1,9 @@
-"""Pack navbuild's walk grid (.hgt2: ground points every 2 yards, every walkable layer) for the addon.
+"""Pack navbuild's walk grid (.hgt3: ground points every 2 yards, every walkable layer with where it ends, and the
+steep ground beside it) for the addon.
 
-The format is documented in Graph.lua (wcells, walk). An 8-yard block whose points are all single-layer ground
-within TOL of the bilinear blend of its four corner points keeps only its corner; any other block keeps all 16
-of its points.
+The format is documented in Graph.lua (wcells, walk, scells, steep). An 8-yard block whose points are all
+single-layer ground within TOL of the bilinear blend of its four corner points, with no edge, keeps only its
+corner; any other block keeps all 16 of its points.
 """
 import struct
 
@@ -21,21 +22,42 @@ MIDS = [-5, -4, 4, 5]
 SERP = [(oj, oi if oj % 2 == 0 else BS - 1 - oi) for oj in range(BS) for oi in range(BS)][1:]  # a block's points after its corner
 
 
-def read_hgt2(path):
-    """{key: (counts[1024], heights[] float32)} with key = cx + cy * 1024."""
+NO_EDGE = 0xFFF  # a layer's edges: 3 bits per direction (+x, -x, +y, -y from the low bits), 7 for none
+
+
+def read_grid(path):
+    """{key: (counts[1024], heights[] float32, edges[] uint16 or None, steep counts[1024], steep heights[])} with
+    key = cx + cy * 1024, from an .hgt3 (or an older .hgt2: no edges, no steep ground)."""
     d = open(path, "rb").read()
-    assert d[:4] == b"HGT2"
+    v3 = d[:4] == b"HGT3"
+    assert v3 or d[:4] == b"HGT2"
     (nc,) = struct.unpack_from("<I", d, 4)
     p, out = 8, {}
+    none = np.zeros(PER * PER, np.uint8)
     for _ in range(nc):
         cx, cy = struct.unpack_from("<ii", d, p)
         p += 8
         n = np.frombuffer(d, np.uint8, PER * PER, p)
         p += PER * PER
         k = int(n.sum())
-        out[cx + cy * 1024] = (n, np.frombuffer(d, "<f4", k, p))
+        h = np.frombuffer(d, "<f4", k, p)
         p += 4 * k
+        e, sn, sh = None, none, np.zeros(0, np.float32)
+        if v3:
+            e = np.frombuffer(d, "<u2", k, p)
+            p += 2 * k
+            sn = np.frombuffer(d, np.uint8, PER * PER, p)
+            p += PER * PER
+            ks = int(sn.sum())
+            sh = np.frombuffer(d, "<f4", ks, p)
+            p += 4 * ks
+        out[cx + cy * 1024] = (n, h, e, sn, sh)
     return out
+
+
+def read_hgt2(path):
+    """{key: (counts[1024], heights[] float32)} of the walkable layers, with key = cx + cy * 1024."""
+    return {k: (c[0], c[1]) for k, c in read_grid(path).items()}
 
 
 def first_layer(cell):
@@ -52,9 +74,9 @@ def b64(v, width):
     return "".join(ALPHA[(v >> (6 * (width - 1 - k))) & 63] for k in range(width))
 
 
-def pack_walk(path, keep_keys):
-    """Returns (index string, data string, cell count, refined share) for the cells in keep_keys."""
-    cells = read_hgt2(path)
+def pack_walk(cells, keep_keys, edges=None):
+    """Returns (index string, data string, cell count, refined share) for the cells in keep_keys of cells ({key:
+    (counts, heights)}), with each layer's edges ({key: edges[]}) if given."""
     firsts = {}
 
     def fl(key):
@@ -77,6 +99,13 @@ def pack_walk(path, keep_keys):
         ZE[PER, :PER], NE[PER, :PER] = zu[0, :], nu[0, :]
         zd, nd = fl(key + 1025)
         ZE[PER, PER], NE[PER, PER] = zd[0, 0], nd[0, 0]
+        e = edges.get(key) if edges else None
+        edged = np.zeros(PER * PER, bool)
+        if e is not None:
+            nn = cells[key][0].astype(np.int64)
+            owner = np.repeat(np.arange(PER * PER), nn)
+            edged[owner[e != NO_EDGE]] = True
+        edged = edged.reshape(PER, PER)
         refine = np.zeros((NB, NB), bool)
         for bj in range(NB):
             for bi in range(NB):
@@ -85,7 +114,7 @@ def pack_walk(path, keep_keys):
                 cn = NE[[j0, j0, j0 + BS, j0 + BS], [i0, i0 + BS, i0, i0 + BS]]
                 if (cnt == 0).all():
                     refine[bj, bi] = False  # no ground anywhere in it
-                elif (cnt != 1).any() or (cn != 1).any():
+                elif (cnt != 1).any() or (cn != 1).any() or edged[j0:j0 + BS, i0:i0 + BS].any():
                     refine[bj, bi] = True  # holes, edges, stacked layers
                 else:
                     c = ZE[[j0, j0, j0 + BS, j0 + BS], [i0, i0 + BS, i0, i0 + BS]]
@@ -166,6 +195,21 @@ def pack_walk(path, keep_keys):
             ex.append(b64(dq + 2048, 2) if -2048 <= dq < 2047 else b64(4095, 2) + b64(first_of[idx] + dq, 3))
             last = idx
         block = "".join(out) + b64(len(extras), 3) + "".join(ex)
+        if edges is not None:
+            # edges: count(3), then per layer with one: the point's index as a step from the last one's (1 char
+            # below 62, else 62 and the index(2)), the edge bits (2), and the layer's rank from the lowest (1) at a
+            # point with more than one layer
+            rec, last, count = [], -1, 0
+            if e is not None:
+                for k in np.nonzero(e != NO_EDGE)[0]:
+                    idx = int(owner[k])
+                    gap = idx - last
+                    rec.append(ALPHA[gap - 1] if 1 <= gap <= 62 else ALPHA[62] + b64(idx, 2))
+                    rec.append(b64(int(e[k]), 2))
+                    if n[idx] > 1:
+                        rec.append(ALPHA[int(k - start[idx])])
+                    last, count = idx, count + 1
+            block += b64(count, 3) + "".join(rec)
         index.append(b64(key, 4) + b64(offset, 5))
         data.append(block)
         offset += len(block)

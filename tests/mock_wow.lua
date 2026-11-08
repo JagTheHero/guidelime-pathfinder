@@ -114,6 +114,13 @@ function M.TrueProject(x, y, z)
 	local ux, uy, uz = ry * fz, -rx * fz, rx * fy - ry * fx
 	local Fx, Fy, Fz = -M.px, M.py, M.pz + M.trueHeight
 	local d = M.trueDist or M.zoom -- nearer than the zoom when something is in the way
+	if not M.trueDist and M.cameraGround then -- like the game: pulled in 0.3 yd over the ground on the line back
+		for k = 0.5, M.zoom, 0.5 do
+			local g = M.cameraGround(M.px + k * fx, M.py - k * fy, k)
+			if g and Fz - k * fz < g + 0.3 then d = math.max(0.5, k - 0.5) break end
+		end
+	end
+	M.camDist = d
 	local Cx, Cy, Cz = Fx - d * fx, Fy - d * fy, Fz - d * fz
 	local vx, vy, vz = E - Cx, N - Cy, U - Cz
 	local cf = vx * fx + vy * fy + vz * fz
@@ -210,7 +217,20 @@ function M.Step(dt)
 	end
 end
 
+-- C_AddOns.LoadAddOn loads an addon from the folder next to the last one loaded with M.LoadAddon
+local addonRoot, loaded = ".", {}
+C_AddOns = C_AddOns or {}
+C_AddOns.LoadAddOn = function(name)
+	if loaded[name] then return true end
+	local ok = io.open(addonRoot .. "/" .. name .. "/" .. name .. ".toc")
+	if not ok then return false, "MISSING" end
+	ok:close()
+	M.LoadAddon(addonRoot .. "/" .. name, name)
+	return true
+end
+
 function M.LoadAddon(dir, name)
+	addonRoot, loaded[name] = dir:match("^(.*)/[^/]+$") or ".", true
 	local ns = {}
 	local toc = assert(io.open(dir .. "/" .. name .. ".toc"))
 	for line in toc:lines() do
