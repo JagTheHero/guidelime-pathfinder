@@ -599,8 +599,9 @@ end
 -- the zone at a world position, for a ship whose far stop has no name in the data
 local function placeName(pl)
 	local mapID = CONTINENT_MAP[pl.instance]
-	local x, y = mapID and HBD:GetZoneCoordinatesFromWorld(pl.x, pl.y, mapID, true)
-	local info = x and C_Map.GetMapInfoAtPosition and C_Map.GetMapInfoAtPosition(mapID, x, y)
+	local x, y
+	if mapID then x, y = HBD:GetZoneCoordinatesFromWorld(pl.x, pl.y, mapID, true) end
+	local info = x and y and C_Map.GetMapInfoAtPosition and C_Map.GetMapInfoAtPosition(mapID, x, y)
 	return info and info.name
 end
 

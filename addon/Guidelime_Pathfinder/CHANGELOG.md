@@ -1,5 +1,11 @@
 # Guidelime Pathfinder
 
+## 0.7.1 (beta)
+
+- Fixed a Lua error ("bad argument #3 ... GetMapInfoAtPosition") after `/gpath go <dungeon>`: the route was set,
+  but the line saying where the entrance is never came. The same error could hit a boat or zeppelin stop with no
+  name in the path data. The entrance now names its zone as the map does (the Ruins of Lordaeron: Tirisfal Glades).
+
 ## 0.7.0 (beta)
 
 - Dungeons: `/gpath go <dungeon>` heads for a dungeon's or battleground's entrance, with the whole trip there

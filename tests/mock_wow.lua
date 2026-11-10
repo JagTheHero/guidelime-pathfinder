@@ -130,14 +130,16 @@ function M.TrueProject(x, y, z)
 end
 
 -- maps: one zone (uiMapID 1411) spanning 4000 yards square around the origin --------------------
--- (M.zones[uiMapID] = { left, top, w, h, instance, name } adds real zones for zone-to-world lookups)
+-- (M.zones[uiMapID] = { left, top, w, h, instance, name, parent } adds real zones for zone-to-world lookups; with
+-- parent, C_Map.GetMapInfoAtPosition(parent, ...) finds them)
 M.zone = { id = 1411, left = 2000, top = 2000, w = 4000, h = 4000 }
 local HBD = {}
 function HBD:GetPlayerWorldPosition() return M.px, M.py, M.instance end
 function HBD:GetPlayerZone() return M.zone.id end
 function HBD:GetZoneCoordinatesFromWorld(x, y, zone, allow)
-	if zone ~= M.zone.id then return end
-	return (M.zone.left - x) / M.zone.w, (M.zone.top - y) / M.zone.h
+	local z = zone == M.zone.id and M.zone or M.zones and M.zones[zone]
+	if not z then return end
+	return (z.left - x) / z.w, (z.top - y) / z.h
 end
 function HBD:GetWorldCoordinatesFromZone(x, y, zone)
 	local z = M.zones and M.zones[zone]
@@ -160,6 +162,18 @@ C_Map = {
 	GetBestMapForUnit = function() return M.zone.id end,
 	CanSetUserWaypointOnMap = function() return true end,
 	GetMapInfo = function(id) local z = M.zones and M.zones[id] return { parentMapID = 0, name = z and z.name } end,
+	-- the zone at a spot on a map: like the game's, an error without numbers for x and y
+	GetMapInfoAtPosition = function(m, x, y)
+		if type(m) ~= "number" or type(x) ~= "number" or type(y) ~= "number" then
+			error("Usage: local info = C_Map.GetMapInfoAtPosition(uiMapID, x, y [, ignoreZoneMapPositionData])", 2)
+		end
+		local on = M.zones and M.zones[m]
+		if not on then return end
+		local wx, wy = on.left - x * on.w, on.top - y * on.h
+		for id, z in pairs(M.zones) do
+			if z.parent == m and wx <= z.left and wx >= z.left - z.w and wy <= z.top and wy >= z.top - z.h then return { mapID = id, name = z.name } end
+		end
+	end,
 	SetUserWaypoint = function(pt) M.waypoint = pt; M.waypointSets = (M.waypointSets or 0) + 1; M.Fire("USER_WAYPOINT_UPDATED") end,
 	GetUserWaypoint = function() return M.waypoint end,
 	ClearUserWaypoint = function() M.waypoint = nil; M.Fire("USER_WAYPOINT_UPDATED") end,

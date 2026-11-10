@@ -623,6 +623,8 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 		[1455] = { left = -713.591, top = -4569.241, w = 790.625, h = 527.604, instance = 0, name = "Ironforge" },
 		[1458] = { left = 873.193, top = 1877.945, w = 959.375, h = 640.104, instance = 0, name = "Undercity" },
 		[1436] = { left = 3016.667, top = -9400.000, w = 3500.000, h = 2333.333, instance = 0, name = "Westfall" },
+		[1415] = { left = 16000.000, top = 7466.600, w = 35199.900, h = 23466.600, instance = 0, name = "Eastern Kingdoms" },
+		[1420] = { left = 3033.333, top = 3837.500, w = 4518.750, h = 3012.500, instance = 0, name = "Tirisfal Glades", parent = 1415 },
 	}
 	local dungeons = { -- Questie's ZoneDB: name, other area ids, parent zone, entrances (area id, zone percent)
 		[16611] = { "Ruins of Lordaeron", nil, 1497, { { 1497, 72.48, 11.33 } } }, -- WoW: Forever's own
@@ -710,7 +712,7 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 	go("go ruins of lordaeron")
 	sv = ns.service
 	check(sv and sv.label == "the Ruins of Lordaeron entrance" and math.abs(sv.x - 177.8) < 1 and math.abs(sv.y - 1805.4) < 1
-		and said():find("Ruins of Lordaeron: the entrance in Undercity, about %d+ min away"), "go ruins of lordaeron: its entrance, over the Undercity (" .. said() .. ")")
+		and said():find("Ruins of Lordaeron: the entrance in Tirisfal Glades, about %d+ min away"), "go ruins of lordaeron: its entrance, up over the Undercity in Tirisfal (" .. said() .. ")")
 	settle()
 	local nxt = ns.trip and ns.trip.next
 	check(nxt and nxt.kind == "tram", "from Stormwind: the tram to Ironforge first (" .. (nxt and nxt.kind or "no trip") .. ")")
