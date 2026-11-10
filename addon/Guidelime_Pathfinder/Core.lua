@@ -561,7 +561,9 @@ local known, knownAt, knownCount = {}, -huge, 0
 -- name) from the game's flight map, which only knows while it is open (C_TaxiMap.GetAllTaxiNodes: a node's state
 -- is Current or Reachable once found). C_TaxiMap.GetTaxiNodesForMap cannot tell: on WoW: Forever every node says
 -- isUndiscovered = false, the other faction's too.
-local UNREACHABLE = Enum and Enum.FlightPathState and Enum.FlightPathState.Unreachable or 2
+local STATE = Enum and Enum.FlightPathState or { Current = 0, Unreachable = 2 }
+local FACTION_ID = { Horde = 1, Alliance = 2 } -- Enum.FlightPathFaction; 0 is neutral
+local taxiOpen -- a flight map is open (what it says about its nodes is only right then)
 local function myFlights(create)
 	local guid = UnitGUID("player")
 	local all = ns.db and ns.db.flights
@@ -573,15 +575,49 @@ local function myFlights(create)
 	return guid and all and all[guid]
 end
 
--- the flight map is open: what it says about every node on it
-local function readTaxiMap()
-	local nodes = C_TaxiMap.GetAllTaxiNodes and GetTaxiMapID and C_TaxiMap.GetAllTaxiNodes(GetTaxiMapID())
-	if not nodes or #nodes == 0 then return end
-	local mine = myFlights(true)
-	if not mine then return end
-	for _, n in ipairs(nodes) do
-		if n.nodeID and not n.isMapLayerTransition then mine[n.nodeID] = n.state ~= UNREACHABLE and n.name or nil end
+-- What the open flight map says: { [node id] = name, or false where not found }, or nil if nothing sure. The game's
+-- flight map (C_TaxiMap.GetAllTaxiNodes, for GetTaxiMapID or else the continent's map: GetTaxiMapID can give none)
+-- or the older taxi frame (TaxiNodeGetType by slot, names matched to node ids); either way only with the flight
+-- master the player stands at in it as the current one.
+local function taxiMapNodes()
+	local _, _, instance = HBD:GetPlayerWorldPosition()
+	local maps = { GetTaxiMapID and GetTaxiMapID() or false, instance and CONTINENT_MAP[instance] or false }
+	for i = 1, 2 do
+		local ok, nodes = false, nil
+		if maps[i] and C_TaxiMap.GetAllTaxiNodes then ok, nodes = pcall(C_TaxiMap.GetAllTaxiNodes, maps[i]) end
+		if ok and type(nodes) == "table" then
+			local out, current = {}, false
+			for _, n in ipairs(nodes) do
+				if n.nodeID and not n.isMapLayerTransition then
+					out[n.nodeID] = n.state ~= STATE.Unreachable and n.name or false
+					current = current or n.state == STATE.Current
+				end
+			end
+			if current then return out end
+		end
 	end
+	local slots = NumTaxiNodes and TaxiNodeGetType and NumTaxiNodes() or 0
+	if slots == 0 or not maps[2] then return end
+	local ids, mine = {}, FACTION_ID[UnitFactionGroup("player")]
+	local ok, all = pcall(C_TaxiMap.GetTaxiNodesForMap, maps[2])
+	for _, n in ipairs(ok and type(all) == "table" and all or {}) do
+		if n.name and n.nodeID and (n.faction == 0 or n.faction == mine) then ids[n.name] = n.nodeID end
+	end
+	local out, current = {}, false
+	for i = 1, slots do
+		local name, kind = TaxiNodeName(i), TaxiNodeGetType(i)
+		if name and ids[name] then out[ids[name]] = kind ~= "NONE" and name or false end
+		current = current or kind == "CURRENT"
+	end
+	if current then return out end
+end
+
+local function readTaxiMap()
+	if not taxiOpen then return end
+	local nodes = taxiMapNodes()
+	local mine = nodes and myFlights(true)
+	if not mine then return end
+	for id, name in pairs(nodes) do mine[id] = name or nil end
 	knownAt = -huge
 end
 
@@ -1001,6 +1037,7 @@ events:SetScript("OnEvent", function(_, event, arg1)
 		ns.Marker.OnWaypointUpdated()
 	else -- the taxi map: which flight masters are found, and a flight master just found counts at once
 		knownAt = -huge
+		if event == "TAXIMAP_OPENED" then taxiOpen = true elseif event == "TAXIMAP_CLOSED" then taxiOpen = false end
 		readTaxiMap()
 		if event == "TAXIMAP_OPENED" then
 			C_Timer.After(0, function() readTaxiMap() lightTaxi() end) -- after the taxi frame has made its buttons

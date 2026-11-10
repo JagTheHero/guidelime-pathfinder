@@ -1,5 +1,11 @@
 # Guidelime Pathfinder
 
+## 0.7.3 (beta)
+
+- Fixed a Lua error ("bad argument #1 ... GetAllTaxiNodes") when you open a flight master's map: the game gave no
+  map for it, so 0.7.2 learned no flight paths and the "fly to" highlight did not come. It now reads the map of the
+  continent you are on, and also the older flight map. Open a flight master's map once so your flight paths count.
+
 ## 0.7.2 (beta)
 
 - Flight paths: routes only take the flight paths you have found. WoW: Forever's world map says every flight master

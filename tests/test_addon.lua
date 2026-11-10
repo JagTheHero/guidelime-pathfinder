@@ -604,7 +604,20 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 	M.guid = "Player-1-00000002"
 	ns.KnownTaxi() -- (cached for a few seconds)
 	check(not (ns.db.flights[M.guid]), "another character starts with none")
-	M.guid = nil
+	-- the older taxi frame: no flight map nodes, slots by name and type
+	local getAll = C_TaxiMap.GetAllTaxiNodes
+	C_TaxiMap.GetAllTaxiNodes = nil
+	M.taxiSlots, M.taxiTypes = { "Crossroads, The Barrens", "Orgrimmar, Durotar", "Thunder Bluff, Mulgore" }, { "CURRENT", "REACHABLE", "NONE" }
+	M.taxiOpen = true
+	M.Fire("TAXIMAP_OPENED", 1)
+	M.taxiOpen = false
+	M.Fire("TAXIMAP_CLOSED")
+	saved = ns.db.flights[M.guid]
+	check(saved and saved[25] and saved[23] and not saved[22], "the older taxi frame's found flight masters are kept too")
+	C_TaxiMap.GetAllTaxiNodes, M.taxiSlots, M.taxiTypes, M.guid = getAll, nil, nil, nil
+	M.Fire("TAXI_NODE_STATUS_CHANGED") -- with no flight map open: nothing read, nothing lost
+	saved = ns.db.flights[UnitGUID("player")]
+	check(saved and saved[25] and saved[23], "nothing is read while no flight map is open")
 	if l then
 		goTo(1, l.from.x, l.from.y, l.from.z)
 		for _ = 1, 3 do M.Step(0.1) end

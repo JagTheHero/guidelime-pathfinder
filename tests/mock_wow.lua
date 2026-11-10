@@ -98,9 +98,14 @@ Enum = Enum or {}
 Enum.FlightPathState = { Current = 0, Reachable = 1, Unreachable = 2 }
 C_TaxiMap = {
 	GetTaxiNodesForMap = function(mapID) return M.taxiNodes and M.taxiNodes[mapID] or {} end,
-	GetAllTaxiNodes = function(mapID) return M.taxiOpen and M.taxiAll or {} end,
+	-- like the game's, an error without a map id
+	GetAllTaxiNodes = function(mapID)
+		if type(mapID) ~= "number" then error("Usage: local taxiNodes = C_TaxiMap.GetAllTaxiNodes(uiMapID)", 2) end
+		return M.taxiOpen and M.taxiAll or {}
+	end,
 }
-function GetTaxiMapID() return M.taxiOpen and 1414 or nil end
+function GetTaxiMapID() return M.taxiMapID end -- WoW: Forever gave none at TAXIMAP_OPENED
+function TaxiNodeGetType(i) return M.taxiTypes and M.taxiTypes[i] or "NONE" end -- the older taxi frame's
 function UnitGUID(unit) return unit == "player" and (M.guid or "Player-1-00000001") or nil end
 function NumTaxiNodes() return #(M.taxiSlots or {}) end
 function TaxiNodeName(i) return M.taxiSlots[i] end
