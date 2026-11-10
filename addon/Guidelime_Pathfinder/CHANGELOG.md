@@ -1,5 +1,15 @@
 # Guidelime Pathfinder
 
+## 0.7.0 (beta)
+
+- Dungeons: `/gpath go <dungeon>` heads for a dungeon's or battleground's entrance, with the whole trip there
+  (flights, boats, the tram): `/gpath go deadmines`, `/gpath go ruins of lordaeron`, and WoW: Forever's own
+  dungeons too. The entrances come from Questie; where a dungeon has several, it picks the quickest to reach.
+- Map pins: a pin you place on the world map (Ctrl-click) is now a goal like Guidelime's step. The route goes there
+  and the marker walks you to it corner by corner (it takes the pin over: the game has only one). Removing the
+  marker drops the pin and goes back to Guidelime's step, and so does `/gpath go`.
+- Reaching the end of a route no longer says "your own map pin takes over".
+
 ## 0.6.1 (beta)
 
 - `/gpath go bank` in Stormwind takes you to Stormwind's bank, not Ironforge's. Routes to quest givers and town

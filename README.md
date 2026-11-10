@@ -6,7 +6,8 @@ the route is drawn on the world map and minimap and (experimental) as dots on th
 straight legs where the ground allows and go around mob camps near your level. It takes the flight
 paths you have found, boats, zeppelins, lifts, the Deeprun Tram and the Teldrassil portal, falls back to
 [Questie](https://www.curseforge.com/wow/addons/questie)'s map icons for Forever's own quests, and
-`/gpath go bank` heads for the nearest bank, inn, vendor or trainer. See
+`/gpath go bank` heads for the nearest bank, inn, vendor or trainer (`/gpath go deadmines`: a dungeon's entrance).
+A map pin you place is a goal too. See
 [addon/Guidelime_Pathfinder/CHANGELOG.md](addon/Guidelime_Pathfinder/CHANGELOG.md) for everything it does.
 
 Needs Guidelime and Questie. Paths exist for the Eastern Kingdoms and Kalimdor.

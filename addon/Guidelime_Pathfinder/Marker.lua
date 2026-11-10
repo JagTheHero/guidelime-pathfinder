@@ -1,14 +1,16 @@
 local ADDON, ns = ...
 
 -- Drives the game's own in-world navigation marker (a super-tracked user waypoint): it sits on the next
--- corner of the path and moves on as each corner is reached. The player's own map pins take priority.
+-- corner of the path and moves on as each corner is reached. A map pin the player places becomes the route's goal
+-- (ns.GoPin), and the marker then takes the pin over (the game has only one).
 
 local Marker = {}
 ns.Marker = Marker
 
 local abs = math.abs
 local own        -- {m = uiMapID, x, y} of the waypoint this addon placed
-local override   -- the player placed or removed a pin themselves; stand back until the next guide step
+local override   -- the player removed the marker, or placed a pin with no world position; stand back until the next guide step
+local reachedEnd -- Blizzard is clearing the waypoint at the route's end (not the player removing it)
 local TOLERANCE = 2e-3
 
 local function mapPointFor(x, y)
@@ -36,7 +38,7 @@ end
 function Marker.Place(x, y, z)
 	local m, mx, my = mapPointFor(x, y)
 	if not m then return false end
-	own = { m = m, x = mx, y = my }
+	own, reachedEnd = { m = m, x = mx, y = my }, false
 	Marker.before, Marker.at = Marker.at, { x, y } -- world spots, for the ground dots
 	C_Map.SetUserWaypoint(UiMapPoint.CreateFromCoordinates(m, mx, my, z))
 	C_SuperTrack.SetSuperTrackedUserWaypoint(true)
@@ -65,12 +67,24 @@ function Marker.ResetOverride()
 end
 
 function Marker.OnWaypointUpdated()
-	if not own then return end
-	if not isOwn(C_Map.GetUserWaypoint()) then
+	local wp = C_Map.GetUserWaypoint()
+	if isOwn(wp) or not (ns.db and ns.db.enabled) then return end
+	if wp then -- the player's own pin (or another add-on's): the way there
 		own = nil
-		override = true
 		Marker.pathId, Marker.k = nil, nil
-		ns.Print("your own map pin takes over; the path marker comes back at the next guide step.")
+		if not ns.GoPin(wp) then
+			override = true
+			ns.Print("your own map pin takes over; the path marker comes back at the next guide step.")
+		end
+	elseif own then -- the player removed the marker, or Blizzard did at the route's end
+		own = nil
+		Marker.pathId, Marker.k = nil, nil
+		if reachedEnd then -- there: stand back (the tick ends a pin or service within SERVICE_ARRIVED)
+			reachedEnd, override = false, true
+		elseif not ns.StopPin() then
+			override = true
+			ns.Print("marker removed; it comes back at the next guide step.")
+		end
 	end
 end
 
@@ -84,6 +98,7 @@ function Marker.HookBlizzard()
 	SuperTrackedFrame.OnDestinationReached = function(self, isWaypoint)
 		local p = ns.path
 		if Marker.probing or (own and p and p.k < p.n) then return end
+		if own then reachedEnd = true end
 		return reached(self, isWaypoint)
 	end
 	hooksecurefunc(SuperTrackedFrame, "UpdateDistanceText", function(self)

@@ -13,12 +13,12 @@
 
 ## File upload
 
-- File: `dist/Guidelime_Pathfinder-0.6.1.zip` (made by `tools/package.sh`): three add-on folders, the add-on and its
+- File: `dist/Guidelime_Pathfinder-0.7.0.zip` (made by `tools/package.sh`): three add-on folders, the add-on and its
   path data for each continent (load-on-demand add-ons it loads itself)
-- Display name: Guidelime Pathfinder 0.6.1
+- Display name: Guidelime Pathfinder 0.7.0
 - Release type: Beta
 - Game version: Forever (1.60.1; the TOC says `## Interface: 16001`)
-- Changelog: the 0.6.1 section of `addon/Guidelime_Pathfinder/CHANGELOG.md`
+- Changelog: the 0.7.0 section of `addon/Guidelime_Pathfinder/CHANGELOG.md`
 - Related projects (both **Required Dependency**):
   - Guidelime: https://www.curseforge.com/wow/addons/guidelime
   - Questie: https://www.curseforge.com/wow/addons/questie
@@ -50,6 +50,9 @@ along real walkable paths, not a straight line through the mountain in the way.
   and boats, then goes back to your Guidelime step once you get there. Also `ah`, `inn`, `mail`, `repair`,
   `flight`, `trainer`, `food`, `drink`, `ammo`, `reagents`, profession trainers like `mining`, and
   everything else in Questie's town services list.
+- **Dungeons.** `/gpath go deadmines` (any dungeon or battleground, Forever's own too, like the Ruins of Lordaeron)
+  heads for its entrance.
+- **Your own map pins.** Ctrl-click the world map to drop a pin, and the route takes you there.
 - **Corpse runs.** While dead it heads for your corpse.
 
 ### Needs
@@ -64,6 +67,7 @@ along real walkable paths, not a straight line through the mountain in the way.
 | --- | --- |
 | `/gpath` | turn it on or off |
 | `/gpath go bank` | head for the nearest bank (or `ah`, `inn`, `mail`, `repair`, `trainer`, ...); `/gpath go` alone stops |
+| `/gpath go deadmines` | head for a dungeon's or battleground's entrance |
 | `/gpath marker`, `dots`, `minimap`, `worldmap` | turn one part on or off |
 | `/gpath status` | what it is doing and why |
 | `/gpath replan` | work the route out again |

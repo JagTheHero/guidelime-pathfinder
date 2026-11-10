@@ -144,15 +144,44 @@ for _ = 1, 5 do worst, count = dotError() end
 check(count > 0 and worst < 1.5, string.format("first-person camera (worst %.2f px)", worst))
 M.zoom = 12
 
--- player's own pin takes over
+-- a map pin the player places is the goal: the route goes there and the marker (taking the pin over) leads the way
 C_Map.SetUserWaypoint(UiMapPoint.CreateFromCoordinates(1411, 0.1, 0.1))
+local pinX, pinY = M.zone.left - 0.1 * M.zone.w, M.zone.top - 0.1 * M.zone.h
 for _ = 1, 3 do M.Step(0.1) end
-local ux = M.waypoint.position.x
-check(math.abs(ux - 0.1) < 1e-9, "player's own pin is left alone")
+check(ns.service and ns.service.pin and math.abs(ns.goal.x - pinX) < 1 and math.abs(ns.goal.y - pinY) < 1 and ns.Marker.IsActive()
+	and M.prints[#M.prints]:find("heading for your map pin", 1, true), "a map pin the player places becomes the goal, the marker leads there")
 GuidelimeArrow.element = { wx = 50, wy = 500, instance = 1 }
 for _ = 1, 3 do M.Step(0.1) end
+check(ns.service and ns.service.pin and math.abs(ns.goal.x - pinX) < 1, "a new guide step does not take over from the pin")
+C_Map.ClearUserWaypoint() -- the player removes the marker: the pin is dropped
+for _ = 1, 3 do M.Step(0.1) end
 wx, wy = M.WaypointWorld()
-check(math.abs(wx - 50) < 1 and math.abs(wy - 500) < 1, "next guide step brings the marker back")
+check(not ns.service and wx and math.abs(wx - 50) < 1 and math.abs(wy - 500) < 1, "removing the marker drops the pin: back to Guidelime's step")
+C_Map.ClearUserWaypoint() -- and on Guidelime's step: it stays away until the next one
+for _ = 1, 3 do M.Step(0.1) end
+check(M.waypoint == nil, "removing the marker on a guide step: it stays away")
+GuidelimeArrow.element = { wx = 60, wy = 520, instance = 1 }
+for _ = 1, 3 do M.Step(0.1) end
+wx, wy = M.WaypointWorld()
+check(wx and math.abs(wx - 60) < 1 and math.abs(wy - 520) < 1, "next guide step brings the marker back")
+-- Blizzard clears the waypoint at the route's end ("destination reached"): arriving, not the player removing it
+SuperTrackedFrame = { OnDestinationReached = function() C_Map.ClearUserWaypoint() end, UpdateDistanceText = function() end }
+M.Fire("ADDON_LOADED", "Blizzard_ObjectiveTracker")
+local tx, ty = M.px + 20, M.py + 20
+C_Map.SetUserWaypoint(UiMapPoint.CreateFromCoordinates(M.zone.id, (M.zone.left - tx) / M.zone.w, (M.zone.top - ty) / M.zone.h))
+for _ = 1, 3 do M.Step(0.1) end
+M.px, M.py = tx - 8, ty - 8 -- 11 yd short of it: the marker on the route's last corner
+for _ = 1, 3 do M.Step(0.1) end
+local saidBefore = #M.prints
+SuperTrackedFrame:OnDestinationReached(true)
+for _ = 1, 3 do M.Step(0.1) end
+check(ns.service and ns.service.pin and M.waypoint == nil and #M.prints == saidBefore, "destination reached near the pin: the marker stands back quietly, the pin stays the goal")
+M.px, M.py = tx - 3, ty - 2
+for _ = 1, 3 do M.Step(0.1) end
+wx, wy = M.WaypointWorld()
+check(not ns.service and (M.prints[#M.prints - 1] or ""):find("here: your map pin", 1, true) or (M.prints[#M.prints] or ""):find("here: your map pin", 1, true),
+	"at the pin it says so (" .. (M.prints[#M.prints] or "") .. ")")
+check(wx and math.abs(wx - 60) < 1 and math.abs(wy - 520) < 1, "then back to Guidelime's step")
 
 -- target gone: marker cleared
 GuidelimeArrow.element = nil
@@ -592,6 +621,13 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 		[1432] = { left = -1993.750, top = -4487.500, w = 2758.333, h = 1839.583, instance = 0, name = "Loch Modan" },
 		[1453] = { left = 1722.920, top = -7995.830, w = 1737.504, h = 1158.340, instance = 0, name = "Stormwind City" },
 		[1455] = { left = -713.591, top = -4569.241, w = 790.625, h = 527.604, instance = 0, name = "Ironforge" },
+		[1458] = { left = 873.193, top = 1877.945, w = 959.375, h = 640.104, instance = 0, name = "Undercity" },
+		[1436] = { left = 3016.667, top = -9400.000, w = 3500.000, h = 2333.333, instance = 0, name = "Westfall" },
+	}
+	local dungeons = { -- Questie's ZoneDB: name, other area ids, parent zone, entrances (area id, zone percent)
+		[16611] = { "Ruins of Lordaeron", nil, 1497, { { 1497, 72.48, 11.33 } } }, -- WoW: Forever's own
+		[1581] = { "The Deadmines", nil, 40, { { 40, 42.6, 71.8 } } },
+		[3429] = { "Ruins of Ahn'Qiraj", nil, 1377, { { 1377, 36.5, 93.9 } } },
 	}
 	local npcs = { -- Questie's name, friendlyToFaction and spawns ([areaId] = { { x, y } } in zone percent)
 		[2455] = { "Olivia Burnside", "A", { [1519] = { { 64.3, 80.8 } } } },
@@ -606,7 +642,8 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 	end
 	local modules = {
 		QuestieDB = { QueryNPCSingle = npc, QueryObjectSingle = npc },
-		ZoneDB = { GetUiMapIdByAreaId = function(_, a) return ({ [1519] = 1453, [1537] = 1455, [38] = 1432 })[a] end, IsDungeonZone = function() return false end },
+		ZoneDB = { GetUiMapIdByAreaId = function(_, a) return ({ [1519] = 1453, [1537] = 1455, [38] = 1432, [1497] = 1458, [40] = 1436 })[a] end,
+			IsDungeonZone = function() return false end, GetDungeons = function() return dungeons end },
 		Townsfolk = { townsfolk = { Banker = { 2455, 2460, 9001 }, Auctioneer = { 8671 }, Innkeeper = { 6734 } }, professionTrainers = {} },
 	}
 	QuestieLoader = { ImportModule = function(_, name) return modules[name] end }
@@ -636,7 +673,7 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 	go("go ba")
 	check(said():find("ba could be: bags, banker", 1, true), "a word that starts several names asks which (" .. said() .. ")")
 	go("go banana")
-	check(said():find("no banana in Questie's town services; there are: auctioneer, bags, banker, innkeeper", 1, true), "an unknown word lists them (" .. said() .. ")")
+	check(said():find("no banana in Questie's town services or dungeons; there are: auctioneer, bags, banker, innkeeper, or any dungeon", 1, true), "an unknown word lists them (" .. said() .. ")")
 	go("go")
 	check(not ns.service and said():find("back to Guidelime's step", 1, true), "go alone stops")
 	M.faction = "Horde"
@@ -666,6 +703,31 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 	local stand = p and p.n > 1 and { x = p.x[p.n - 1], y = p.y[p.n - 1] }
 	check(ns.targetSource == "service" and p and p.graph and near(stand, sv, 6) and math.abs(p.z[p.n] - 99.5) < 3,
 		string.format("the route ends within talking range of the banker, on the bank's floor (height %.1f, the floor 99.5)", p and p.z and p.z[p.n] or -1))
+
+	-- dungeons and battlegrounds: /gpath go <name> heads for the entrance
+	go("go ruins")
+	check(said():find("ruins could be: ruins of ahn'qiraj, ruins of lordaeron", 1, true), "go ruins: which ruins (" .. said() .. ")")
+	go("go ruins of lordaeron")
+	sv = ns.service
+	check(sv and sv.label == "the Ruins of Lordaeron entrance" and math.abs(sv.x - 177.8) < 1 and math.abs(sv.y - 1805.4) < 1
+		and said():find("Ruins of Lordaeron: the entrance in Undercity, about %d+ min away"), "go ruins of lordaeron: its entrance, over the Undercity (" .. said() .. ")")
+	settle()
+	local nxt = ns.trip and ns.trip.next
+	check(nxt and nxt.kind == "tram", "from Stormwind: the tram to Ironforge first (" .. (nxt and nxt.kind or "no trip") .. ")")
+	go("go deadmines")
+	sv = ns.service
+	check(sv and sv.label == "The Deadmines entrance" and said():find("The Deadmines: the entrance in Westfall", 1, true), "go deadmines: The Deadmines (" .. said() .. ")")
+	goTo(0, sv.x + 60, sv.y + 40) -- Moonbrook
+	settle()
+	p = ns.path
+	local last = p and p.n > 1 and { x = p.x[p.n - 1], y = p.y[p.n - 1] }
+	check(ns.targetSource == "service" and p and p.graph and near(last, sv, 15), "the route ends at the Deadmines' door")
+	goTo(0, sv.x + 3, sv.y + 2, M.pz)
+	for _ = 1, 3 do M.Step(0.1) end
+	check(not ns.service and lastHint() == "here: The Deadmines entrance", "at the door it says so (" .. lastHint() .. ")")
+	go("go ruins of lordaeron")
+	go("go")
+	check(not ns.service and said():find("stopped heading for the Ruins of Lordaeron entrance", 1, true), "go alone stops it (" .. said() .. ")")
 	M.faction, M.zones, QuestieLoader, Questie = nil, nil, nil, nil
 end
 

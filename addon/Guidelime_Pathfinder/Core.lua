@@ -710,7 +710,8 @@ end
 
 -- Town services (/gpath go bank): Questie knows where every banker, auctioneer, innkeeper, mailbox, trainer
 -- and vendor stands. Head for the one quickest to reach (walking, flights and rides) instead of Guidelime's
--- step, until there.
+-- step, until there. Dungeons and battlegrounds too (/gpath go deadmines: the entrance, from Questie's ZoneDB,
+-- WoW: Forever's own included), and a map pin the player places (ns.GoPin).
 local SERVICE_ARRIVED = 10 -- yards from it that count as there
 local SERVICE_WORDS = { -- short words for Questie's names; any start of a name works too ("bank", "inn")
 	ah = "Auctioneer", auctionhouse = "Auctioneer", fm = "Flight Master", trainer = "Class Trainer",
@@ -758,34 +759,59 @@ local function serviceSpots(name, ids)
 	return spots
 end
 
+-- dungeon or battleground name -> its entrances, as Questie's spawns ({ [areaId] = { { x, y }, ... } })
+local function dungeonLists()
+	local Z = QuestieLoader:ImportModule("ZoneDB")
+	local lists = {}
+	for areaId, d in pairs(Z and Z.GetDungeons and Z:GetDungeons() or {}) do
+		local spawns = {}
+		for _, at in ipairs(d[4] or {}) do
+			spawns[at[1]] = spawns[at[1]] or {}
+			table.insert(spawns[at[1]], { at[2], at[3] })
+		end
+		local name = Z.GetLocalizedDungeonName and Z:GetLocalizedDungeonName(areaId) or d[1]
+		if name and next(spawns) then lists[name] = spawns end
+	end
+	return lists
+end
+
+local function awayText(trip)
+	return not trip and "" or trip.cost < 60 and ", under a minute away" or format(", about %d min away", floor(trip.cost / 60 + 0.5))
+end
+
 -- word: what the player typed after /gpath go; nil or "" stops
 function ns.GoService(word)
 	if not word or word == "" then
-		if ns.service then ns.Print("stopped heading for the " .. ns.service.what .. "; back to Guidelime's step") end
+		local sv = ns.service
+		if sv then ns.Print("stopped heading for " .. (sv.label or ("the " .. sv.what)) .. "; back to Guidelime's step") end
 		ns.service = nil
 		return
 	end
-	if not QuestieLoader then return ns.Print("the town services come from Questie, which is not loaded") end
-	local lists = serviceLists()
+	if not QuestieLoader then return ns.Print("the town services and dungeons come from Questie, which is not loaded") end
+	local lists, dungeons = serviceLists(), dungeonLists()
 	if not next(lists) then return ns.Print("Questie has not finished loading its town services; try again in a moment") end
 	local w = squash(SERVICE_WORDS[squash(word)] or word)
 	local name, matches = nil, {}
-	for n in pairs(lists) do
-		if squash(n) == w then name = n end
-		if squash(n):sub(1, #w) == w then matches[#matches + 1] = n:lower() end
+	local function try(n)
+		local s, bare = squash(n), squash((n:gsub("^[Tt]he ", ""))) -- "deadmines": The Deadmines
+		if s == w or bare == w then name = n end
+		if s:sub(1, #w) == w or bare:sub(1, #w) == w then matches[#matches + 1] = n end
 	end
-	if not name and #matches == 1 then
-		for n in pairs(lists) do if n:lower() == matches[1] then name = n end end
-	end
+	for n in pairs(lists) do try(n) end
+	for n in pairs(dungeons) do try(n) end
+	if not name and #matches == 1 then name = matches[1] end
 	if not name then
 		local unknown = #matches == 0
-		if unknown then for n in pairs(lists) do matches[#matches + 1] = n:lower() end end
+		if unknown then for n in pairs(lists) do matches[#matches + 1] = n end end
+		for i, n in ipairs(matches) do matches[i] = n:lower() end
 		table.sort(matches)
-		return ns.Print(format("%s: %s", unknown and ("no " .. word .. " in Questie's town services; there are") or (word .. " could be"), table.concat(matches, ", ")))
+		return ns.Print(format("%s: %s%s", unknown and ("no " .. word .. " in Questie's town services or dungeons; there are") or (word .. " could be"),
+			table.concat(matches, ", "), unknown and ", or any dungeon or battleground by name" or ""))
 	end
 	local px, py, instance = HBD:GetPlayerWorldPosition()
 	if not px then return ns.Print("the game gives no position here") end
-	local spots = serviceSpots(name, lists[name])
+	local dungeon = not lists[name] and dungeons[name]
+	local spots = dungeon and spawnSpots(function() return dungeon end, nil, {}) or serviceSpots(name, lists[name])
 	local trip = ns.Graph.PlanTrip({ instance = instance, x = px, y = py, z = ns.player.z }, spots, tripOpts())
 	local pick = trip and spots[trip.goal]
 	if not pick then -- off the walkable graph: the nearest on this continent in a straight line
@@ -796,11 +822,37 @@ function ns.GoService(word)
 		end
 	end
 	if not pick then return ns.Print(format("no %s you can get to from here", name:lower())) end
-	pick.what = name:lower()
 	ns.service = pick
+	if dungeon then
+		pick.what, pick.label = name, (name:find("^[Tt]he ") and "" or "the ") .. name .. " entrance"
+		-- the zone it is in on the continent map: Questie files the Ruins of Lordaeron under the Undercity below it
+		local zone = placeName(pick) or (C_Map.GetMapInfo(pick.uiMap) or {}).name
+		return ns.Print(format("%s: the %sentrance%s%s", name, #spots > 1 and "nearest " or "", zone and (" in " .. zone) or "", awayText(trip)))
+	end
+	pick.what = name:lower()
 	local zone = C_Map.GetMapInfo(pick.uiMap)
-	ns.Print(format("nearest %s: %s%s%s", pick.what, pick.name or "?", zone and zone.name and (" in " .. zone.name) or "",
-		not trip and "" or trip.cost < 60 and ", under a minute away" or format(", about %d min away", floor(trip.cost / 60 + 0.5))))
+	ns.Print(format("nearest %s: %s%s%s", pick.what, pick.name or "?", zone and zone.name and (" in " .. zone.name) or "", awayText(trip)))
+end
+
+-- A map pin the player placed (wp: the game's UiMapPoint; Marker.lua sees it): the route goes there like a town
+-- service, until there or /gpath go, and the marker walks it corner by corner (the game has one map pin, so the
+-- marker takes it over). False where the pin has no world position.
+function ns.GoPin(wp)
+	local x, y, instance = HBD:GetWorldCoordinatesFromZone(wp.position.x, wp.position.y, wp.uiMapID)
+	if not x then return false end
+	ns.service = { instance = instance, x = x, y = y, what = "map pin", label = "your map pin", pin = true }
+	local px, py, pinst = HBD:GetPlayerWorldPosition()
+	local trip = px and ns.Graph.PlanTrip({ instance = pinst, x = px, y = py, z = ns.player.z }, { instance = instance, x = x, y = y }, tripOpts())
+	ns.Print("heading for your map pin" .. awayText(trip) .. "; the marker leads the way (/gpath go stops)")
+	return true
+end
+
+-- The player removed the marker. True when it was leading to their map pin, which is then dropped.
+function ns.StopPin()
+	if not (ns.service and ns.service.pin) then return false end
+	ns.service = nil
+	ns.Print("map pin removed; back to Guidelime's step")
+	return true
 end
 
 -- The game gives addons no player height, so walk the ground under the player on the walk grid from tick to tick
@@ -845,7 +897,7 @@ local function tick()
 	local sv = ns.service
 	if sv and px and instance == sv.instance and dist(px, py, sv.x, sv.y) < SERVICE_ARRIVED then
 		ns.service = nil
-		hint(format("here: %s (%s)", sv.name or "?", sv.what))
+		hint(sv.label and ("here: " .. sv.label) or format("here: %s (%s)", sv.name or "?", sv.what))
 	end
 	local tx, ty, tinstance, tz = ns.GetTarget()
 	if not px or not tx then return ns.Stop() end
@@ -954,7 +1006,8 @@ local function status()
 	end
 	local p = ns.path
 	if ns.targetSource == "service" then
-		ns.Print(format("  heading for the nearest %s: %s (/gpath go stops)", ns.service.what, ns.service.name or "?"))
+		local sv = ns.service
+		ns.Print("  heading for " .. (sv.label or format("the nearest %s: %s", sv.what, sv.name or "?")) .. " (/gpath go stops)")
 	end
 	if ns.targetSource == "questie" then
 		ns.Print(format("  target from Questie (Guidelime's step has no map position): %s for %s",
@@ -1014,6 +1067,8 @@ SlashCmdList.GUIDELIMEPATHFINDER = function(msg)
 		ns.Print("/gpath  - turn on/off")
 		ns.Print("/gpath marker | dots | minimap | worldmap | debug  - toggle a part")
 		ns.Print("/gpath go bank | ah | inn | mail | repair | flight | trainer | food | mining ...  - head for the nearest one; /gpath go stops")
+		ns.Print("/gpath go deadmines | ruins of lordaeron ...  - head for a dungeon's or battleground's entrance")
+		ns.Print("a map pin you place (Ctrl-click the world map) is a goal too: the marker walks you there")
 		ns.Print("/gpath status | replan | probe (measure the camera for the ground dots)")
 		ns.Print("/gpath spacing <yd> | range <yd> | size <yd> | height <yd> | fov <deg, 0 = auto>  - ground dot tuning")
 	end
