@@ -471,6 +471,9 @@ if ns.Graph.HasGround(0) then
 	M.px, M.py, M.pz = -1166.4, -4808.5, 502.5
 	local likely = ns.Graph.LikelyZ(0, M.px, M.py)
 	check(likely and likely < 600, string.format("Ironforge: the likely height is in the halls, not on the mountainside (%.1f)", likely or -1))
+	-- the Military Ward by the Hot Coals: the mountainside over it has more path nodes close by (picked until 0.7.1)
+	likely = ns.Graph.LikelyZ(0, -1216.9, -4961.1)
+	check(likely and math.abs(likely - 501.8) < 3, string.format("Ironforge's Military Ward: the likely height is its floor (%.1f, the floor 501.8)", likely or -1))
 	ns.player.gx, ns.player.gy, ns.player.ginstance, ns.player.z = M.px, M.py, 0, M.pz -- on the floor at the /reload
 	M.Fire("PLAYER_LOGOUT")
 	ns.player.gx, ns.player.z = nil, nil
@@ -494,6 +497,13 @@ if ns.Graph.HasGround(0) then
 		ns.Dots.record = nil
 		check(nd > 3 and worst < 15, string.format("Ironforge: the dots stay in the halls (%d dots, at most %.1f yd from the floor)", nd, worst))
 	end
+	-- a height saved by another version is not restored after the /reload (0.7.1 put players in the Military Ward on
+	-- the mountainside over it, and kept them there)
+	M.px, M.py, M.pz = -1216.9, -4961.1, 501.8
+	ns.db.ground = { 0, M.px, M.py, 684.2, "0.7.1" }
+	ns.player.gx, ns.player.z = nil, nil
+	for _ = 1, 3 do M.Step(0.1) end
+	check(ns.player.z and math.abs(ns.player.z - 501.8) < 3, string.format("a height saved by an older version is not restored (%.1f, the floor 501.8)", ns.player.z or -1))
 end
 
 -- trips: walk to where a lift, portal, boat, zeppelin or flight starts, say what to do there, wait out the ride,
@@ -567,15 +577,34 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 	GuidelimeArrow.element = { wx = -4330, wy = 1660, instance = 1 }
 	settle()
 	check(ns.trip and not ns.trip.next, "no flight masters found: the way is walked")
+	-- WoW: Forever's world map says every flight master is found (isUndiscovered = false), the other faction's too
 	M.taxiNodes = { [1414] = {
 		{ nodeID = 25, name = "Crossroads, The Barrens", faction = 1, isUndiscovered = false },
 		{ nodeID = 23, name = "Orgrimmar, Durotar", faction = 1, isUndiscovered = false },
-		{ nodeID = 22, name = "Thunder Bluff, Mulgore", faction = 1, isUndiscovered = true },
+		{ nodeID = 22, name = "Thunder Bluff, Mulgore", faction = 1, isUndiscovered = false },
 	} }
 	M.Fire("TAXI_NODE_STATUS_CHANGED")
 	settle()
+	check(ns.trip and not ns.trip.next, "the world map's flight masters do not count as found")
+	-- the flight map does know: the player opens it at the Crossroads
+	M.taxiAll = {
+		{ nodeID = 25, name = "Crossroads, The Barrens", state = 0 },
+		{ nodeID = 23, name = "Orgrimmar, Durotar", state = 1 },
+		{ nodeID = 22, name = "Thunder Bluff, Mulgore", state = 2 },
+	}
+	M.taxiOpen = true
+	M.Fire("TAXIMAP_OPENED", 1)
+	M.taxiOpen = false
+	M.Fire("TAXIMAP_CLOSED")
+	local saved = ns.db.flights and ns.db.flights[UnitGUID("player")]
+	check(saved and saved[25] and saved[23] and not saved[22], "the flight map's found flight masters are kept for this character")
+	settle()
 	l = ns.trip and ns.trip.next
 	check(l and l.kind == "flight" and l.to.node == 23 and near(routeEnd(), l.from, 3), "both found: walk to the flight master, fly to Orgrimmar")
+	M.guid = "Player-1-00000002"
+	ns.KnownTaxi() -- (cached for a few seconds)
+	check(not (ns.db.flights[M.guid]), "another character starts with none")
+	M.guid = nil
 	if l then
 		goTo(1, l.from.x, l.from.y, l.from.z)
 		for _ = 1, 3 do M.Step(0.1) end

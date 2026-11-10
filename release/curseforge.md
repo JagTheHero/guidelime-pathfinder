@@ -13,12 +13,12 @@
 
 ## File upload
 
-- File: `dist/Guidelime_Pathfinder-0.7.1.zip` (made by `tools/package.sh`): three add-on folders, the add-on and its
+- File: `dist/Guidelime_Pathfinder-0.7.2.zip` (made by `tools/package.sh`): three add-on folders, the add-on and its
   path data for each continent (load-on-demand add-ons it loads itself)
-- Display name: Guidelime Pathfinder 0.7.1
+- Display name: Guidelime Pathfinder 0.7.2
 - Release type: Beta
 - Game version: Forever (1.60.1; the TOC says `## Interface: 16001`)
-- Changelog: the 0.7.1 section of `addon/Guidelime_Pathfinder/CHANGELOG.md`
+- Changelog: the 0.7.2 section of `addon/Guidelime_Pathfinder/CHANGELOG.md`
 - Related projects (both **Required Dependency**):
   - Guidelime: https://www.curseforge.com/wow/addons/guidelime
   - Questie: https://www.curseforge.com/wow/addons/questie
@@ -40,9 +40,9 @@ along real walkable paths, not a straight line through the mountain in the way.
   line up with and run.
 - **Around mob camps.** Hostile mobs near your level count like a traffic jam: the route skirts their aggro
   range when the way around is not much longer.
-- **Flights, boats and more.** Takes the flight paths you have found (and highlights where to fly on the flight
-  map), boats, zeppelins, Thunder Bluff's lifts, the Deeprun Tram and the Teldrassil portal, and tells you what
-  to do at each stop.
+- **Flights, boats and more.** Takes the flight paths you have found (it learns them when you open a flight
+  master's map, and highlights where to fly on it), boats, zeppelins, Thunder Bluff's lifts, the Deeprun Tram
+  and the Teldrassil portal, and tells you what to do at each stop.
 - **Forever's own quests.** When Guidelime's step has no map position, it heads for
   [Questie](https://www.curseforge.com/wow/addons/questie)'s nearest map icon for the quest the step names
   (keep Guidelime's window open).

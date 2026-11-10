@@ -959,11 +959,12 @@ function Graph.LocalPath(instance, x0, y0, z0, x1, y1, z1)
 	return corners
 end
 
--- Most likely ground height at (x, y) when nothing else is known (login, teleport): the layer most path nodes
--- within 40 yards are on, nearer nodes counting more. Ironforge's halls win over the mountainside above them.
--- The nodes where NPCs stand do not vote: each has one on every layer over its spot, the mountainside too.
--- At a flight master (where a flight lands) it is the flight master's: Orgrimmar's stands on top of a tower.
-local AT_TAXI = 8
+-- Most likely ground height at (x, y) when nothing else is known (login, teleport): of the walk grid's layers at
+-- the spot, the one most path nodes within LIKELY_REACH yards are on, nearer nodes counting more and the nodes where
+-- a player stands to talk to an NPC LIKELY_POI times (NPCs stand where players go; one whose height is known has
+-- them on its own floor only). Ironforge's halls win over the mountainside over them, which has more nodes close by
+-- but no NPCs. At a flight master (where a flight lands) it is the flight master's: Orgrimmar's is on a tower.
+local AT_TAXI, LIKELY_REACH, LIKELY_POI = 8, 40, 5
 function Graph.LikelyZ(instance, x, y)
 	local g = graphs[instance]
 	if not g or (g.n or 0) == 0 then return end
@@ -971,19 +972,20 @@ function Graph.LikelyZ(instance, x, y)
 		if (pos[1] - x) ^ 2 + (pos[2] - y) ^ 2 < AT_TAXI * AT_TAXI then return pos[3] end
 	end
 	decodeNodes(g)
-	local found = {}
-	for _, a in ipairs(nearest(g, x, y, 36)) do
-		if #found < 12 and not flag(g.f[a[1]], NODE_POI) then found[#found + 1] = a end
+	local near = nearest(g, x, y, 80)
+	local layers = layersAt(g, x, y)
+	if #layers == 0 then -- no walk grid ground here: the heights of the nodes around
+		for _, a in ipairs(near) do if a[2] < LIKELY_REACH then layers[#layers + 1] = g.z[a[1]] end end
 	end
 	local best, bestScore
-	for _, a in ipairs(found) do
-		if a[2] < 40 then
-			local score = 0
-			for _, b in ipairs(found) do
-				if b[2] < 40 and abs(g.z[b[1]] - g.z[a[1]]) < LAYER_GAP then score = score + 1 / (b[2] + 10) end
+	for _, h in ipairs(layers) do
+		local score = 0
+		for _, a in ipairs(near) do
+			if a[2] < LIKELY_REACH and abs(g.z[a[1]] - h) < LAYER_GAP then
+				score = score + (flag(g.f[a[1]], NODE_POI) and LIKELY_POI or 1) / (a[2] + 10)
 			end
-			if not bestScore or score > bestScore then best, bestScore = g.z[a[1]], score end
 		end
+		if not bestScore or score > bestScore then best, bestScore = h, score end
 	end
 	return best
 end

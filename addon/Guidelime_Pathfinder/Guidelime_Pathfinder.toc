@@ -2,7 +2,7 @@
 ## Title: Guidelime |cff9fff3fPathfinder|r
 ## Notes: Walks you to Guidelime's current step (or the nearest bank, inn or vendor) along real walkable paths, flights and boats: in-world marker, ground dots, map and minimap trail.
 ## Author: Jag
-## Version: 0.7.1
+## Version: 0.7.2
 ## Dependencies: Guidelime, Questie
 ## X-License: GPL-3.0-or-later
 ## SavedVariables: GuidelimePathfinderDB

@@ -1,5 +1,17 @@
 # Guidelime Pathfinder
 
+## 0.7.2 (beta)
+
+- Flight paths: routes only take the flight paths you have found. WoW: Forever's world map says every flight master
+  is found (the other faction's too), so routes could send you to one you never visited. The add-on now learns yours
+  from the flight map whenever you open it at a flight master, per character: open any flight master's map once
+  after updating, and until then routes walk.
+- The wrong floor in Ironforge: after a hearth, a teleport or a login, the add-on guesses which floor you are on,
+  and in Ironforge's Military Ward it picked the mountainside 180 yards over the halls, so the route and the dots
+  were up there. The guess now weighs each floor at your spot by the path points on it and where NPCs stand: on
+  stacked floors around the world it picks the wrong one about a third less often (and the Military Ward's floor).
+  A height saved by an older version is no longer restored after a /reload.
+
 ## 0.7.1 (beta)
 
 - Fixed a Lua error ("bad argument #3 ... GetMapInfoAtPosition") after `/gpath go <dungeon>`: the route was set,

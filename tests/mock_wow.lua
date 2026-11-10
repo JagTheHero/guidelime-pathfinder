@@ -91,9 +91,17 @@ function UnitFactionGroup() return M.faction or "Alliance" end
 function UnitLevel() return M.level or 60 end
 function UnitOnTaxi() return M.onTaxi end
 function GetUnitSpeed() return 0, M.runSpeed or 7, 0, 4.7 end
--- flight masters: M.taxiNodes[uiMapID] = { { nodeID, name, faction, isUndiscovered }, ... }; the taxi map's slots
--- are M.taxiSlots = { name, ... }
-C_TaxiMap = { GetTaxiNodesForMap = function(mapID) return M.taxiNodes and M.taxiNodes[mapID] or {} end }
+-- flight masters: M.taxiNodes[uiMapID] = { { nodeID, name, faction, isUndiscovered }, ... } (WoW: Forever says
+-- isUndiscovered = false for all); while a flight map is open (M.taxiOpen), M.taxiAll = { { nodeID, name, state }, ... }
+-- (Enum.FlightPathState); the taxi map's slots are M.taxiSlots = { name, ... }
+Enum = Enum or {}
+Enum.FlightPathState = { Current = 0, Reachable = 1, Unreachable = 2 }
+C_TaxiMap = {
+	GetTaxiNodesForMap = function(mapID) return M.taxiNodes and M.taxiNodes[mapID] or {} end,
+	GetAllTaxiNodes = function(mapID) return M.taxiOpen and M.taxiAll or {} end,
+}
+function GetTaxiMapID() return M.taxiOpen and 1414 or nil end
+function UnitGUID(unit) return unit == "player" and (M.guid or "Player-1-00000001") or nil end
 function NumTaxiNodes() return #(M.taxiSlots or {}) end
 function TaxiNodeName(i) return M.taxiSlots[i] end
 C_Timer = { After = function(_, fn) fn() end }
@@ -234,6 +242,7 @@ end
 -- C_AddOns.LoadAddOn loads an addon from the folder next to the last one loaded with M.LoadAddon
 local addonRoot, loaded = ".", {}
 C_AddOns = C_AddOns or {}
+C_AddOns.GetAddOnMetadata = function(_, field) if field == "Version" then return M.version or "test" end end
 C_AddOns.LoadAddOn = function(name)
 	if loaded[name] then return true end
 	local ok = io.open(addonRoot .. "/" .. name .. "/" .. name .. ".toc")

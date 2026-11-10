@@ -2,6 +2,7 @@ local ADDON, ns = ...
 GuidelimePathfinder = ns
 
 local HBD = LibStub("HereBeDragons-2.0")
+local VERSION = C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON, "Version")
 ns.HBD = HBD
 
 local floor, sqrt, min, max, abs, huge = math.floor, math.sqrt, math.min, math.max, math.abs, math.huge
@@ -553,31 +554,47 @@ end
 -- says which flight masters the player has found; the taxi map highlights where to fly.
 local CONTINENT_MAP = { [0] = 1415, [1] = 1414 }
 local FACTION = { Alliance = "A", Horde = "H" }
-local TAXI_FACTION = { Horde = 1, Alliance = 2 } -- Enum.FlightPathFaction; 0 is neutral
 local KNOWN_FOR = 10 -- seconds the list of found flight masters is reused
 local known, knownAt, knownCount = {}, -huge, 0
 
-local function taxiNodes(mapID, mine, into)
-	local nodes = C_TaxiMap.GetTaxiNodesForMap(mapID) or {}
-	for _, n in ipairs(nodes) do
-		if not n.isUndiscovered and (n.faction == 0 or n.faction == mine) and n.nodeID then into[n.nodeID] = n.name end
+-- The flight masters the player has found, kept per character (GuidelimePathfinderDB.flights[GUID]: [node id] =
+-- name) from the game's flight map, which only knows while it is open (C_TaxiMap.GetAllTaxiNodes: a node's state
+-- is Current or Reachable once found). C_TaxiMap.GetTaxiNodesForMap cannot tell: on WoW: Forever every node says
+-- isUndiscovered = false, the other faction's too.
+local UNREACHABLE = Enum and Enum.FlightPathState and Enum.FlightPathState.Unreachable or 2
+local function myFlights(create)
+	local guid = UnitGUID("player")
+	local all = ns.db and ns.db.flights
+	if create and guid and ns.db then
+		ns.db.flights = all or {}
+		ns.db.flights[guid] = ns.db.flights[guid] or {}
+		return ns.db.flights[guid]
 	end
-	return #nodes
+	return guid and all and all[guid]
+end
+
+-- the flight map is open: what it says about every node on it
+local function readTaxiMap()
+	local nodes = C_TaxiMap.GetAllTaxiNodes and GetTaxiMapID and C_TaxiMap.GetAllTaxiNodes(GetTaxiMapID())
+	if not nodes or #nodes == 0 then return end
+	local mine = myFlights(true)
+	if not mine then return end
+	for _, n in ipairs(nodes) do
+		if n.nodeID and not n.isMapLayerTransition then mine[n.nodeID] = n.state ~= UNREACHABLE and n.name or nil end
+	end
+	knownAt = -huge
 end
 
 -- [node id] = name of every flight master the player has found and may use
+local toldToOpen
 function ns.KnownTaxi()
 	if GetTime() - knownAt < KNOWN_FOR then return known, knownCount end
 	knownAt = GetTime()
-	local found = {}
-	if C_TaxiMap and C_TaxiMap.GetTaxiNodesForMap then
-		local mine = TAXI_FACTION[UnitFactionGroup("player")]
-		for _, mapID in pairs(CONTINENT_MAP) do
-			-- no nodes on the continent map: ask its zones
-			if taxiNodes(mapID, mine, found) == 0 and C_Map.GetMapChildrenInfo then
-				for _, child in ipairs(C_Map.GetMapChildrenInfo(mapID, 3) or {}) do taxiNodes(child.mapID, mine, found) end
-			end
-		end
+	local found, mine = {}, myFlights()
+	for id, name in pairs(mine or {}) do found[id] = name end
+	if not mine and not toldToOpen and ns.db then
+		toldToOpen = true
+		ns.Print("open any flight master's map once, so routes can take the flight paths you have found")
 	end
 	local n, changed = 0, false
 	for id, name in pairs(found) do
@@ -865,6 +882,7 @@ function ns.TrackGround(px, py, instance)
 	local pl = ns.player
 	local moved = pl.gx and pl.ginstance == instance and pl.z and sqrt((px - pl.gx) ^ 2 + (py - pl.gy) ^ 2)
 	local saved = not pl.gx and ns.db.ground
+	if saved and saved[5] ~= VERSION then saved = nil end -- an update may track heights better: start afresh
 	local z
 	if moved and moved < 40 then
 		local lost
@@ -978,13 +996,14 @@ events:SetScript("OnEvent", function(_, event, arg1)
 		ticker:Show()
 	elseif event == "PLAYER_LOGOUT" then -- also on /reload: the height to start from after it
 		local pl = ns.player
-		ns.db.ground = pl.gx and pl.z and { pl.ginstance, pl.gx, pl.gy, pl.z } or nil
+		ns.db.ground = pl.gx and pl.z and { pl.ginstance, pl.gx, pl.gy, pl.z, VERSION } or nil
 	elseif event == "USER_WAYPOINT_UPDATED" then
 		ns.Marker.OnWaypointUpdated()
-	else -- the taxi map: a flight master just found counts at once
+	else -- the taxi map: which flight masters are found, and a flight master just found counts at once
 		knownAt = -huge
+		readTaxiMap()
 		if event == "TAXIMAP_OPENED" then
-			C_Timer.After(0, lightTaxi) -- after the taxi frame has made its buttons
+			C_Timer.After(0, function() readTaxiMap() lightTaxi() end) -- after the taxi frame has made its buttons
 		elseif event == "TAXIMAP_CLOSED" and lit then
 			lit:UnlockHighlight()
 			lit = nil
@@ -1021,7 +1040,7 @@ local function status()
 		ns.Print(format("  ground height under you %.1f yd%s", ns.player.z, line and format(", route here %.1f yd", line) or ""))
 	end
 	local _, found = ns.KnownTaxi()
-	ns.Print(format("  flight paths: %d found%s", found, found == 0 and " (the game lists none yet)" or ""))
+	ns.Print(format("  flight paths: %d found%s", found, not myFlights() and " (none known yet: open any flight master's map once)" or ""))
 	local trip = ns.trip
 	if trip and trip.next then
 		ns.Print(format("  trip: %s (about %d min)%s", ns.TripText(trip), floor(trip.cost / 60 + 0.5),
