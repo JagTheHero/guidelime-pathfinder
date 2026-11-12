@@ -33,7 +33,13 @@ local MULT = { [0] = 1, [1] = 2.5, [2] = 2.5, [3] = 2.5 }
 -- puts them where a player can stand to talk to it, up to 5 yards off (behind a counter: in front of it)
 local POI_REACH = 6
 local SWIM_GOAL = 15 -- yards a goal in the water counts as farther than one on land
-local HEURISTIC_WEIGHT = 1.15
+-- The search estimate is the straight distance to the target, times this weight.
+-- With a weight of 1 the search finds the cheapest route. A larger weight is faster, but the result then depends
+-- on the order of the search. Two starts that are near each other can then get two different routes.
+local HEURISTIC_WEIGHT = 1
+-- A new plan can go back onto the old route (see Graph.FindPath). The old route counts as this much cheaper.
+-- Thus a different route replaces the old route only if it is clearly better.
+local KEEP_ROUTE = 0.85
 -- yards every leg costs on top of its length (navbuild's LEG_COST): of two routes about as long, the one with
 -- fewer, longer straight legs, which is less to steer
 local LEG_COST = 10
@@ -390,7 +396,9 @@ local function back(ax, ay, bx, by, cx, cy)
 	return d > 0 and min(d, lv) * BACK_COST or 0
 end
 
-local function search(g, sx, sy, tx, ty, indoors, sz, tz)
+-- keep is optional. It gives the cost from a node of the old route to the goal: keep[id] = cost.
+-- The search can end at such a node. The route then continues along the old route.
+local function search(g, sx, sy, tx, ty, indoors, sz, tz, keep)
 	decodeNodes(g)
 	local gx, gy, gz = g.x, g.y, g.z
 	local starts = nearest(g, sx, sy, 4, indoors, sz)
@@ -411,7 +419,7 @@ local function search(g, sx, sy, tx, ty, indoors, sz, tz)
 		hn = heapPush(hk, hv, hn, st[2] + h(st[1]), st[1])
 	end
 
-	local best, bestId = huge, nil
+	local best, bestId, bestKept = huge, nil, false
 	local expanded = 0
 	while hn > 0 do
 		local f, u
@@ -425,8 +433,9 @@ local function search(g, sx, sy, tx, ty, indoors, sz, tz)
 			local fx, fy = from and gx[from] or sx, from and gy[from] or sy
 			if goalCost[u] then
 				local c = gu + goalCost[u] + back(fx, fy, ux, uy, tx, ty)
-				if c < best then best, bestId = c, u end
+				if c < best then best, bestId, bestKept = c, u, false end
 			end
+			if keep and keep[u] and gu + keep[u] < best then best, bestId, bestKept = gu + keep[u], u, true end
 			local first, last = edgeRange(g, u)
 			for j = first, last - 1 do
 				local v, fl = edgeAt(g, j)
@@ -453,7 +462,7 @@ local function search(g, sx, sy, tx, ty, indoors, sz, tz)
 		table.insert(ids, 1, id)
 		id = came[id]
 	end
-	return ids, best, expanded
+	return ids, best, expanded, best - gs[bestId], bestKept
 end
 
 -- Of the found path's corners, the cheapest chain by the search's own costs over direct graph edges (each an
@@ -480,6 +489,19 @@ local function smooth(g, ids)
 		j = from[j]
 	end
 	return out
+end
+
+-- Returns the cost from each node of the chain to the goal. endCost is the cost from the last node to the goal.
+-- The costs are the costs of the search.
+local function chainCosts(g, ids, endCost)
+	local cost = { [#ids] = endCost }
+	for i = #ids - 1, 1, -1 do
+		local u, v = ids[i], ids[i + 1]
+		local fl, e = edgeFlag(g, u, v)
+		local dx, dy, dz = g.x[v] - g.x[u], g.y[v] - g.y[u], g.z[v] - g.z[u]
+		cost[i] = cost[i + 1] + sqrt(dx * dx + dy * dy + dz * dz) * (MULT[(fl or 0) % 8] or 1) + LEG_COST + (e and edgeJam(g, e, u, v) or 0)
+	end
+	return cost
 end
 
 local function buildPath(g, ids, sx, sy, tx, ty)
@@ -522,15 +544,37 @@ end)
 
 -- Calls cb(path) later with a path table {x, y, z, n} from (sx, sy) to (tx, ty), or cb(nil). sz, the player's
 -- ground height if known, starts the path on the player's layer; tz, the target's, ends it on the target's.
-function Graph.FindPath(instance, sx, sy, tx, ty, indoors, cb, sz, tz)
+--
+-- old is optional. It is the route that the player has left, to the same target. Corner `from` of it is the next
+-- corner ahead of the player. The new route can then go back onto the old route at this corner or a later one.
+-- The part of the old route after that point stays as it is. The route does not change to a different one
+-- that is almost as good (KEEP_ROUTE).
+-- The path has two more fields for this: ids (the graph node of each corner between the start and the target)
+-- and cost (the search cost from each of these nodes to the target).
+function Graph.FindPath(instance, sx, sy, tx, ty, indoors, cb, sz, tz, old, from)
 	local g = graphs[instance]
 	if not g or (g.n or 0) == 0 then cb(nil) return end
 	local j = { cb = cb }
 	j.co = create(function()
 		local t0 = debugprofilestop()
-		local ids, cost, expanded = search(g, sx, sy, tx, ty, indoors, sz, tz)
+		local keep, index
+		if old and old.ids and old.cost then
+			keep, index = {}, {}
+			-- Corner c of a path is node c - 1 of its ids. Corner 1 is the start.
+			for i = #old.ids, max(1, (from or 2) - 1), -1 do
+				keep[old.ids[i]], index[old.ids[i]] = old.cost[i] * KEEP_ROUTE, i
+			end
+		end
+		local ids, cost, expanded, endCost, kept = search(g, sx, sy, tx, ty, indoors, sz, tz, keep)
 		if ids then
-			j.result = buildPath(g, smooth(g, ids), sx, sy, tx, ty)
+			if kept then
+				-- The search ended on the old route. Add the rest of the old route.
+				for k = index[ids[#ids]] + 1, #old.ids do ids[#ids + 1] = old.ids[k] end
+				endCost = old.cost[#old.ids]
+			end
+			ids = smooth(g, ids)
+			j.result = buildPath(g, ids, sx, sy, tx, ty)
+			j.result.ids, j.result.cost, j.result.kept = ids, chainCosts(g, ids, endCost), kept
 			ns.Debug(format("path: %d corners, %.0f yd, %d nodes searched, %.0f ms", j.result.n, cost, expanded, debugprofilestop() - t0))
 		else
 			ns.Debug("no connected path found")

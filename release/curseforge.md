@@ -74,7 +74,9 @@ along real walkable paths, not a straight line through the mountain in the way.
 | `/gpath probe` | measure the camera, for better ground dots |
 | `/gpath trace` | record the camera for 15 seconds, to find why dots are not on the ground |
 | `/gpath jump on` / `off` | keep the ground dots on the ground when you jump (on by default) |
-| `/gpath spacing`, `range`, `size`, `height`, `fov` | ground dot tuning |
+| `/gpath jump 0.6` | tune the jump correction: a larger number if the dots go up when you jump, a smaller number if they go down (default 0.5) |
+| `/gpath range 120` | how far ahead the ground dots go, in yards (default 90) |
+| `/gpath spacing`, `size`, `height`, `fov` | ground dot tuning |
 
 ### Good to know
 

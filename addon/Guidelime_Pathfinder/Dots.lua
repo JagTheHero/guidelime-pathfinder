@@ -14,7 +14,8 @@ ns.Dots = Dots
 local sin, cos, tan, sqrt, abs, min, max, rad, pi, floor = math.sin, math.cos, math.tan, math.sqrt, math.abs, math.min, math.max, math.rad, math.pi, math.floor
 local DOT = "Interface\\AddOns\\" .. ADDON .. "\\Media\\dot"
 local COLOR = { 0.62, 1, 0.25 }
-local MAX_DOTS = 48
+local MAX_DOTS = 96
+local ROUTE_FADE = 0.4 -- seconds: the dots of a new route come in during this time
 local VFOV_PER_FOV = 0.6
 -- A marker nearer than the camera's distance has two cameras that put it on the same spot: the real one
 -- and its mirror on the far side of the player looking back (often under the floor). Of the cameras that fit,
@@ -31,12 +32,12 @@ local CAM_CLEAR, CAM_STEP = 0.3, 0.5
 -- The game draws the marker at the height of the camera pivot. A /gpath trace recording shows this.
 -- Thus the marker cannot tell us the camera height during a jump.
 -- We calculate the height of the character from the jump speed and the gravity of the game.
--- We then put the camera at JUMP_CAMERA times that height.
--- JUMP_CAMERA is an estimate from two screenshots. It is not a measured value.
+-- We then put the camera at a share of that height. The share is the setting jumpCamera (/gpath jump <share>).
+-- The default share is an estimate from two screenshots. It is not a measured value.
+-- If the dots go up when you jump, the share is too small. If they go down, it is too large.
 local JUMP_SPEED, GRAVITY, FALL_MAX = 7.9555, 19.2911, 60.148 -- yards per second, yards per second squared, yards per second
 -- Seconds. If the character leaves the ground this soon after the jump key, it is a jump. If not, it is a fall.
 local JUMP_GRACE = 0.3
-local JUMP_CAMERA = 0.5
 local air, jumpAt
 if hooksecurefunc and JumpOrAscendStart then
 	hooksecurefunc("JumpOrAscendStart", function()
@@ -356,7 +357,7 @@ local function draw()
 	local falling = IsFalling and IsFalling() or false
 	local up = airHeight(pz, now)
 	-- The height of the camera pivot and the marker above their height on the ground, in yards.
-	local lift = db.jumpFix ~= false and JUMP_CAMERA * up or 0
+	local lift = db.jumpFix ~= false and (db.jumpCamera or 0.5) * up or 0
 	local m, md
 	for _, at in ipairs({ ns.Marker.at, ns.Marker.before }) do
 		local d2 = sqrt((at[1] - px) ^ 2 + (at[2] - py) ^ 2)
@@ -422,6 +423,11 @@ local function draw()
 	end
 	local rec = Dots.record or (cap and cap.dots)
 
+	-- The dots of a new route do not appear suddenly. This does not apply to a plan that goes back onto the old route.
+	if p.id ~= cam.pathId then
+		cam.pathId, cam.pathAt = p.id, (cam.pathId and not p.kept) and now or nil
+	end
+	local routeFade = cam.pathAt and min(1, (now - cam.pathAt) / ROUTE_FADE) or 1
 	local n = 0
 	local range, size = db.dotRange, db.dotSize
 	ns.SampleGround(p, instance, px, py, ground and pz, db.dotSpacing, range, function(x, y, z, along, lineZ, unsure)
@@ -438,7 +444,7 @@ local function draw()
 		t:SetPoint("CENTER", UIParent, "BOTTOMLEFT", sx, sy)
 		local fadeIn = min(1, (along - 2) / 6)
 		local fadeOut = min(1, (range - along) / (range * 0.35))
-		t:SetAlpha(0.85 * fadeIn * fadeOut)
+		t:SetAlpha(0.85 * fadeIn * fadeOut * routeFade)
 		t:Show()
 	end)
 	return n

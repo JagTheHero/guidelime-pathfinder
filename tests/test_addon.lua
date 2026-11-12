@@ -83,6 +83,11 @@ do
 	check(ok, "a jump, the camera and the marker going up half of it: the dots stay on the ground (" .. msg .. ")")
 	ok, msg = jump(0.5, 0.5, -0.1)
 	check(ok, "a jump, turning: the dots stay on the ground (" .. msg .. ")")
+	-- A client whose camera goes up 0.7 of the jump height. /gpath jump 0.7 sets the addon to that share.
+	SlashCmdList.GUIDELIMEPATHFINDER("jump 0.7")
+	ok, msg = jump(0.7, 0.7, 0)
+	check(ok and GuidelimePathfinderDB.jumpCamera == 0.7, "/gpath jump 0.7: the dots stay on the ground when the camera goes up 0.7 of a jump (" .. msg .. ")")
+	SlashCmdList.GUIDELIMEPATHFINDER("jump 0.5")
 	-- /gpath trace must save one row of 20 columns for each frame of 15 seconds.
 	ns.Dots.Trace()
 	for _ = 1, 910 do M.Step(1 / 60) end
@@ -585,11 +590,13 @@ if ns.Graph.Has(0) then
 		check(ns.path == r and n > 5 and slid < 0.2, string.format("walking the route: the dots stay where they are on the ground (%d dots, at most %.2f yd from where one was)", n, slid))
 		-- Do the same test 3 yards to the side of the route.
 		-- The first dots are on the way to the route. They move with the player, thus we ignore them.
+		-- The join point moves along the route at a limited speed. Wait until it is in its place.
 		goTo(60, 3)
+		for _ = 1, 12 do M.Step(0.1) end
 		local a = dots()
 		goTo(61.3, 3)
 		local b, far = dots(), 0
-		for i = 1, 3 do table.remove(b, 1) end
+		for i = 1, 4 do table.remove(b, 1) end
 		check(ns.path == r and #b > 5 and moved(a, b) < 0.2, string.format("walking 3 yd beside the route: its dots stay where they are (at most %.2f yd)", moved(a, b)))
 
 		-- A shortcut. The player stands inside a corner of the route.
@@ -605,7 +612,7 @@ if ns.Graph.Has(0) then
 				if off > 5 then
 					goTo(r.len[i] - 13)
 					M.px, M.py = mx, my
-					for _ = 1, 3 do M.Step(0.1) end
+					for _ = 1, 12 do M.Step(0.1) end
 					local pz = ns.Graph.GroundZ(M.instance, mx, my, ns.player.z, 1) or ns.player.z
 					local way, _, js = ns.LocalLeg(r, M.instance, mx, my, pz)
 					local jx, jy = way[#way][1], way[#way][2]
@@ -617,6 +624,37 @@ if ns.Graph.Has(0) then
 					end
 				end
 			end
+		end
+		-- Walk in a slow wave, up to 12 yards to each side of the route.
+		-- The join point must move smoothly. It must not jump from one place to another.
+		-- A change between the straight way and a way around is not a jump of the join point: ignore those ticks.
+		do
+			-- The tests before this one moved the player a long way. Start again on this route, at its start.
+			M.px, M.py = at(5)
+			ns.player.x, ns.player.y = M.px, M.py
+			ns.SetPath(r, true)
+			for _ = 1, 12 do M.Step(0.1) end
+			local jumps, ticks, worst, ljx, ljy, lastN = 0, 0, 0
+			local s = 5
+			while s < r.len[r.n] - 20 do
+				local x, y, i = at(s)
+				local dx, dy = r.x[i + 1] - r.x[i], r.y[i + 1] - r.y[i]
+				local l = math.sqrt(dx * dx + dy * dy)
+				local side = 12 * math.sin(s / 120 * 2 * math.pi)
+				M.px, M.py = x - side * dy / l, y + side * dx / l
+				M.Step(0.1)
+				local pz = ns.Graph.GroundZ(M.instance, M.px, M.py, ns.player.z, 1) or ns.player.z
+				local way = ns.LocalLeg(r, M.instance, M.px, M.py, pz)
+				local jx, jy = way[#way][1], way[#way][2]
+				if ljx and #way == 1 and lastN == 1 then
+					local d = math.sqrt((jx - ljx) ^ 2 + (jy - ljy) ^ 2)
+					worst = math.max(worst, d)
+					if d > 6 then jumps = jumps + 1 end
+				end
+				ljx, ljy, lastN, ticks, s = jx, jy, #way, ticks + 1, s + 0.7
+			end
+			check(ns.path == r and ticks > 500 and jumps == 0,
+				string.format("walking in a wave beside the route: the join point does not jump (%d ticks, at most %.1f yd in a tick)", ticks, worst))
 		end
 		check(tried > 0 and cuts == tried, string.format("cutting a corner: the dots lead across to the route past it at %d of %d corners%s", cuts, tried, led ~= "" and " (not at" .. led .. ")" or ""))
 	end
@@ -679,6 +717,8 @@ if ns.Graph.Has(0) and ns.Graph.Has(1) then
 		if z then pl.z, pl.gx, pl.gy, pl.ginstance = z, x, y, inst else pl.gx, pl.z = nil, nil end
 	end
 	local function settle()
+		-- The addon makes a plan on its next tick. Wait for that tick before we look for the result.
+		for _ = 1, 2 do M.Step(0.1) end
 		for _ = 1, 200 do
 			M.Step(0.05)
 			if ns.path and ns.path.graph and not ns.planning then break end

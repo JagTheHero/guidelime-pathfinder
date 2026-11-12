@@ -135,6 +135,40 @@ for _, c in ipairs({
 	for _, leg in ipairs(trip and trip.legs or {}) do lift = lift or leg.kind == "lift" end
 	check(lift, string.format("%s takes the lift (%s)", c[1], trip and string.format("%.0f s", trip.cost) or "no trip"))
 end
+-- A new plan from beside the route. It must go back onto the old route and keep the rest of it.
+do
+	local function plan(old, from, sx, sy)
+		local result, done = nil, false
+		ns.Graph.FindPath(0, sx, sy, -2240, -9250, false, function(p) result, done = p, true end, nil, nil, old, from)
+		local frames = 0
+		while not done and frames < 20000 do M.Step(1 / 60); frames = frames + 1 end
+		return result
+	end
+	local p = plan(nil, nil, 62, -9465) -- Goldshire -> Lakeshire
+	local again = p and plan(nil, nil, 62, -9465)
+	local same = again and again.n == p.n
+	for i = 1, same and p.n or 0 do same = same and again.x[i] == p.x[i] and again.y[i] == p.y[i] end
+	check(same, "the same start and target give the same route each time")
+	local kept, tried, tail = 0, 0, 0
+	for c = 4, p and p.n - 4 or 0, 3 do
+		local dx, dy = p.x[c + 1] - p.x[c], p.y[c + 1] - p.y[c]
+		local l = math.sqrt(dx * dx + dy * dy)
+		if l > 1 then
+			-- 30 yards to the side of the middle of the leg after corner c. The next corner ahead is c + 1.
+			local q = plan(p, c + 1, (p.x[c] + p.x[c + 1]) / 2 - dy / l * 30, (p.y[c] + p.y[c + 1]) / 2 + dx / l * 30)
+			tried = tried + 1
+			if q and q.kept then
+				kept = kept + 1
+				-- The last 3 corners before the target must be the corners of the old route.
+				local ok = true
+				for k = 1, 3 do ok = ok and q.x[q.n - k] == p.x[p.n - k] and q.y[q.n - k] == p.y[p.n - k] end
+				if ok then tail = tail + 1 end
+			end
+		end
+	end
+	check(tried > 3 and kept == tried and tail == tried,
+		string.format("a new plan from 30 yd beside the route goes back onto it: %d of %d, the end of the route stays in %d", kept, tried, tail))
+end
 print(string.format("     Lua memory after searches %.0f MB", collectgarbage("count") / 1024))
 
 print(fails == 0 and "ALL PASSED" or (fails .. " FAILED"))
