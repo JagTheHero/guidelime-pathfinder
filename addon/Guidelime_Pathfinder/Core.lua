@@ -14,9 +14,10 @@ local DEFAULTS = {
 	minimap = true,
 	worldmap = true,
 	dotSpacing = 4,  -- yards between ground dots
-	dotRange = 60,   -- yards of path ahead drawn as ground dots
+	dotRange = 90,   -- yards of path ahead drawn as ground dots
 	dotSize = 0.8,   -- dot diameter in yards
 	focusHeight = 1.9, -- camera pivot height above the feet, yards
+	jumpCamera = 0.5, -- the share of a jump's height that the camera goes up (see Dots.lua)
 	fov = 0,         -- horizontal field of view in degrees; 0 = from the cameraFov CVar
 	debug = false,
 }
@@ -347,10 +348,11 @@ local JOIN_LEAD = 12 -- yards: the furthest ahead of the player's spot on the ro
 -- Where a way from (x0, y0) onto the route joins it: the route's point ahead of the player's spot on it by as far as
 -- the player is off it (a way in at about 45 degrees; on the route, the spot itself), at most JOIN_LEAD yards.
 -- Returns x, y, the route's height there and the leg it is on (the route's corners after it follow, as they are).
-function ns.JoinPoint(p, x0, y0)
+-- If lead is given, the join point is that many yards ahead. ns.LocalLeg uses this for a shortcut.
+function ns.JoinPoint(p, x0, y0, lead)
 	local i = p.seg
 	local x, y, z = ns.PointOnSeg(p, i, p.segT or 0)
-	local d = min(dist(x0, y0, x, y), JOIN_LEAD)
+	local d = lead or min(dist(x0, y0, x, y), JOIN_LEAD)
 	while i < p.n do
 		local nx, ny, nz = p.x[i + 1], p.y[i + 1], p.z and p.z[i + 1] or 0
 		local L = dist(x, y, nx, ny)
@@ -364,25 +366,41 @@ function ns.JoinPoint(p, x0, y0)
 	return x, y, z, i
 end
 
+-- Returns the distance from the player to the first dot, in yards.
+-- The dots must not move on the ground when the player walks.
+-- Thus each dot is a whole number of spacings from the end of the route. We measure this distance along the route.
+-- If we measure from the player, all the dots move with each step.
+-- legLen is the length of the way from the player to the route.
+-- The way joins the route at (jx, jy), on the leg after corner js.
+function ns.DotPhase(p, js, jx, jy, legLen, spacing)
+	local j = min(js + 1, p.n)
+	local toEnd = legLen + dist(jx, jy, p.x[j], p.y[j]) + p.len[p.n] - p.len[j]
+	local s = toEnd % spacing
+	return s < 1e-3 and spacing or s
+end
+
 -- Calls fn(x, y, z, distanceAlong) every `spacing` yards along the path ahead of the player: from the player's
 -- spot on the path, or from (x0, y0, z0) straight onto it (ns.JoinPoint), then corner to corner.
+-- The points do not move in the world when the player walks (ns.DotPhase).
 function ns.SamplePath(p, spacing, maxDist, fn, x0, y0, z0)
 	if not p or not p.seg then return end
-	local xs, ys, zs, i = {}, {}, {}, p.seg
+	local xs, ys, zs, i, first = {}, {}, {}, p.seg, nil
 	if x0 then
 		local jx, jy, jz, js = ns.JoinPoint(p, x0, y0)
 		xs[1], ys[1], zs[1], i = jx, jy, jz, js
+		first = ns.DotPhase(p, js, jx, jy, dist(x0, y0, jx, jy), spacing)
 	else
 		x0, y0, z0 = ns.PointOnSeg(p, i, p.segT or 0)
+		first = ns.DotPhase(p, i, x0, y0, 0, spacing)
 	end
 	for k = i + 1, p.n do xs[#xs + 1], ys[#ys + 1], zs[#zs + 1] = p.x[k], p.y[k], p.z and p.z[k] or 0 end
-	local travelled, nextS = 0, spacing
+	local travelled, nextS = 0, first or spacing
 	for k = 1, #xs do
 		if travelled >= maxDist then return end
 		local x1, y1, z1 = xs[k], ys[k], zs[k]
 		local L = dist(x0, y0, x1, y1)
 		while nextS <= travelled + L and nextS <= maxDist do
-			local u = (nextS - travelled) / L
+			local u = L > 0 and (nextS - travelled) / L or 0
 			if fn(x0 + (x1 - x0) * u, y0 + (y1 - y0) * u, z0 + (z1 - z0) * u, nextS) == false then return end
 			nextS = nextS + spacing
 		end
@@ -400,11 +418,107 @@ local LOCAL_EVERY, LOCAL_MOVE = 0.5, 2 -- seconds, yards: how often a way around
 -- line), else around what is in the way (Graph.LocalPath: a drop, a wall, the other side of a house). The route's
 -- corners stay as they are (they were picked for their directions): the way only leads onto them. Returns its
 -- corners (the last the join point), the route's ground height at the join point and the leg it is on.
+--
+-- Shortcuts.
+-- A player can leave the route to cut a corner. We do not send this player back to the nearest point of the route.
+-- The way from the player joins the route at a point ahead. The lead is the distance along the route to this point.
+-- The lead is CUT_RATIO times the distance between the player and the route. It is CUT_MAX yards at most.
+-- Thus the join point moves smoothly when the player moves. There is no limit at which it jumps.
+-- The straight line to the join point must pass two checks:
+--   1. A player can walk the line. There is no drop, no wall and no steep slope.
+--   2. The line does not go near more mobs than the part of the route that it skips.
+-- If the line fails, we try a smaller share of the lead (CUT_SHARES).
+-- We do the checks again every LOCAL_EVERY seconds or LOCAL_MOVE yards.
+-- A check can change the result suddenly. The nearest point of the route also jumps at the inner side of a bend.
+-- Thus the join point moves along the route by JOIN_SLEW yards each second at most.
+local CUT_RATIO, CUT_MAX, JOIN_SLEW = 3, 45, 40
+local CUT_SHARES = { 1, 0.6, 0.3 }
+local CUT_MIN = 0.5 -- yards: a lead that is this much more than the usual lead is a shortcut
+local cut = {}
+
+-- Returns the mob cost of a part of the route (see Graph.Jam).
+-- The part starts at (x, y, z) on the leg after corner i. It ends at (x1, y1, z1) on the leg after corner i1.
+local function routeJam(p, instance, x, y, z, i, x1, y1, z1, i1)
+	local sum = 0
+	while i < i1 do
+		local nx, ny, nz = p.x[i + 1], p.y[i + 1], p.z[i + 1]
+		sum = sum + ns.Graph.Jam(instance, x, y, z, nx, ny, nz)
+		x, y, z, i = nx, ny, nz, i + 1
+	end
+	return sum + ns.Graph.Jam(instance, x, y, z, x1, y1, z1)
+end
+
+-- Returns true if the straight line from the player to the route at this lead passes the two checks.
+-- (bx, by, bz) is the usual join point, on the leg after corner bs.
+local function cutOk(p, instance, x0, y0, z0, lead, bx, by, bz, bs)
+	local jx, jy, jz, js = ns.JoinPoint(p, x0, y0, lead)
+	local z, fell, lost, steep = ns.Graph.Walk(instance, x0, y0, z0, jx, jy, nil, true)
+	local rz = ns.Graph.GroundZ(instance, jx, jy, jz, 0) or jz
+	return not (fell or lost or steep) and abs(z - rz) <= CORNER_SNAP
+		and ns.Graph.Jam(instance, x0, y0, z0, jx, jy, rz) <= routeJam(p, instance, bx, by, bz, bs, jx, jy, jz, js) + 0.5
+end
+
+-- Returns the lead of the join point in yards, and true if the way to it is a shortcut.
+local function joinLead(p, instance, x0, y0, z0)
+	local ax, ay = ns.PointOnSeg(p, p.seg, p.segT or 0)
+	local off = dist(x0, y0, ax, ay)
+	local base = min(off, JOIN_LEAD)
+	local want = max(base, min(off * CUT_RATIO, CUT_MAX))
+	local c, now = cut, GetTime()
+	if c.pathId ~= p.id then c.pathId, c.at, c.t, c.checked = p.id, nil, nil, nil end
+	if not c.checked or now - c.checked >= LOCAL_EVERY or dist(c.x0, c.y0, x0, y0) >= LOCAL_MOVE then
+		c.x0, c.y0, c.checked, c.share = x0, y0, now, 0
+		if want > base + CUT_MIN then
+			local bx, by, bz, bs = ns.JoinPoint(p, x0, y0)
+			for _, share in ipairs(CUT_SHARES) do
+				if cutOk(p, instance, x0, y0, z0, base + (want - base) * share, bx, by, bz, bs) then
+					c.share = share
+					break
+				end
+			end
+		end
+	end
+	-- spot is the distance along the route from its start to the point nearest the player.
+	local i = p.seg
+	local spot = p.len[i] + (p.len[min(i + 1, p.n)] - p.len[i]) * (p.segT or 0)
+	local at = spot + base + (want - base) * c.share
+	-- The old join point has no value after a pause of 1 second, or if it is far away (a teleport, a new nearest leg).
+	-- Then start from the new one.
+	if c.at and now - c.t < 1 and abs(at - c.at) <= CUT_MAX then
+		local step = JOIN_SLEW * (now - c.t)
+		at = c.at + max(-step, min(step, at - c.at))
+	end
+	c.at, c.t = at, now
+	local lead = max(0, at - spot)
+	return lead, lead > base + CUT_MIN
+end
+
+-- Moves the marker when the player takes a shortcut (see cutLead).
+-- The marker goes to the corner after the point where the shortcut joins the route.
+-- The corners before that point are not ahead of the player now.
+local function followCut(p, instance, px, py, pz)
+	if not p.graph or not p.z or not pz or not ns.Graph.HasGround(instance) then return end
+	local lead, isCut = joinLead(p, instance, px, py, pz)
+	if not isCut then return end
+	local _, _, _, js = ns.JoinPoint(p, px, py, lead)
+	local k = min(p.n, js + 1)
+	if k > p.k then
+		p.k = k
+		p.remaining = dist(px, py, p.x[k], p.y[k]) + p.len[p.n] - p.len[k]
+	end
+end
+
 local localLeg = {}
 function ns.LocalLeg(p, instance, x0, y0, z0)
-	local jx, jy, jz, js = ns.JoinPoint(p, x0, y0)
+	if not p.graph or not p.z or not z0 or not ns.Graph.HasGround(instance) then
+		local jx, jy, jz, js = ns.JoinPoint(p, x0, y0)
+		return { { jx, jy } }, jz, js
+	end
+	local lead, isCut = joinLead(p, instance, x0, y0, z0)
+	local jx, jy, jz, js = ns.JoinPoint(p, x0, y0, lead)
 	local straight = { { jx, jy } }
-	if not p.graph or not p.z or not z0 or not ns.Graph.HasGround(instance) then return straight, jz, js end
+	-- A shortcut is one straight line to the route farther ahead. joinLead did the checks.
+	if isCut then return straight, ns.Graph.GroundZ(instance, jx, jy, jz, 0) or jz, js end
 	local rz = ns.Graph.GroundZ(instance, jx, jy, jz, 0) or jz
 	local c = localLeg
 	if c.pathId == p.id and c.seg == js and dist(c.x0, c.y0, x0, y0) < LOCAL_MOVE and GetTime() - c.t < LOCAL_EVERY then
@@ -448,7 +562,10 @@ function ns.SampleGround(p, instance, x0, y0, z0, spacing, maxDist, fn)
 	for i = js + 1, p.n do
 		xs[#xs + 1], ys[#ys + 1], zs[#xs + 1] = p.x[i], p.y[i], anchored and p.z[i] or false
 	end
-	local along, nextS, z, lineA = 0, spacing, z0, z0
+	-- Calculate the length of the way to the route. ns.DotPhase uses it to keep the dots in the same place on the ground.
+	local legLen, lx, ly = 0, x0, y0
+	for _, c in ipairs(way) do legLen, lx, ly = legLen + dist(lx, ly, c[1], c[2]), c[1], c[2] end
+	local along, nextS, z, lineA = 0, ns.DotPhase(p, js, lx, ly, legLen, spacing), z0, z0
 	local ax, ay = x0, y0
 	local done, hole, steep = false, 0, 0
 	for i = 1, #xs do
@@ -493,12 +610,27 @@ function ns.SetPath(p, fromGraph)
 end
 
 -- Tracks progress: which segment the player is on and which corner comes next.
+-- First we examine the legs near the next corner. The nearest leg is the result.
+-- Then we examine the legs farther ahead, up to FOLLOW_AHEAD yards of route.
+-- This finds a player who cut across a bend that has many short legs.
+-- A leg farther ahead must be FOLLOW_NEARER yards nearer than the result. It must also be at the height of the player.
+-- The height check rejects the next turn of a ramp above or below the player.
+local FOLLOW_AHEAD, FOLLOW_NEARER = 80, 2
 function ns.Follow(p, px, py)
 	if not px then return end
 	local bestI, bestD, bestT = max(1, p.k - 1), huge, 0
-	for i = max(1, p.k - 2), min(p.n - 1, p.k + 4) do
+	local near = min(p.n - 1, p.k + 4)
+	for i = max(1, p.k - 2), near do
 		local d, t = segDist(px, py, p.x[i], p.y[i], p.x[i + 1], p.y[i + 1])
 		if d <= bestD + 0.25 then bestI, bestD, bestT = i, d, t end
+	end
+	local pz = p.z and ns.player.z
+	for i = near + 1, p.n - 1 do
+		if p.len[i] - p.len[near] > FOLLOW_AHEAD then break end
+		local d, t = segDist(px, py, p.x[i], p.y[i], p.x[i + 1], p.y[i + 1])
+		if d < bestD - FOLLOW_NEARER and (not pz or abs(p.z[i] + (p.z[i + 1] - p.z[i]) * t - pz) < OFF_LAYER / 3) then
+			bestI, bestD, bestT = i, d, t
+		end
 	end
 	local k = bestI + 1
 	if k < p.n and dist(px, py, p.x[k], p.y[k]) < ADVANCE then k = k + 1 end
@@ -517,6 +649,8 @@ function ns.Plan(px, py, keepCurrent)
 	end
 	if not ns.Graph.Has(d.instance) or d.straight then return end
 	local key = goalKey
+	-- A plan for a player who left the route can go back onto that route (see Graph.FindPath).
+	local old = keepCurrent and ns.path and ns.path.graph and ns.path or nil
 	ns.planning = true
 	ns.Graph.SetThreat(UnitLevel("player"), ({ Alliance = 1, Horde = 2 })[UnitFactionGroup("player")] or 0)
 	ns.Graph.FindPath(d.instance, px, py, d.x, d.y, IsIndoors(), function(p)
@@ -527,7 +661,7 @@ function ns.Plan(px, py, keepCurrent)
 			p.otherLayer = ns.player.z and abs(p.z[1] - ns.player.z) > OFF_LAYER
 			ns.SetPath(p, true)
 		end
-	end, ns.player.z, d.z)
+	end, ns.player.z, d.z, old, old and old.k)
 end
 
 function ns.Stop()
@@ -979,6 +1113,7 @@ local function tick()
 		end
 		ns.Follow(p, px, py)
 		local pz = ns.player.z
+		followCut(p, instance, px, py, pz)
 		local offLayer = p.graph and pz and not p.otherLayer and abs(pz - select(3, ns.PointOnSeg(p, p.seg, p.segT or 0))) > OFF_LAYER
 		if p.graph and (p.off > OFF_PATH or offLayer) then
 			offSince = offSince or GetTime()
@@ -1091,8 +1226,8 @@ local function status()
 		ns.Print("  no path: " .. ns.WhyNoTarget())
 	end
 	ns.Print("  marker " .. (ns.Marker.IsActive() and "placed" or "not placed") .. (ns.Marker.probing and " (probing)" or ""))
-	ns.Print(format("  dots: spacing %d yd, range %d yd, size %.1f yd, camera height %.1f yd, fov %s",
-		db.dotSpacing, db.dotRange, db.dotSize, db.focusHeight, db.fov > 0 and db.fov or ns.Dots.FovText()))
+	ns.Print(format("  dots: spacing %d yd, range %d yd, size %.1f yd, camera height %.2f yd, fov %s",
+		db.dotSpacing, db.dotRange, db.dotSize, ns.Dots.FocusHeight(), db.fov > 0 and db.fov or ns.Dots.FovText()))
 end
 
 SLASH_GUIDELIMEPATHFINDER1 = "/gpath"
@@ -1118,6 +1253,17 @@ SlashCmdList.GUIDELIMEPATHFINDER = function(msg)
 		status()
 	elseif cmd == "probe" then
 		ns.Dots.Probe()
+	elseif cmd == "jump" then
+		local share = tonumber(arg)
+		if arg == "off" or arg == "on" then db.jumpFix = arg == "on" end
+		if share and share >= 0 and share <= 1 then db.jumpCamera, db.jumpFix = share, true end
+		ns.Print(db.jumpFix ~= false and format("Jump correction is on. The camera goes up %.2f of the jump height.", db.jumpCamera)
+			or "Jump correction is off. Type /gpath jump on to start it.")
+		if db.jumpFix ~= false then
+			ns.Print("If the dots go up when you jump, type a larger number: /gpath jump 0.6. If they go down, type a smaller number.")
+		end
+	elseif cmd == "trace" then
+		ns.Dots.Trace()
 	elseif cmd == "go" then
 		ns.GoService(arg)
 	else
@@ -1126,7 +1272,9 @@ SlashCmdList.GUIDELIMEPATHFINDER = function(msg)
 		ns.Print("/gpath go bank | ah | inn | mail | repair | flight | trainer | food | mining ...  - head for the nearest one; /gpath go stops")
 		ns.Print("/gpath go deadmines | ruins of lordaeron ...  - head for a dungeon's or battleground's entrance")
 		ns.Print("a map pin you place (Ctrl-click the world map) is a goal too: the marker walks you there")
-		ns.Print("/gpath status | replan | probe (measure the camera for the ground dots)")
-		ns.Print("/gpath spacing <yd> | range <yd> | size <yd> | height <yd> | fov <deg, 0 = auto>  - ground dot tuning")
+		ns.Print("/gpath status | replan | probe (measure the camera for the ground dots) | trace (record the camera for 15 seconds)")
+		ns.Print("/gpath jump on | off | <0 to 1>  - keep the ground dots on the ground when you jump; the number tunes it")
+		ns.Print("/gpath range <yd>  - how far ahead the ground dots go (default 90)")
+		ns.Print("/gpath spacing <yd> | size <yd> | height <yd> | fov <deg, 0 = auto>  - ground dot tuning")
 	end
 end

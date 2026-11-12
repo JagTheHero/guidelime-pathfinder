@@ -1,5 +1,39 @@
 # Guidelime Pathfinder
 
+## Unreleased
+
+- The ground dots do not move on the ground when you walk. Before, each dot was a fixed distance from your
+  character, and the full line moved with each step. Now each dot is a fixed distance from the end of the route.
+  The minimap trail has the same correction.
+- The dots do not move away from the ground when the marker is near. Before, the addon used a camera pivot height
+  of 1.9 yards for all characters. The correct height changes with the character (1.68 yards on one test character).
+  Now the addon measures the height while you play, each time the marker moves to the next corner. It uses the
+  median of the last 15 results when it has 3 or more. A height that you set with `/gpath height` has priority.
+- The dots do not shake on clients that give the player position in steps of 0.1 yards. The addon now fits a line
+  through the positions of the last quarter second. On a test recording, the position error decreased from 0.030
+  to 0.007 yards.
+- The dots stay on the ground when you jump. The camera goes up when the character jumps, and the marker goes up
+  with the camera, thus the marker cannot show the camera height. The addon calculates the jump height and puts the
+  camera at half of it. This half is an estimate. `/gpath jump 0.6` changes it: use a larger number if the dots
+  go up when you jump, and a smaller number if they go down. `/gpath jump off` stops this correction.
+- New command `/gpath trace`. It records the camera data of each frame for 15 seconds. Use it to find the cause
+  of dots that are not on the ground.
+- Shortcuts. When you leave the route, the dots do not go back to the nearest point of the route. They go in a
+  straight line to a point of the route that is ahead. The distance ahead is 3 times your distance from the
+  route, up to 45 yards. Thus this point moves smoothly, and the line of dots does not jump from one state to
+  another. This occurs only when you can walk the line and it does not go near more mobs. The marker moves to
+  the corner after that point. The route does not change.
+- The route search now finds the cheapest route each time. Before, it was a faster search, and its result changed
+  with small changes of the start position.
+- When you are far from the route, the addon makes a new plan. The new plan now goes back onto the old route,
+  unless a different route is 15 percent or more cheaper. Before, a new plan frequently gave a different route.
+  In a test of 128 new plans from 30 yards beside 8 routes, 28 plans left the old route before and 8 do now.
+- The dots of a new route come in during 0.4 seconds.
+- The dots now go 90 yards ahead by default (60 before), and `/gpath range` accepts up to 380 yards at the default
+  spacing. If you used the addon before, your saved range stays: type `/gpath range 90`.
+- The addon looks for your position farther along the route (80 yards, not only 4 legs). Thus the marker does not
+  stay on a corner behind you when you cut across a bend that has many short legs.
+
 ## 0.7.3 (beta)
 
 - Fixed a Lua error ("bad argument #1 ... GetAllTaxiNodes") when you open a flight master's map: the game gave no
