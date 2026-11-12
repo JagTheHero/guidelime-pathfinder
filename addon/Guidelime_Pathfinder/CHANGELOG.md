@@ -1,5 +1,29 @@
 # Guidelime Pathfinder
 
+## Unreleased
+
+- The ground dots do not move on the ground when you walk. Before, each dot was a fixed distance from your
+  character, and the full line moved with each step. Now each dot is a fixed distance from the end of the route.
+  The minimap trail has the same correction.
+- The dots do not move away from the ground when the marker is near. Before, the addon used a camera pivot height
+  of 1.9 yards for all characters. The correct height changes with the character (1.68 yards on one test character).
+  Now the addon measures the height while you play, each time the marker moves to the next corner. It uses the
+  median of the last 15 results when it has 3 or more. A height that you set with `/gpath height` has priority.
+- The dots do not shake on clients that give the player position in steps of 0.1 yards. The addon now fits a line
+  through the positions of the last quarter second. On a test recording, the position error decreased from 0.030
+  to 0.007 yards.
+- The dots stay on the ground when you jump. The camera goes up when the character jumps, and the marker goes up
+  with the camera, thus the marker cannot show the camera height. The addon calculates the jump height and puts the
+  camera at half of it. This half is an estimate. `/gpath jump off` stops this correction.
+- New command `/gpath trace`. It records the camera data of each frame for 15 seconds. Use it to find the cause
+  of dots that are not on the ground.
+- Shortcuts. When you are 4 yards or more from the route, the dots do not go back to the nearest point of the
+  route. They go in a straight line to a point of the route that is up to 45 yards ahead. This occurs only when
+  you can walk the line, the line is shorter, and it does not go near more mobs. The marker moves to the corner
+  after that point. The route does not change.
+- The addon looks for your position farther along the route (80 yards, not only 4 legs). Thus the marker does not
+  stay on a corner behind you when you cut across a bend that has many short legs.
+
 ## 0.7.3 (beta)
 
 - Fixed a Lua error ("bad argument #1 ... GetAllTaxiNodes") when you open a flight master's map: the game gave no

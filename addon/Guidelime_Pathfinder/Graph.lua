@@ -363,6 +363,14 @@ local function edgeJam(g, j, a, b)
 	return c
 end
 
+-- Returns the mob cost of a straight walk from a to b for the current threat. The route search uses the same cost.
+function Graph.Jam(instance, ax, ay, az, bx, by, bz)
+	local g = graphs[instance]
+	if not g or not g.mobs or threat.side == 0 then return 0 end
+	g.zones, g.mobZones = g.zones or {}, g.mobZones or {}
+	return segmentJam(g, ax, ay, az, bx, by, bz)
+end
+
 -- Weighted yards of aggro zones along a path { x, y, z, n } for the current threat (for /gpath status and tests).
 function Graph.PathJam(instance, p)
 	local g = graphs[instance]

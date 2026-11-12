@@ -69,7 +69,16 @@ function strsplit(sep, s, n)
 end
 function Round(v) return math.floor(v + 0.5) end
 function geterrorhandler() return function(e) error(e, 2) end end
-function hooksecurefunc(t, name, fn) local old = t[name]; t[name] = function(...) local r = { old(...) } fn(...) return unpack(r) end end
+-- hooksecurefunc(table, name, fn) hooks a function of a table. hooksecurefunc(name, fn) hooks a global function.
+function hooksecurefunc(t, name, fn)
+	if type(t) == "string" then t, name, fn = _G, t, name end
+	local old = t[name]; t[name] = function(...) local r = { old(...) } fn(...) return unpack(r) end
+end
+-- M.air is the height of the character above the ground, in yards. It is nil when the character is on the ground.
+-- M.airCamera is the part of that height that the camera goes up. M.airMarker is the part that the marker goes up.
+function IsFalling() return M.air ~= nil end
+function IsSwimming() return false end
+function JumpOrAscendStart() end
 function IsIndoors() return false end
 function IsMounted() return false end
 function IsMouselooking() return M.mouselook end
@@ -125,7 +134,7 @@ function M.TrueProject(x, y, z)
 	local fx, fy, fz = -math.sin(yaw) * math.cos(pitch), math.cos(yaw) * math.cos(pitch), -math.sin(pitch)
 	local rx, ry = math.cos(yaw), math.sin(yaw)
 	local ux, uy, uz = ry * fz, -rx * fz, rx * fy - ry * fx
-	local Fx, Fy, Fz = -M.px, M.py, M.pz + M.trueHeight
+	local Fx, Fy, Fz = -M.px, M.py, M.pz + M.trueHeight + (M.air or 0) * (M.airCamera or 0)
 	local d = M.trueDist or M.zoom -- nearer than the zoom when something is in the way
 	if not M.trueDist and M.cameraGround then -- like the game: pulled in 0.3 yd over the ground on the line back
 		for k = 0.5, M.zoom, 0.5 do
@@ -219,7 +228,7 @@ function M.UpdateNav()
 	M.navX, M.navY = x, y
 	M.navValid, M.navClamped = false, false
 	if not x or not M.superTracking then return end
-	local sx, sy = M.TrueProject(x, y, M.pz) -- like the game: drawn at the player's height, not the waypoint's
+	local sx, sy = M.TrueProject(x, y, M.pz + (M.air or 0) * (M.airMarker or 0)) -- like the game: drawn at the player's height, not the waypoint's
 	if not sx then M.navValid = true; M.navClamped = true; return end
 	M.navValid = true
 	M.navClamped = sx < 0 or sx > M.W or sy < 0 or sy > M.H

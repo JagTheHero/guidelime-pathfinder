@@ -52,6 +52,76 @@ for _ = 1, 10 do worst, count = dotError() end
 check(count > 5, "dots drawn (" .. count .. ")")
 check(worst < 1.5, string.format("dots match the true projection with the right fov (worst %.2f px)", worst))
 
+-- A jump. The camera and the marker go up with the character. The dots must stay on the ground.
+-- camera and marker are the parts of the jump height that the camera and the marker go up.
+-- turn is the speed at which the camera turns during the jump, in radians per second.
+local function jump(camera, marker, turn)
+	local v, g, t, jumpWorst, frames, off = 7.9555, 19.2911, 0, 0, 0, 0
+	M.airCamera, M.airMarker = camera, marker
+	local yaw0 = M.trueYaw
+	JumpOrAscendStart()
+	while true do
+		t = t + 1 / 60
+		local h = v * t - g * t * t / 2
+		if h <= 0 then break end
+		M.air = h
+		M.trueYaw = yaw0 + turn * t
+		local w, c = dotError()
+		frames = frames + 1
+		-- The ground behind the player can change the camera distance during the jump.
+		-- The solver can be one frame late then. We permit one such frame.
+		if c == 0 then jumpWorst = 99 elseif w > 1.5 then off = off + 1 else jumpWorst = math.max(jumpWorst, w) end
+	end
+	M.air = nil
+	M.trueYaw = yaw0
+	local w = dotError()
+	for _ = 1, 40 do dotError() end
+	return frames > 40 and jumpWorst < 1.5 and off <= 1 and w < 1.5, string.format("%d frames, %d off, worst of the rest %.2f px, %.2f px after landing", frames, off, jumpWorst, w)
+end
+do
+	local ok, msg = jump(0.5, 0.5, 0)
+	check(ok, "a jump, the camera and the marker going up half of it: the dots stay on the ground (" .. msg .. ")")
+	ok, msg = jump(0.5, 0.5, -0.1)
+	check(ok, "a jump, turning: the dots stay on the ground (" .. msg .. ")")
+	-- /gpath trace must save one row of 20 columns for each frame of 15 seconds.
+	ns.Dots.Trace()
+	for _ = 1, 910 do M.Step(1 / 60) end
+	local traces = GuidelimePathfinderDB.traces
+	check(traces and #traces == 1 and #traces[1] > 890 and #traces[1][1] == 20 and not ns.Dots.trace, "/gpath trace records the frames of 15 seconds")
+end
+
+-- The pivot height. Two markers seen through one camera must give the pivot height of the mock camera.
+do
+	local height = M.trueHeight
+	M.trueHeight = 1.68
+	local function frame(x, y)
+		local sx, sy = M.TrueProject(x, y, M.pz)
+		return { x = -M.px, y = M.py, z = M.pz, d = M.camDist, ox = sx, oy = sy, m = { -x, y, M.pz }, yaw = M.trueYaw + 0.01, pitch = M.truePitch + 0.02 }
+	end
+	local fit = ns.Dots.FitFocus(frame(M.px - 4, M.py + 9), frame(M.px - 20, M.py + 60), 1.9)
+	check(fit and math.abs(fit - 1.68) < 0.01, string.format("the pivot's height from two markers through one camera (%.3f for 1.68)", fit or 0))
+	M.trueHeight = height
+end
+
+-- A position in steps of 0.1 yards. The smoothed position must be near the true position.
+-- An exact position must come back with no change.
+do
+	local worst, raw = 0, 0
+	for i = 0, 200 do
+		local t = 1000 + i / 100
+		local x, y = 50 + 6.1 * i / 100, -20 + 3.3 * i / 100
+		local qx, qy = math.floor(x * 10 + 0.5) / 10, math.floor(y * 10 + 0.5) / 10
+		local sx, sy = ns.Dots.SmoothPosition(qx, qy, 1, t)
+		if i > 30 then
+			worst = math.max(worst, math.sqrt((sx - x) ^ 2 + (sy - y) ^ 2))
+			raw = math.max(raw, math.sqrt((qx - x) ^ 2 + (qy - y) ^ 2))
+		end
+	end
+	check(worst < 0.03 and raw > 0.05, string.format("a position in steps of 0.1 yd is smoothed (%.3f yd off at most, %.3f as given)", worst, raw))
+	local sx, sy = ns.Dots.SmoothPosition(12.34, 5.6, 1, 2000)
+	check(sx == 12.34 and sy == 5.6 and ns.Dots.SmoothPosition(7.1, 3.2, 1, 2001) == 7.1, "a position not in steps is used as it is")
+end
+
 -- the field of view follows the cameraFov CVar
 M.cvarFov, M.truePitch = 75, 0.25
 for _ = 1, 3 do worst, count = dotError() end
@@ -460,6 +530,98 @@ if ns.Graph.Has(0) then
 		local z, guess = ns.Graph.GroundZ(M.instance, x, y, M.pz, 1)
 		return z or guess
 	end
+
+	-- The dots must not move on the ground when the player walks.
+	-- After a step of 1.3 yards, each dot must be where a dot was before the step.
+	-- The new dot at the far end is the only exception.
+	GuidelimeArrow.element = nil
+	for _ = 1, 3 do M.Step(0.1) end
+	M.px, M.py = -133, -8914
+	GuidelimeArrow.element = { wx = 62, wy = -9465, instance = 0 }
+	for _ = 1, 200 do
+		M.Step(0.05)
+		if ns.path and ns.path.graph then break end
+	end
+	r = ns.path
+	if r then
+		local function at(s)
+			local i = 1
+			while r.len[i + 1] < s do i = i + 1 end
+			local u = (s - r.len[i]) / (r.len[i + 1] - r.len[i])
+			return r.x[i] + (r.x[i + 1] - r.x[i]) * u, r.y[i] + (r.y[i + 1] - r.y[i]) * u, i
+		end
+		local function goTo(s, side)
+			local x, y, i = at(s)
+			local dx, dy = r.x[i + 1] - r.x[i], r.y[i + 1] - r.y[i]
+			local l = math.sqrt(dx * dx + dy * dy)
+			M.px, M.py = x - (side or 0) * dy / l, y + (side or 0) * dx / l
+			for _ = 1, 3 do M.Step(0.1) end
+		end
+		local function dots()
+			local list = {}
+			local pz = ns.Graph.GroundZ(M.instance, M.px, M.py, ns.player.z, 1) or ns.player.z
+			ns.SampleGround(ns.path, M.instance, M.px, M.py, pz, ns.db.dotSpacing, ns.db.dotRange, function(x, y) list[#list + 1] = { x, y } end)
+			return list
+		end
+		-- Returns the largest distance from a dot of b to the nearest dot of a. The last dot of b is ignored.
+		local function moved(a, b)
+			local worst = 0
+			for i = 1, #b - 1 do
+				local best = math.huge
+				for _, q in ipairs(a) do best = math.min(best, math.sqrt((q[1] - b[i][1]) ^ 2 + (q[2] - b[i][2]) ^ 2)) end
+				worst = math.max(worst, best)
+			end
+			return worst
+		end
+		local slid, n = 0, 0
+		for s = 20, 120, 9.7 do
+			goTo(s)
+			local a = dots()
+			goTo(s + 1.3)
+			local b = dots()
+			n = math.max(n, #b)
+			slid = math.max(slid, moved(a, b))
+		end
+		check(ns.path == r and n > 5 and slid < 0.2, string.format("walking the route: the dots stay where they are on the ground (%d dots, at most %.2f yd from where one was)", n, slid))
+		-- Do the same test 3 yards to the side of the route.
+		-- The first dots are on the way to the route. They move with the player, thus we ignore them.
+		goTo(60, 3)
+		local a = dots()
+		goTo(61.3, 3)
+		local b, far = dots(), 0
+		for i = 1, 3 do table.remove(b, 1) end
+		check(ns.path == r and #b > 5 and moved(a, b) < 0.2, string.format("walking 3 yd beside the route: its dots stay where they are (at most %.2f yd)", moved(a, b)))
+
+		-- A shortcut. The player stands inside a corner of the route.
+		-- The dots must go straight to the route after the corner. The marker must go to the next corner.
+		local cuts, tried, led = 0, 0, ""
+		for i = 3, r.n - 2 do
+			local l0, l1 = r.len[i] - r.len[i - 1], r.len[i + 1] - r.len[i]
+			if l0 > 14 and l1 > 14 and ns.path == r then
+				local ax, ay = at(r.len[i] - 12)
+				local bx, by = at(r.len[i] + 12)
+				local mx, my = (ax + bx) / 2, (ay + by) / 2
+				local off = math.sqrt((mx - r.x[i]) ^ 2 + (my - r.y[i]) ^ 2)
+				if off > 5 then
+					goTo(r.len[i] - 13)
+					M.px, M.py = mx, my
+					for _ = 1, 3 do M.Step(0.1) end
+					local pz = ns.Graph.GroundZ(M.instance, mx, my, ns.player.z, 1) or ns.player.z
+					local way, _, js = ns.LocalLeg(r, M.instance, mx, my, pz)
+					local jx, jy = way[#way][1], way[#way][2]
+					local _, fell, lost, steep = ns.Graph.Walk(M.instance, mx, my, pz, bx, by, nil, true)
+					if not (fell or lost or steep) then
+						tried = tried + 1
+						local past = js > i or (js == i and math.sqrt((jx - r.x[i]) ^ 2 + (jy - r.y[i]) ^ 2) > 8)
+						if #way == 1 and past and r.k >= i + 1 then cuts = cuts + 1 else led = led .. " " .. i end
+					end
+				end
+			end
+		end
+		check(tried > 0 and cuts == tried, string.format("cutting a corner: the dots lead across to the route past it at %d of %d corners%s", cuts, tried, led ~= "" and " (not at" .. led .. ")" or ""))
+	end
+	GuidelimeArrow.element = nil -- Remove the route. The tests that follow need a clean state.
+	for _ = 1, 3 do M.Step(0.1) end
 end
 
 -- Ironforge: the halls lie under walkable mountainside, and a walkway crosses over the Great Forge. With no
